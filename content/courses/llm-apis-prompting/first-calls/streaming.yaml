@@ -1,0 +1,270 @@
+title: Streaming and time to first token
+description: Where response time goes (prefill vs decode), what streaming fixes and what it doesn't, then ORBIT's first shift.
+exercises:
+  - id: streaming-slides
+    type: video
+    title: Where the seconds go
+    slides: |
+      # Two phases of every reply
+
+      1. **Prefill:** the model reads all input tokens at once (in parallel) and builds its internal state.
+         This sets the **time to first token (TTFT)**. It grows with prompt length and model size, and with queueing on a busy server.
+      2. **Decode:** the model writes output one token at a time. Each token needs a full pass through the model,
+         so this part grows **linearly with output length**.
+
+      $$\text{total} \approx \text{TTFT} + \text{output tokens} \times \text{time per token}$$
+
+      Without streaming, the crew sees nothing until the whole reply is done. With streaming, they see the first words
+      at TTFT and read along while the rest is decoded.
+
+      ---
+
+      ## Streaming with the SDK
+
+      ```python
+      import time
+
+      start = time.perf_counter()
+      first = None
+      with client.messages.stream(model="claude-sonnet-5-5", max_tokens=600,
+                                  system=SYSTEM, messages=history) as stream:
+          for text in stream.text_stream:          # chunks of text as they arrive
+              if first is None:
+                  first = time.perf_counter() - start
+              print(text, end="", flush=True)
+          final = stream.get_final_message()       # full Message: content, stop_reason, usage
+      ```
+
+      On the wire, this is a series of server-sent events: `message_start`, `content_block_delta` (text pieces),
+      `message_delta` (stop_reason, usage), `message_stop`. The SDK assembles them for you.
+
+      **In the exercises** the fake can't make you wait, so `stream.events` records when each chunk *would* arrive,
+      as `(ms_since_start, text)` pairs.
+
+      ---
+
+      ## Stream or not?
+
+      | | no streaming | streaming |
+      | --- | --- | --- |
+      | time until the user sees text | total time | TTFT |
+      | total time | same | same |
+      | cost | same | same |
+      | code | one call, one result | a loop, plus the final message |
+      | errors | all or nothing | can fail **mid-reply**, after the user saw half of it |
+      | validating output | easy: check, then show | hard: you've already shown it |
+
+      **Stream** chat replies and long answers that people read. **Don't stream** batch jobs, classification, or JSON that
+      code parses: nobody is watching, and you need the whole thing before you can validate it.
+
+      ---
+
+      ## Playbook: "ORBIT feels slow"
+
+      Measure TTFT and total time **separately**, on real requests.
+
+      | what you see | usual cause | fixes, cheapest first |
+      | --- | --- | --- |
+      | high TTFT, short replies | long prompt, big model, server load | trim the prompt, cache the static prefix (chapter 4), a smaller model |
+      | low TTFT, long total | long outputs | ask for shorter answers, lower `max_tokens`, stream so people can read along |
+      | both high | long prompt **and** long output | do both; check the biggest number first |
+
+      Streaming improves how fast the reply **feels**, not how long it takes. If a downstream system needs the full
+      answer, only cutting prefill or decode time will help.
+
+  - id: collect-stream
+    type: coding
+    title: Stream ORBIT's airlock briefing
+    context: |
+      A crew member asks for the full airlock procedure, a long answer. `client` is ORBIT's model. The fake stream has the
+      real SDK's `text_stream` and `get_final_message()`, plus `stream.events`: a list of `(ms_since_start, chunk)` pairs.
+    instructions:
+      - "Open `client.messages.stream(...)` with `model=MODEL`, `max_tokens=400`, `system=SYSTEM` and the user message `QUESTION`. Join every chunk from `stream.text_stream` into `full_text`."
+      - "Store when the first chunk arrived in `ttft_ms` and when the last chunk arrived in `total_ms`, using `stream.events`."
+      - "Store `decode_ms = total_ms - ttft_ms`, and `ms_per_token`: `decode_ms` divided by the reply's output tokens (from `stream.get_final_message().usage`)."
+    hint: |
+      `with client.messages.stream(...) as stream:` then `full_text = "".join(stream.text_stream)`. The first event is
+      `stream.events[0]` and its time is `stream.events[0][0]`; the last is `stream.events[-1][0]`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      client = aikit.FakeClaude(orbit_chat(), clock=aikit.VirtualClock())
+      SYSTEM = "You are ORBIT, the station assistant on research station Helios-7."
+      QUESTION = "Walk me through the airlock procedure for an EVA."
+    sample_code: |
+      with client.messages.stream(model=MODEL, max_tokens=____, system=SYSTEM,
+                                  messages=[{"role": "user", "content": ____}]) as stream:
+          full_text = ____
+          ttft_ms = ____
+          total_ms = ____
+          out_tokens = stream.get_final_message().usage.output_tokens
+
+      decode_ms = ____
+      ms_per_token = ____
+      print(full_text[:80], "...")
+      print(f"first words after {ttft_ms:.0f} ms, last after {total_ms:.0f} ms, {ms_per_token:.1f} ms/token")
+    solution: |
+      with client.messages.stream(model=MODEL, max_tokens=400, system=SYSTEM,
+                                  messages=[{"role": "user", "content": QUESTION}]) as stream:
+          full_text = "".join(stream.text_stream)
+          ttft_ms = stream.events[0][0]
+          total_ms = stream.events[-1][0]
+          out_tokens = stream.get_final_message().usage.output_tokens
+
+      decode_ms = total_ms - ttft_ms
+      ms_per_token = decode_ms / out_tokens
+      print(full_text[:80], "...")
+      print(f"first words after {ttft_ms:.0f} ms, last after {total_ms:.0f} ms, {ms_per_token:.1f} ms/token")
+    tests: |
+      check_object("full_text")
+      from kits.llm_apis_prompting import orbit_answer
+      assert "".join(user["full_text"].split()) == "".join(orbit_answer("airlock").split()), "`full_text` should be the whole briefing: join every chunk of `stream.text_stream`, and ask with `max_tokens=400` so it isn't cut off."
+      check_equal("ttft_ms", msg="`ttft_ms` is the time of the first event: `stream.events[0][0]`.")
+      check_equal("total_ms", msg="`total_ms` is the time of the last event: `stream.events[-1][0]`.")
+      check_equal("decode_ms")
+      check_equal("ms_per_token", tol=1e-6, msg="`ms_per_token` is `decode_ms / out_tokens`.")
+    success_msg: |
+      The crew sees words after about half a second instead of waiting for the full briefing. Decoding took most of the
+      time, so for this reply a shorter answer would save more than a shorter prompt.
+
+  - id: slow-reply-diagnosis
+    type: mc
+    title: "Troubleshoot: the slow handbook answers"
+    question: |
+      ORBIT's handbook answers feel slow. You log two kinds of request:
+
+      | request | input tokens | output tokens | TTFT | total |
+      | --- | --- | --- | --- | --- |
+      | handbook question (whole handbook pasted into `system`) | 48,000 | 35 | 2,600 ms | 3,100 ms |
+      | small talk | 300 | 40 | 450 ms | 1,000 ms |
+
+      Which change should you try first for the handbook questions?
+    options:
+      - text: Turn on streaming.
+        feedback: The reply is only 35 tokens, so it appears about 0.5 s after the first token anyway. Streaming can't hide the 2.6 s the crew waits before the first word.
+      - text: Lower `max_tokens` to 50.
+        feedback: The replies are already short, and decode takes only about 0.5 s. The time goes into prefill, before the first token.
+      - text: Send only the relevant handbook sections, and cache the static part of the prompt.
+        correct: true
+        feedback: Right. TTFT accounts for most of the total and grows with the 48k-token prompt. Sending less, and caching what stays the same, attacks the cause. Verify by checking that TTFT drops on the same questions.
+      - text: Set `temperature=0`.
+        feedback: Temperature changes which tokens are picked, not how fast they are computed.
+    hint: Split each total into TTFT and decode time. Which part is big for the handbook request, and what drives it?
+
+  - id: orbit-first-shift
+    type: sequential
+    title: "Mission: ORBIT's first shift"
+    context: |
+      ORBIT goes live for its first shift. Noor will introduce herself, ask a long medical question, check that ORBIT
+      remembers her, then ask for the hydroponics routine. Build the chat code piece by piece. `client` is ORBIT's model,
+      `SYSTEM` its system prompt and `MODEL` the model id.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, orbit_answer, MODEL
+      clk = aikit.VirtualClock()
+      client = aikit.FakeClaude(orbit_chat(), clock=clk)
+      SYSTEM = "You are ORBIT, the station assistant on research station Helios-7."
+    steps:
+      - instructions:
+          - "Write `ask(history, text)`: append `text` as a user message, call the model with `max_tokens=80` and `messages=history`, and while `stop_reason` is `\"max_tokens\"` call again with double the ceiling (stop at 1280)."
+          - Append the final reply text to `history` as an assistant message and return it.
+        hint: |
+          Keep `max_tokens` in a local variable. The retry sends the same `history`, because the user turn is already in it.
+          Only append the assistant turn once, after the loop.
+        sample_code: |
+          def ask(history, text):
+              history.append({"role": "user", "content": text})
+              max_tokens = 80
+              r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=SYSTEM, messages=history)
+              while ____ and max_tokens < 1280:
+                  max_tokens = ____
+                  r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=SYSTEM, messages=history)
+              reply = r.content[0].text
+              history.append(____)
+              return reply
+        solution: |
+          def ask(history, text):
+              history.append({"role": "user", "content": text})
+              max_tokens = 80
+              r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=SYSTEM, messages=history)
+              while r.stop_reason == "max_tokens" and max_tokens < 1280:
+                  max_tokens = max_tokens * 2
+                  r = client.messages.create(model=MODEL, max_tokens=max_tokens, system=SYSTEM, messages=history)
+              reply = r.content[0].text
+              history.append({"role": "assistant", "content": reply})
+              return reply
+        tests: |
+          check_object("ask")
+          from kits.llm_apis_prompting import orbit_answer
+          h = []
+          out = user["ask"](h, "What should I do in a medical emergency?")
+          assert "".join(str(out).split()) == "".join(orbit_answer("medical").split()), "`ask` returned a truncated or wrong answer. Retry with a doubled `max_tokens` while `stop_reason == 'max_tokens'`, and return the final text."
+          assert len(h) == 2 and [m["role"] for m in h] == ["user", "assistant"], f"After one `ask`, `history` should hold exactly one user and one assistant message; it holds {[m['role'] for m in h]}. Append the assistant turn once, after the retry loop."
+      - instructions:
+          - "Start an empty `history` and run the shift: call `ask` for each text in `shift_turns`, collecting the replies in `replies`."
+        hint: "`replies = [ask(history, t) for t in shift_turns]`"
+        sample_code: |
+          shift_turns = ["Hi, my name is Noor.", "What should I do in a medical emergency?", "What is my name?"]
+          history = ____
+          replies = ____
+          for r in replies:
+              print("ORBIT:", r[:70])
+        solution: |
+          shift_turns = ["Hi, my name is Noor.", "What should I do in a medical emergency?", "What is my name?"]
+          history = []
+          replies = [ask(history, t) for t in shift_turns]
+          for r in replies:
+              print("ORBIT:", r[:70])
+        tests: |
+          check_object("replies")
+          assert len(user["replies"]) == 3, "Collect one reply per text in `shift_turns`."
+          assert "Noor" in user["replies"][2], "ORBIT forgot Noor's name. Use one `history` list for the whole shift."
+          assert len(user["history"]) == 6, "`history` should end with 6 messages."
+          check_equal("replies")
+      - instructions:
+          - "Measure the shift so far: store the number of API calls in `calls_made`, the extra calls caused by truncation in `retries`, and the total cost in `shift_cost`."
+        hint: "`len(client.calls)`; retries are the calls beyond one per turn, so `calls_made - len(shift_turns)`; and `client.total_cost()`."
+        sample_code: |
+          calls_made = ____
+          retries = ____
+          shift_cost = ____
+          print(calls_made, retries, round(shift_cost, 6))
+        solution: |
+          calls_made = len(client.calls)
+          retries = calls_made - len(shift_turns)
+          shift_cost = client.total_cost()
+          print(calls_made, retries, round(shift_cost, 6))
+        tests: |
+          check_equal("calls_made", msg="`calls_made` is `len(client.calls)`.")
+          check_equal("retries", msg="`retries` is the number of calls beyond one per turn.")
+          check_equal("shift_cost", tol=1e-9, msg="`shift_cost` is `client.total_cost()`.")
+      - instructions:
+          - "Noor asks: `Give me an overview of the hydroponics routine.` Append it to `history` and **stream** the reply with `max_tokens=400`."
+          - "Store the joined text in `streamed`, the first chunk's time in `ttft_ms`, then append `streamed` to `history` as an assistant message."
+        hint: |
+          `with client.messages.stream(model=MODEL, max_tokens=400, system=SYSTEM, messages=history) as stream:` then
+          `streamed = "".join(stream.text_stream)` and `ttft_ms = stream.events[0][0]`.
+        sample_code: |
+          history.append({"role": "user", "content": "Give me an overview of the hydroponics routine."})
+          with client.messages.stream(model=MODEL, max_tokens=____, system=SYSTEM, messages=____) as stream:
+              streamed = ____
+              ttft_ms = ____
+          history.append(____)
+          print(f"first words after {ttft_ms:.0f} ms:", streamed[:60])
+        solution: |
+          history.append({"role": "user", "content": "Give me an overview of the hydroponics routine."})
+          with client.messages.stream(model=MODEL, max_tokens=400, system=SYSTEM, messages=history) as stream:
+              streamed = "".join(stream.text_stream)
+              ttft_ms = stream.events[0][0]
+          history.append({"role": "assistant", "content": streamed})
+          print(f"first words after {ttft_ms:.0f} ms:", streamed[:60])
+        tests: |
+          check_object("streamed")
+          from kits.llm_apis_prompting import orbit_answer
+          assert "".join(user["streamed"].split()) == "".join(orbit_answer("hydroponics").split()), "`streamed` should hold the whole hydroponics answer: join all chunks of `stream.text_stream`, with `max_tokens=400`."
+          check_equal("ttft_ms", msg="`ttft_ms` is `stream.events[0][0]`.")
+          h = user["history"]
+          assert len(h) == 8 and h[-1]["role"] == "assistant", "Append the streamed reply to `history` as an assistant message, so the next turn can see it."
+    success_msg: |
+      ORBIT survived its first shift: it kept its persona, remembered Noor, recovered from truncation (at the cost of
+      the retries you measured) and streamed a long answer. Next chapter: making the answers themselves better.

@@ -1,0 +1,252 @@
+title: Tokens, vocabularies and unknown words
+description: Turn crew messages into token ids, and measure what happens when new words arrive.
+exercises:
+  - id: intro
+    type: video
+    title: From text to token ids
+    slides: |
+      # Models read numbers, not text
+
+      Every language model, from a spam filter to an LLM, starts with the same three steps:
+
+      ```
+      "Pump in Module E is leaking"
+        → tokens   ["pump", "in", "module", "e", "is", "leaking"]
+        → ids      [412, 7, 33, 51, 9, 1]
+        → vectors  one row of an embedding table per id
+      ```
+
+      The **tokeniser** decides what a token is. The **vocabulary** maps each token to an id.
+      Both are fixed when the model is trained, so every choice you make here is baked in.
+
+      ---
+
+      ## A word-level tokeniser in four lines
+
+      ```python
+      import re
+      from collections import Counter
+
+      def tokenize(text):
+          return re.findall(r"[a-z0-9]+", text.lower())
+
+      counts = Counter(t for text in train_texts for t in tokenize(text))
+      vocab = {"<pad>": 0, "<unk>": 1}
+      for word, n in counts.most_common():
+          if n >= 2:                      # min_count: drop words seen once
+              vocab[word] = len(vocab)
+      ```
+
+      - `<pad>` fills short sequences so a batch is rectangular.
+      - `<unk>` stands for **every** word not in the vocabulary.
+      - `min_count` keeps the vocabulary small and drops typos, but also drops real rare words.
+
+      ---
+
+      ## The out-of-vocabulary (OOV) problem
+
+      Word frequencies follow Zipf's law: a few words are everywhere, and a long tail
+      shows up once or never. New text always brings tail words: typos (`presure`),
+      new equipment (`centrifuge`), names, codes (`B-6`).
+
+      $$\text{OOV rate} = \frac{\#\text{ tokens that map to } \texttt{<unk>}}{\#\text{ tokens}}$$
+
+      Every OOV token becomes the same `<unk>` id, so the model cannot tell
+      `centrifuge` from `password`. **Measure OOV on new data before you trust a model on it.**
+      On training-like text it is near 0; a jump to 10-20% is a warning sign.
+
+      ---
+
+      ## Characters: no OOV, but long sequences
+
+      A character-level tokeniser has a vocabulary of about 100 symbols and never
+      sees an unknown token. The price:
+
+      - sequences are 4-6 times longer, and attention cost grows with the **square** of length;
+      - a single character carries almost no meaning, so the model must learn spelling first.
+
+      **Subword** tokenisers (next lesson) sit in between: common words stay whole,
+      rare words split into known pieces.
+
+      ---
+
+      ## Trade-offs: what should a token be?
+
+      | | word | character | subword (BPE, WordPiece) |
+      | --- | --- | --- | --- |
+      | vocab size | 50k-1M+ | ~100-300 | 8k-200k (you choose) |
+      | OOV on new text | high | none | none (falls back to pieces) |
+      | sequence length | short | 4-6x longer | ~1.3x words |
+      | embedding params ($V \times d$) | huge | tiny | moderate |
+      | meaning per token | high | very low | medium |
+
+      Rule of thumb: **subwords** for any neural model; **words** are fine for small
+      bag-of-words baselines on stable, clean text; **characters** when text is noisy
+      and short, or for spelling-heavy tasks.
+
+  - id: build-vocab
+    type: coding
+    title: Build a vocabulary and encode a message
+    context: |
+      `train_texts` is a list of 140 Helios-7 crew tickets, e.g. `"Printer in Module A says offline."`.
+      `re` and `Counter` are imported. Build a word-level tokeniser and vocabulary from scratch.
+    instructions:
+      - "Write `tokenize(text)` that lowercases the text and returns `re.findall(r\"[a-z0-9]+\", ...)`."
+      - Count every token in `train_texts` into a `Counter` called `counts`.
+      - "Build `vocab`: start with `{\"<pad>\": 0, \"<unk>\": 1}`, then give every word with a count of **at least 2** the next free id, most frequent first."
+      - "Write `encode(text)` that returns the list of ids for `tokenize(text)`, using `vocab[\"<unk>\"]` for unknown words."
+    hint: |
+      Loop over `counts.most_common()` and add `vocab[word] = len(vocab)` when `n >= 2`.
+      In `encode`, `vocab.get(token, vocab["<unk>"])` does the lookup with a fallback.
+    pre_code: |
+      import re
+      from collections import Counter
+      from kits.nlp_transformers import ticket_split
+      _train, _test = ticket_split()
+      train_texts = list(_train["text"])
+    sample_code: |
+      def tokenize(text):
+          return ____
+
+      counts = Counter(____)
+
+      vocab = {"<pad>": 0, "<unk>": 1}
+      for word, n in counts.most_common():
+          if ____:
+              vocab[word] = ____
+
+      def encode(text):
+          return [____ for token in tokenize(text)]
+
+      print(len(vocab))
+      print(encode("Pump in Module E is leaking near the centrifuge."))
+    solution: |
+      def tokenize(text):
+          return re.findall(r"[a-z0-9]+", text.lower())
+
+      counts = Counter(t for text in train_texts for t in tokenize(text))
+
+      vocab = {"<pad>": 0, "<unk>": 1}
+      for word, n in counts.most_common():
+          if n >= 2:
+              vocab[word] = len(vocab)
+
+      def encode(text):
+          return [vocab.get(token, vocab["<unk>"]) for token in tokenize(text)]
+
+      print(len(vocab))
+      print(encode("Pump in Module E is leaking near the centrifuge."))
+    tests: |
+      check_object("tokenize")
+      assert user["tokenize"]("Valve B-6: STUCK again!") == ["valve", "b", "6", "stuck", "again"], \
+          "`tokenize` should lowercase and keep runs of letters/digits: 'Valve B-6: STUCK again!' -> ['valve', 'b', '6', 'stuck', 'again']."
+      check_equal("counts", msg="`counts` should count every token of every text in `train_texts`.")
+      v = check_object("vocab")
+      assert v.get("<pad>") == 0 and v.get("<unk>") == 1, "Keep `<pad>` at id 0 and `<unk>` at id 1."
+      assert set(v) == set(sol["vocab"]), \
+          f"`vocab` should hold the 2 special tokens plus every word seen at least twice ({len(sol['vocab'])} entries); yours has {len(v)}."
+      assert sorted(v.values()) == list(range(len(v))), "Ids should be 0, 1, 2, ... with no gaps or repeats. Use `len(vocab)` as the next id."
+      check_object("encode")
+      msg = "Leak near the pump, centrifuge offline."
+      expected = [v.get(t, 1) for t in sol["tokenize"](msg)]
+      assert user["encode"](msg) == expected, \
+          "`encode` should map each token to its id in `vocab`, and unknown tokens to `vocab['<unk>']` (1)."
+    success_msg: "Your vocabulary works. Notice that both `leaking` and `centrifuge` became `1`, the `<unk>` id: the training tickets only ever say `leak`, so even a simple inflection is unknown to a word-level vocabulary."
+
+  - id: oov-rate
+    type: coding
+    title: Measure the OOV rate
+    context: |
+      `tokenize` and the `vocab` you built are loaded. `test_texts` holds 60 held-out tickets
+      like the training ones. `new_texts` holds 8 messages from this week, after new equipment arrived.
+      How much of each set can the vocabulary actually read?
+    instructions:
+      - "Write `oov_rate(texts)`: the fraction of all tokens in `texts` that are **not** in `vocab`."
+      - Store `oov_rate(test_texts)` in `oov_test` and `oov_rate(new_texts)` in `oov_new`.
+      - "Store the average number of **characters** per message in `new_texts` divided by the average number of **word tokens** per message in `length_ratio`. That is how much longer a character-level model's input would be."
+    hint: |
+      Collect `tokens = [t for text in texts for t in tokenize(text)]`, then
+      `sum(t not in vocab for t in tokens) / len(tokens)`. For `length_ratio`, use
+      `np.mean([len(t) for t in new_texts]) / np.mean([len(tokenize(t)) for t in new_texts])`.
+    pre_code: |
+      import re
+      import numpy as np
+      from collections import Counter
+      from kits.nlp_transformers import ticket_split
+      _train, _test = ticket_split()
+      train_texts, test_texts = list(_train["text"]), list(_test["text"])
+      def tokenize(text):
+          return re.findall(r"[a-z0-9]+", text.lower())
+      counts = Counter(t for text in train_texts for t in tokenize(text))
+      vocab = {"<pad>": 0, "<unk>": 1}
+      for word, n in counts.most_common():
+          if n >= 2:
+              vocab[word] = len(vocab)
+      new_texts = [
+          "The new centrifuge in Module B is wobbling at high speed.",
+          "Spectrometer calibration failed twice this morning.",
+          "Can I reserve the centrifuge on Thursday afternoon?",
+          "Glovebox humidity sensor reads zero, probably broken.",
+          "Need replacement cuvettes for the spectrometer.",
+          "Treadmill harness strap is frayed, please inspect.",
+          "Requesting ibuprofen, my wrist is sore after the EVA.",
+          "The galley rehydrator is dripping onto the counter.",
+      ]
+    sample_code: |
+      def oov_rate(texts):
+          tokens = [t for text in texts for t in tokenize(text)]
+          return ____
+
+      oov_test = ____
+      oov_new = ____
+      print(f"OOV on held-out tickets: {oov_test:.1%}")
+      print(f"OOV on this week's messages: {oov_new:.1%}")
+
+      length_ratio = ____
+      print(f"Characters per message / words per message: {length_ratio:.1f}")
+    solution: |
+      def oov_rate(texts):
+          tokens = [t for text in texts for t in tokenize(text)]
+          return sum(t not in vocab for t in tokens) / len(tokens)
+
+      oov_test = oov_rate(test_texts)
+      oov_new = oov_rate(new_texts)
+      print(f"OOV on held-out tickets: {oov_test:.1%}")
+      print(f"OOV on this week's messages: {oov_new:.1%}")
+
+      length_ratio = np.mean([len(t) for t in new_texts]) / np.mean([len(tokenize(t)) for t in new_texts])
+      print(f"Characters per message / words per message: {length_ratio:.1f}")
+    tests: |
+      check_object("oov_rate")
+      check_equal("oov_test", msg="`oov_test` should be the share of tokens in `test_texts` that are not in `vocab` (a number between 0 and 1).")
+      check_equal("oov_new", msg="`oov_new` should be the share of tokens in `new_texts` that are not in `vocab`.")
+      assert abs(user["oov_rate"](["pump zzz", "zzz zzz"]) - 0.75) < 1e-9, "`oov_rate` should count unknown tokens over **all** tokens of all texts, not average per message."
+      check_equal("length_ratio", tol=1e-3, msg="`length_ratio` is mean characters per message divided by mean word tokens per message, both over `new_texts`.")
+    success_msg: Held-out tickets look fine, but about half of this week's tokens are unknown. A character model would read them all, at almost 7x the sequence length.
+
+  - id: choose-tokeniser
+    type: mc
+    title: Pick a tokeniser for the glove keypads
+    question: |
+      The crew will type tickets on new EVA-glove keypads, so expect lots of typos and
+      abbreviations. You are training a small neural classifier that must run on the
+      station's low-power tablet, with inputs of at most 64 tokens. Which tokeniser do you choose?
+    options:
+      - text: Word-level with a 200,000-word vocabulary, so nearly every real word is covered
+        feedback: |
+          A huge vocabulary does not help with typos: `presure` and `pressuer` are still unknown.
+          It also makes the embedding table ($200{,}000 \times d$) the biggest part of a small model.
+      - text: Character-level, because it never produces an unknown token
+        feedback: |
+          No OOV, but a 12-word ticket becomes about 70 characters, which overflows the
+          64-token limit, and attention cost grows with the square of length. Good for short, very noisy strings, not here.
+      - text: Subword (BPE) with a vocabulary of about 8,000 pieces
+        correct: true
+        feedback: |
+          Right. Common words stay whole, typos and new words fall back to known pieces,
+          sequences stay close to word length, and an 8k-row embedding table is small.
+      - text: Word-level with `min_count=1`, so every training word is kept
+        feedback: |
+          Keeping singletons adds typos from the training set to the vocabulary but does nothing
+          for **new** typos at test time. OOV stays high, and rare ids get almost no training signal.
+    hint: Weigh three things for each option, OOV on noisy text, sequence length and embedding table size.

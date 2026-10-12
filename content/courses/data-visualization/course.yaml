@@ -1,0 +1,30 @@
+title: Data Visualization in Python
+description: 'Make clear charts with matplotlib and seaborn: choose the right chart, label it properly,
+  and explore data visually.'
+level: beginner
+est_hours: 3
+prerequisites:
+- pandas-data-manipulation
+objectives:
+- Pick the right chart for a question
+- Build and customise matplotlib figures
+- Use seaborn for statistical plots
+- Explore a dataset visually
+requires: []
+chapters:
+- id: matplotlib-basics
+  title: matplotlib basics
+  description: Figures, axes, line and scatter plots, labels.
+  lessons: []
+- id: distributions
+  title: Distributions
+  description: Histograms, box plots and KDEs.
+  lessons: []
+- id: relationships
+  title: Relationships and categories
+  description: Scatter matrices, bar charts and heatmaps.
+  lessons: []
+- id: exploratory-viz
+  title: Exploring a dataset
+  description: 'Putting it together: a visual EDA.'
+  lessons: []

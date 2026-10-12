@@ -1,0 +1,297 @@
+title: Broadcasting and shape bugs
+description: The broadcasting rules, the silent (N, 1) vs (N,) bug, and gradient descent written by hand.
+exercises:
+  - id: intro
+    type: video
+    title: Broadcasting, and how it bites
+    slides: |
+      # Broadcasting: maths on mismatched shapes
+
+      `X - X.mean(dim=0)` subtracts a `(3,)` tensor from a `(200, 3)` tensor without a loop.
+      PyTorch (like NumPy) applies one rule:
+
+      1. Line the shapes up **from the right**.
+      2. Each pair of sizes must be **equal**, or one of them must be **1** (a missing size counts as 1).
+      3. The result takes the larger size in every position.
+
+      | A | B | aligned | result |
+      | --- | --- | --- | --- |
+      | `(200, 3)` | `(3,)` | `200 3` / `_ 3` | `(200, 3)` |
+      | `(200, 3)` | `(200, 1)` | `200 3` / `200 1` | `(200, 3)` |
+      | `(200, 3)` | `(200,)` | `200 3` / `_ 200` | **error**: 3 vs 200 |
+      | `(4, 1)` | `(3,)` | `4 1` / `_ 3` | `(4, 3)`, bigger than both |
+
+      ---
+
+      ## Underneath: stride 0, no copies
+
+      Broadcasting does not copy the smaller tensor. It reads it with a **stride of 0** along the
+      stretched dimension, so every row sees the same memory:
+
+      ```python
+      v = torch.tensor([1.0, 2.0, 3.0])
+      big = v.expand(4, 3)    # what broadcasting does internally
+      big.stride()            # (0, 1): "next row" means skip 0 elements
+      ```
+
+      The **result** is still a full new tensor, though. That is where memory goes.
+
+      ---
+
+      ## `keepdim=True` keeps reductions broadcastable
+
+      Reducing over a dimension removes it. To divide each **row** by its own norm you need the
+      reduced dimension back as a 1:
+
+      ```python
+      X.norm(dim=1).shape                  # (200,)   X / this -> error (3 vs 200)
+      X.norm(dim=1, keepdim=True).shape    # (200, 1) X / this -> each row scaled
+      ```
+
+      Column statistics (`dim=0`) broadcast without it, because the missing dimension is on the left.
+
+      ---
+
+      ## The silent bug: `(N, 1)` minus `(N,)`
+
+      A model with one output returns predictions of shape `(N, 1)`. Targets often arrive as `(N,)`.
+
+      ```python
+      pred.shape, y.shape        # (100, 1), (100,)
+      (pred - y).shape           # (100, 100): every prediction minus every target
+      ((pred - y) ** 2).mean()   # a number, no error, and completely wrong
+      ```
+
+      **Symptom:** the loss is stuck near the variance of `y` no matter how good the model is.
+      **Measure:** print the shape of every intermediate. **Fix:** `y.unsqueeze(1)` or
+      `pred.squeeze(1)`. **Verify:** add `assert pred.shape == y.shape` before every loss.
+      (`F.mse_loss` prints a warning for this, which is easy to miss.)
+
+      ---
+
+      ## Trade-off: broadcast, repeat, or loop?
+
+      | approach | memory | speed | when it wins |
+      | --- | --- | --- | --- |
+      | Python loop over rows | tiny | very slow | almost never; only when each row needs different logic |
+      | `repeat` / `tile` then operate | copies the small tensor | fast | rarely; when you really need the copy |
+      | broadcasting | no copy of inputs, full-size result | fast | the default |
+      | broadcast to a huge intermediate, e.g. `(N, 1, D) - (1, M, D)` | $N \cdot M \cdot D$ floats | fast until it runs out of memory | small N, M; otherwise use a matmul form (`torch.cdist`, `A @ B.T`) |
+
+      The last row is a common out-of-memory cause: pairwise distances between 10,000 and 10,000
+      vectors of size 512 is 51 billion floats. Rewrite with matrix products instead.
+
+  - id: broadcast-or-error
+    type: classify
+    title: Broadcasts or errors?
+    prompt: |
+      For each `A + B`, decide what happens. Align the shapes from the right; each pair must be equal or contain a 1.
+    hint: A missing size counts as 1. If any aligned pair has two different sizes and neither is 1, it errors.
+    zones: [Raises an error, "Result has the larger input's shape", Result is bigger than both inputs]
+    items:
+      - { text: "(3, 4) + (4,)", zone: "Result has the larger input's shape" }
+      - { text: "(3, 4) + (3, 1)", zone: "Result has the larger input's shape" }
+      - { text: "(8, 3, 32, 32) + (3, 1, 1)", zone: "Result has the larger input's shape" }
+      - { text: "(1,) + (7, 7)", zone: "Result has the larger input's shape" }
+      - { text: "(3, 4) + (3,)", zone: Raises an error }
+      - { text: "(5,) + (4,)", zone: Raises an error }
+      - { text: "(8, 3, 32, 32) + (3,)", zone: Raises an error }
+      - { text: "(2, 3) + (3, 2)", zone: Raises an error }
+      - { text: "(100, 1) + (100,)", zone: Result is bigger than both inputs }
+      - { text: "(2, 1, 5) + (4, 1)", zone: Result is bigger than both inputs }
+
+  - id: standardise-features
+    type: coding
+    title: Standardise columns, normalise rows
+    context: |
+      `X` is a `(200, 3)` tensor whose columns have wildly different scales (around 0, around 1,000
+      and around 5). Networks train badly on unscaled inputs, so you will standardise each column,
+      then scale each row to unit length, as you will do later for cosine similarity.
+    instructions:
+      - Store the per-column mean and standard deviation (PyTorch's default `std`) in `mean` and `std`, each of shape `(3,)`.
+      - Store the standardised data `(X - mean) / std` in `Z`.
+      - Store `Z` with every row divided by its own length (`Z.norm(dim=1, ...)`) in `Z_unit`.
+      - Print `Z.mean(dim=0)` and `Z_unit.norm(dim=1)[:5]`.
+    hint: |
+      Column statistics use `dim=0`. For the row lengths you need `keepdim=True` so the shape is
+      `(200, 1)` and broadcasts across the columns.
+    pre_code: |
+      import torch
+      torch.manual_seed(0)
+      X = torch.randn(200, 3) * torch.tensor([1.0, 50.0, 0.01]) + torch.tensor([0.0, 1000.0, 5.0])
+    sample_code: |
+      mean = ____
+      std = ____
+      Z = ____
+
+      Z_unit = Z / Z.norm(dim=1)
+
+      print(Z.mean(dim=0))
+      print(Z_unit.norm(dim=1)[:5])
+    solution: |
+      mean = X.mean(dim=0)
+      std = X.std(dim=0)
+      Z = (X - mean) / std
+
+      Z_unit = Z / Z.norm(dim=1, keepdim=True)
+
+      print(Z.mean(dim=0))
+      print(Z_unit.norm(dim=1)[:5])
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "mean", atol=1e-3, msg="`mean` should be the mean of each column: `X.mean(dim=0)`, shape `(3,)`.")
+      check_tensor(user, sol, "std", atol=1e-3, rtol=1e-2, msg="`std` should be the standard deviation of each column: `X.std(dim=0)`, shape `(3,)`.")
+      check_tensor(user, sol, "Z", atol=2e-2, rtol=1e-2, msg="`Z` should be `(X - mean) / std`; each column should end up with mean 0 and std 1.")
+      check_tensor(user, sol, "Z_unit", atol=1e-3, rtol=1e-2, msg="Each row of `Z_unit` should have length 1. Divide by `Z.norm(dim=1, keepdim=True)`, shape `(200, 1)`.")
+    success_msg: Column stats broadcast for free; row stats needed `keepdim=True`.
+
+  - id: silent-broadcast-bug
+    type: coding
+    title: "Fix it: a perfect model with a terrible loss"
+    context: |
+      `model` is a `nn.Linear(2, 1)` already set to the weights that generated the data, so its
+      error should be about the noise level (around 0.01). The colleague's loss line reports
+      about 8.7. `X` is `(100, 2)` and `y` holds the 100 targets.
+    instructions:
+      - "Measure: store the shape of `pred - y`, exactly as the buggy line computes it, in `bad_shape`."
+      - "Fix the loss line so it compares each prediction only with its own target. Store the result in `loss`."
+      - Print `bad_shape` and `loss`.
+    hint: |
+      `pred` has shape `(100, 1)` and `y` has shape `(100,)`, which broadcast to `(100, 100)`.
+      Make them the same shape: `pred.squeeze(1)` or `y.unsqueeze(1)`.
+    pre_code: |
+      import torch
+      torch.manual_seed(0)
+      X = torch.randn(100, 2)
+      y = X @ torch.tensor([1.0, -2.0]) + 0.5 + 0.1 * torch.randn(100)
+      model = torch.nn.Linear(2, 1)
+      with torch.no_grad():
+          model.weight.copy_(torch.tensor([[1.0, -2.0]]))
+          model.bias.fill_(0.5)
+    sample_code: |
+      pred = model(X).detach()
+      print(pred.shape, y.shape)
+
+      bad_shape = ____
+
+      loss = ((pred - y) ** 2).mean()   # the colleague's line: fix it
+      print(bad_shape, loss)
+    solution: |
+      pred = model(X).detach()
+      print(pred.shape, y.shape)
+
+      bad_shape = (pred - y).shape
+
+      loss = ((pred.squeeze(1) - y) ** 2).mean()
+      print(bad_shape, loss)
+    tests: |
+      check_object("bad_shape")
+      assert tuple(user["bad_shape"]) == (100, 100), "`bad_shape` should be the shape of `pred - y` with the original shapes: `(pred - y).shape`."
+      check_object("loss")
+      l = float(user["loss"])
+      assert l < 0.05, f"`loss` is {l:.3f}, still far above the noise level. Make `pred` and `y` the same shape before subtracting."
+      assert abs(l - float(sol["loss"])) < 1e-4, "`loss` should be the mean squared error between each prediction and its own target."
+    success_msg: From 8.7 to 0.01 with one `squeeze`. Asserting `pred.shape == y.shape` before a loss catches this for good.
+
+  - id: gd-by-hand
+    type: sequential
+    title: "Chapter boss: linear regression with bare tensors"
+    context: |
+      No `nn`, no optimiser: just tensors, broadcasting and autograd. `X` is `(200, 3)` and `y` is
+      `(200, 1)`, generated from weights `[2, -3, 0.5]`, bias `1` and noise with standard deviation
+      0.1, so the best possible MSE is about 0.01.
+    pre_code: |
+      import torch
+      torch.manual_seed(0)
+      X = torch.randn(200, 3)
+      y = X @ torch.tensor([[2.0], [-3.0], [0.5]]) + 1.0 + 0.1 * torch.randn(200, 1)
+    steps:
+      - instructions:
+          - Create `w`, a `(3, 1)` tensor of zeros, and `b`, a `(1,)` tensor of zeros, both with `requires_grad=True`.
+          - Compute `pred = X @ w + b` and the mean squared error `loss`. Check that `pred` and `y` have the same shape.
+        hint: "`torch.zeros(3, 1, requires_grad=True)`; `loss = ((pred - y) ** 2).mean()`."
+        sample_code: |
+          w = ____
+          b = ____
+          pred = ____
+          assert pred.shape == y.shape
+          loss = ____
+          print(loss)
+        solution: |
+          w = torch.zeros(3, 1, requires_grad=True)
+          b = torch.zeros(1, requires_grad=True)
+          pred = X @ w + b
+          assert pred.shape == y.shape
+          loss = ((pred - y) ** 2).mean()
+          print(loss)
+        tests: |
+          from kits.deep_learning_pytorch import check_tensor
+          assert tuple(user["w"].shape) == (3, 1) and user["w"].requires_grad, "`w` should be zeros of shape `(3, 1)` with `requires_grad=True`."
+          assert user["b"].requires_grad, "`b` needs `requires_grad=True`."
+          check_tensor(user, sol, "loss", msg="With zero weights the loss is the mean of `y ** 2`. Check `pred = X @ w + b` and the mean squared error.")
+      - instructions:
+          - Call `loss.backward()`.
+          - "Compute the gradient by hand: `grad_w_manual = 2 / N * X.T @ (pred - y)` with `N = 200` (detach `pred` first)."
+          - Print `grad_w_manual` next to `w.grad`.
+        hint: "`err = pred.detach() - y`, then `grad_w_manual = 2 / len(X) * X.T @ err`. Its shape is `(3, 1)`, like `w`."
+        sample_code: |
+          loss.backward()
+          err = ____
+          grad_w_manual = ____
+          print(grad_w_manual.T)
+          print(w.grad.T)
+        solution: |
+          loss.backward()
+          err = pred.detach() - y
+          grad_w_manual = 2 / len(X) * X.T @ err
+          print(grad_w_manual.T)
+          print(w.grad.T)
+        tests: |
+          from kits.deep_learning_pytorch import check_tensor
+          assert user["w"].grad is not None, "Call `loss.backward()` so that `w.grad` is filled in."
+          check_tensor(user, sol, "grad_w_manual", msg="`grad_w_manual` should be `2 / 200 * X.T @ (pred - y)`, shape `(3, 1)`.")
+          check_tensor({"g": user["w"].grad}, {"g": sol["w"].grad}, "g", msg="`w.grad` should come from exactly one `backward()` call.")
+      - instructions:
+          - "Run 100 steps of gradient descent with learning rate `0.1`: compute the loss, call `backward()`, then inside `torch.no_grad()` subtract `lr * grad` from `w` and `b` and zero both gradients."
+          - Store the last loss as a Python float in `final_loss` and print it next to `w`.
+        hint: |
+          `w.grad` already holds the gradient from step 2, so zero the gradients at the start of the
+          loop (or right after each update). Updates go inside `with torch.no_grad():` so they are
+          not recorded: `w -= lr * w.grad`, then `w.grad.zero_()`.
+        sample_code: |
+          lr = 0.1
+          for step in range(100):
+              w.grad.zero_()
+              b.grad.zero_()
+              loss = ((X @ w + b - y) ** 2).mean()
+              loss.backward()
+              with torch.no_grad():
+                  w -= ____
+                  b -= ____
+
+          final_loss = ____
+          print(final_loss, w.T, b)
+        solution: |
+          lr = 0.1
+          for step in range(100):
+              w.grad.zero_()
+              b.grad.zero_()
+              loss = ((X @ w + b - y) ** 2).mean()
+              loss.backward()
+              with torch.no_grad():
+                  w -= lr * w.grad
+                  b -= lr * b.grad
+
+          final_loss = loss.item()
+          print(final_loss, w.T, b)
+        tests: |
+          check_object("final_loss")
+          fl = float(user["final_loss"])
+          assert fl < 0.02, f"`final_loss` is {fl:.4f}; it should get below 0.02. Check the update `w -= lr * w.grad` and that gradients are zeroed every step."
+          true_w = [2.0, -3.0, 0.5]
+          got = user["w"].detach().flatten().tolist()
+          assert all(abs(g - t) < 0.05 for g, t in zip(got, true_w)), f"`w` ended at {[round(g, 2) for g in got]}, but should be close to {true_w}."
+          assert abs(float(user["b"].detach()) - 1.0) < 0.05, "`b` should end close to 1."
+    success_msg: |
+      You just wrote what `nn.Linear`, `F.mse_loss` and `optim.SGD` do for you. Next chapter you
+      will swap them in and see that nothing about the mechanism changes.

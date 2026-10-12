@@ -1,0 +1,223 @@
+title: Preferences and DPO
+description: "Learn from 'A is better than B' instead of a single target: the DPO loss written out exactly, sequence log-probabilities, and what beta controls."
+exercises:
+  - id: intro
+    type: video
+    title: From one right answer to "this one is better"
+    slides: |
+      # Why preferences?
+
+      SFT needs a **target** for every prompt. Some qualities are easy to judge but hard to write a
+      target for: concise but complete, cites its source, refuses the right things, sounds like ORBIT.
+
+      Preference data is easier to collect: show a rater (or a judge model) two replies to the same
+      prompt and record which is better.
+
+      ```json
+      {"prompt": "How long do spacewalkers prebreathe oxygen?",
+       "chosen":   "2 hours of 100% oxygen. [eva-prep-checklist]",
+       "rejected": "Great question! ... About 93%. ..."}
+      ```
+
+      The usual recipe is **SFT first** (teach the format and the task), then **preference tuning** (teach which of
+      the plausible replies is better).
+
+      ---
+
+      ## RLHF or DPO?
+
+      **RLHF**: fit a reward model $r(x, y)$ on the pairs, then use reinforcement learning (PPO) to
+      maximise reward while a KL penalty keeps the policy near the SFT model $\pi_\text{ref}$.
+
+      **DPO** (Direct Preference Optimization) shows that the optimum of that same objective satisfies
+      $r(x,y) = \beta \log \frac{\pi_\theta(y|x)}{\pi_\text{ref}(y|x)} + \text{const}$. Substitute that into
+      the pairwise preference model and you get a plain classification loss on the pairs. No reward
+      model, no sampling, no RL.
+
+      | | RLHF (reward model + PPO) | DPO | Best-of-n, then SFT |
+      | --- | --- | --- | --- |
+      | Models in training | policy, reference, reward, value | policy, reference | policy |
+      | Stability, effort | finicky, many knobs | stable, a few knobs | simple |
+      | Data | can generate fresh samples (online) | a fixed set of pairs (offline) | samples ranked by a judge |
+      | When it wins | large budgets; rewards you can compute | most teams, most of the time | quick wins with a good judge |
+
+      ---
+
+      ## The DPO loss, exactly
+
+      $$\mathcal{L}_\text{DPO} = -\log \sigma\Big(\beta \big[ (\log\pi_\theta(y_w|x) - \log\pi_\text{ref}(y_w|x)) - (\log\pi_\theta(y_l|x) - \log\pi_\text{ref}(y_l|x)) \big]\Big)$$
+
+      $y_w$ is the chosen ("winner") reply, $y_l$ the rejected one, $\sigma$ the sigmoid.
+
+      ```python
+      def dpo_loss(pi_w, pi_l, ref_w, ref_l, beta=0.1):
+          margin = (pi_w - ref_w) - (pi_l - ref_l)       # how much MORE the policy now favours y_w
+          return -F.logsigmoid(beta * margin).mean()     # logsigmoid: stable for large margins
+      ```
+
+      - At the start $\pi_\theta = \pi_\text{ref}$, so the margin is 0 and the loss is $\log 2 \approx 0.693$.
+      - The loss only cares about the **difference**. Both log-probs can fall while the loss improves (watch for that).
+      - $\hat r(x,y) = \beta \log\frac{\pi_\theta}{\pi_\text{ref}}$ is the **implicit reward**. "Reward accuracy" is the share of pairs where $\hat r(y_w) > \hat r(y_l)$.
+
+      ---
+
+      ## Sequence log-probabilities
+
+      $\log\pi(y|x)$ is the sum over the **reply tokens** of $\log p(y_t \mid x, y_{<t})$: the same
+      `-100` mask as SFT, but **summed** instead of averaged.
+
+      ```python
+      def seq_logprob(logits, labels):                   # labels: -100 on prompt and padding
+          logp = torch.log_softmax(logits[:, :-1], dim=-1)
+          tgt = labels[:, 1:]
+          mask = tgt != -100
+          picked = logp.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+          return (picked * mask).sum(-1)                 # one number per sequence
+      ```
+
+      Run it on the policy and on the frozen **reference** (the SFT model). Reference log-probs never
+      change, so compute them once before training.
+
+      ---
+
+      ## What beta does
+
+      | β | effect | risk |
+      | --- | --- | --- |
+      | small (0.01-0.05) | the policy may move far from the reference to fit the pairs | drift, odd text, exploiting quirks of the data |
+      | typical (0.1-0.5) | a balance | none in particular |
+      | large (1+) | stays close to the reference; learns slowly | barely changes anything |
+
+      Watch during training: the loss, reward accuracy, the **chosen and rejected log-probs separately**,
+      and the KL from the reference. If the chosen log-prob falls steadily, probability is leaking to
+      replies that appear in neither set. Raise β, add an SFT term on the chosen replies, or stop earlier.
+
+  - id: dpo-loss
+    type: coding
+    title: The DPO loss by hand
+    context: |
+      Four preference pairs. `pi_w`, `pi_l` are the policy's sequence log-probs of the chosen and rejected
+      replies; `ref_w`, `ref_l` are the reference model's. `torch` and `F` (`torch.nn.functional`) are imported.
+    instructions:
+      - "Write `dpo_loss(pi_w, pi_l, ref_w, ref_l, beta)` returning the mean of `-F.logsigmoid(beta * margin)`, where `margin = (pi_w - ref_w) - (pi_l - ref_l)`."
+      - "Store `dpo_loss(pi_w, pi_l, ref_w, ref_l, 0.1).item()` in `loss`, and the loss when the policy equals the reference (pass `ref_w, ref_l` as the policy log-probs too) in `init_loss`."
+      - "Store `reward_acc`: the share of pairs whose implicit reward margin `0.1 * margin` is positive."
+    hint: "`init_loss` should come out as log 2. `reward_acc = (margin > 0).float().mean().item()`."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      pi_w = torch.tensor([-12.0, -30.5, -8.2, -20.0])
+      pi_l = torch.tensor([-15.0, -28.0, -9.9, -26.0])
+      ref_w = torch.tensor([-13.0, -31.0, -8.0, -21.5])
+      ref_l = torch.tensor([-14.0, -29.0, -9.0, -25.0])
+    sample_code: |
+      def dpo_loss(pi_w, pi_l, ref_w, ref_l, beta):
+          margin = ____
+          return ____
+
+      loss = dpo_loss(pi_w, pi_l, ref_w, ref_l, 0.1).item()
+      init_loss = ____
+      margin = (pi_w - ref_w) - (pi_l - ref_l)
+      reward_acc = ____
+      print(f"loss {loss:.4f}, at init {init_loss:.4f}, reward accuracy {reward_acc:.2f}")
+    solution: |
+      def dpo_loss(pi_w, pi_l, ref_w, ref_l, beta):
+          margin = (pi_w - ref_w) - (pi_l - ref_l)
+          return -F.logsigmoid(beta * margin).mean()
+
+      loss = dpo_loss(pi_w, pi_l, ref_w, ref_l, 0.1).item()
+      init_loss = dpo_loss(ref_w, ref_l, ref_w, ref_l, 0.1).item()
+      margin = (pi_w - ref_w) - (pi_l - ref_l)
+      reward_acc = (margin > 0).float().mean().item()
+      print(f"loss {loss:.4f}, at init {init_loss:.4f}, reward accuracy {reward_acc:.2f}")
+    tests: |
+      import math, torch
+      fn = check_object("dpo_loss")
+      torch.manual_seed(1)
+      a, b, c, d = torch.randn(4, 16).unbind(0)
+      want = -torch.nn.functional.logsigmoid(0.5 * ((a - c) - (b - d))).mean()
+      got = fn(a, b, c, d, 0.5)
+      assert torch.is_tensor(got) and got.dim() == 0, "`dpo_loss` should return a scalar tensor (the mean over pairs)."
+      assert abs(got.item() - want.item()) < 1e-5, "`dpo_loss` gives the wrong value. margin = (pi_w - ref_w) - (pi_l - ref_l), loss = mean of -logsigmoid(beta * margin)."
+      big = fn(torch.tensor([0.0]), torch.tensor([-1000.0]), torch.tensor([0.0]), torch.tensor([0.0]), 1.0)
+      assert torch.isfinite(big), "With a huge margin your loss is not finite. Use `F.logsigmoid` rather than `torch.log(torch.sigmoid(...))`."
+      check_equal("loss", tol=1e-5, msg="`loss` is `dpo_loss(pi_w, pi_l, ref_w, ref_l, 0.1).item()`.")
+      assert abs(float(check_object("init_loss")) - math.log(2)) < 1e-6, "When the policy equals the reference every margin is 0, so `init_loss` should be log 2 = 0.6931."
+      check_equal("reward_acc", msg="`reward_acc` is the share of pairs with a positive margin.")
+    success_msg: "log 2 at the start, as the maths predicts. One pair (the second) still has the policy favouring the rejected reply more than the reference does, so reward accuracy is 0.75."
+
+  - id: seq-logprob
+    type: coding
+    title: Sequence log-probabilities with a mask
+    context: |
+      `logits` has shape `(2, 10, 50)`: a model's scores for two prompt + reply sequences. `labels` holds
+      the token ids with `-100` on prompt and padding positions, the same masking as SFT. `torch` is imported.
+    instructions:
+      - "Write `seq_logprob(logits, labels)`: log-softmax `logits[:, :-1]`, take the targets `labels[:, 1:]`, pick each target's log-prob (use `tgt.clamp(min=0)` so -100 doesn't break `gather`), zero out masked positions and **sum** per sequence."
+      - "Store `seq_logprob(logits, labels)` in `lp` (shape `(2,)`), and the number of reply tokens scored per sequence in `n_scored` (a list of two ints)."
+    hint: "`picked = logp.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)`, then `(picked * mask).sum(-1)` with `mask = tgt != -100`."
+    pre_code: |
+      import torch
+      torch.manual_seed(2)
+      logits = torch.randn(2, 10, 50)
+      labels = torch.randint(0, 50, (2, 10))
+      labels[0, :6] = -100                 # sequence 0: 6 prompt tokens, 4 reply tokens
+      labels[1, :4] = -100                 # sequence 1: 4 prompt tokens, 4 reply tokens, 2 padding
+      labels[1, 8:] = -100
+    sample_code: |
+      def seq_logprob(logits, labels):
+          logp = torch.log_softmax(logits[:, :-1], dim=-1)
+          tgt = labels[:, 1:]
+          mask = ____
+          picked = logp.gather(-1, ____).squeeze(-1)
+          return ____
+
+      lp = seq_logprob(logits, labels)
+      n_scored = ____
+      print(lp, n_scored)
+    solution: |
+      def seq_logprob(logits, labels):
+          logp = torch.log_softmax(logits[:, :-1], dim=-1)
+          tgt = labels[:, 1:]
+          mask = tgt != -100
+          picked = logp.gather(-1, tgt.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+          return (picked * mask).sum(-1)
+
+      lp = seq_logprob(logits, labels)
+      n_scored = (labels[:, 1:] != -100).sum(-1).tolist()
+      print(lp, n_scored)
+    tests: |
+      import torch
+      from kits.fine_tuning_llms import check_tensor
+      check_tensor(user, sol, "lp", atol=1e-4, msg="`lp` should be, per sequence, the SUM of log-softmax(logits[:, :-1]) at the targets labels[:, 1:], over positions whose label is not -100.")
+      fn = check_object("seq_logprob")
+      L = torch.zeros(1, 4, 3)
+      lab = torch.tensor([[-100, 2, -100, 1]])
+      want = torch.log_softmax(L[:, :-1], -1)[0, 0, 2] + torch.log_softmax(L[:, :-1], -1)[0, 2, 1]
+      assert abs(fn(L, lab).item() - want.item()) < 1e-5, "On a hand-made example your function scores the wrong positions. Shift (position t predicts label t + 1) and skip every -100."
+      check_equal("n_scored", msg="`n_scored` counts the positions of `labels[:, 1:]` that are not -100, per sequence.")
+    success_msg: "One number per sequence, summed over the reply only. These are the four inputs of the DPO loss, from the policy and from the frozen reference."
+
+  - id: both-fall
+    type: mc
+    title: Is this run working?
+    context: |
+      DPO training log, averaged over the batch:
+
+      | step | loss | chosen log-prob | rejected log-prob |
+      | --- | --- | --- | --- |
+      | 0 | 0.693 | -42.0 | -40.0 |
+      | 200 | 0.410 | -48.5 | -58.0 |
+      | 400 | 0.250 | -55.1 | -71.3 |
+    question: The loss is falling nicely. What do you conclude?
+    options:
+      - text: Training is working; ship the checkpoint with the lowest loss.
+        feedback: "The loss only measures the *gap* between chosen and rejected. The chosen replies are becoming less likely too, so probability mass is going somewhere else: to replies in neither set."
+      - text: "The margin grows, but both replies lose probability: the policy is drifting towards replies in neither set. Check KL and sample outputs, then raise β, add an SFT term on the chosen replies, or stop earlier."
+        correct: true
+        feedback: "Right. A falling chosen log-prob is a known DPO failure. Look at actual generations and the KL from the reference. A larger β, an SFT loss on the chosen replies, or fewer steps keeps the policy anchored."
+      - text: The learning rate is too low, since the loss should be near 0 by step 400.
+        feedback: "A DPO loss near 0 isn't the goal. It would mean huge margins, usually through big drift. The worrying signal here is the chosen log-prob, not the speed."
+      - text: The reference model is being trained by mistake.
+        feedback: "Possible in buggy code, but nothing in this log shows it. The log shows the policy's own log-prob of the chosen replies falling, and that is the issue to address."
+    hint: The loss depends only on the difference between the two log-prob changes. What happens to the chosen reply itself?

@@ -1,0 +1,329 @@
+title: Graph search and HNSW
+description: Search by walking a nearest-neighbour graph. See why greedy walks get stuck, how beam search and the ef knob trade work for recall, and what HNSW's layers add.
+exercises:
+  - id: graph-search-slides
+    type: video
+    title: Walking a graph instead of scanning
+    slides: |
+      # Search by walking a graph
+
+      Build a **k-NN graph** once: link every vector to its $m$ nearest neighbours. To search, walk it:
+
+      1. Start at an entry node.
+      2. Score the current node's neighbours against the query.
+      3. Move to the best neighbour if it beats the current node; otherwise **stop**.
+
+      ```python
+      def greedy(q, entry=0):
+          cur, best = entry, X[entry] @ q
+          while True:
+              nb = G[cur]; s = X[nb] @ q            # m distance computations
+              if s.max() <= best: return cur
+              cur, best = nb[s.argmax()], s.max()
+      ```
+
+      Cost: (number of hops) × $m$ distance computations, typically hundreds instead of $N$.
+
+      ---
+
+      ## Why greedy gets stuck
+
+      Greedy stops at a **local** best: no neighbour is closer to the query, yet the true nearest vector lives elsewhere.
+
+      - Real embeddings are **clustered** (topics), and a pure k-NN graph links mostly within clusters, so a walk that
+        starts in the wrong cluster may never leave it.
+      - The result is **approximate**: recall@k < 1, and you only know how much below 1 by **measuring** against brute force.
+
+      Two fixes, both used by HNSW: explore more than one path (**beam search**), and start from a good entry point (**layers**).
+
+      ---
+
+      ## Beam search: the `ef` knob
+
+      Keep the `ef` best nodes found so far (`results`) and a queue of nodes still to expand (`candidates`). Always expand
+      the most promising candidate; stop when even the best candidate is worse than the worst result you're keeping.
+
+      | `ef` | distance computations | recall@10 | latency |
+      | --- | --- | --- | --- |
+      | 10 | few | lower | lowest |
+      | 50 | more | higher | higher |
+      | 200 | many | close to 1 | highest |
+
+      `ef` is a **query-time** setting: no rebuild needed, so you can tune it against your recall target and latency
+      budget, or even set it per request.
+
+      ---
+
+      ## HNSW = layers + beam search
+
+      **Hierarchical Navigable Small World** graphs stack layers. The top layers hold a few nodes with long links (express
+      lanes), and the bottom layer holds every node. A query descends greedily through the top layers to a good entry
+      point, then runs beam search at the bottom.
+
+      ```python
+      import hnswlib
+      index = hnswlib.Index(space="cosine", dim=768)
+      index.init_index(max_elements=1_000_000, M=16, ef_construction=200)
+      index.add_items(X, ids)
+      index.set_ef(64)                                   # efSearch
+      labels, distances = index.knn_query(Q, k=10)
+      ```
+
+      | parameter | effect | cost |
+      | --- | --- | --- |
+      | `M` (links per node) | higher recall, better connected | memory: about 2·M·4 bytes per vector on the bottom layer; slower build |
+      | `ef_construction` | better graph quality | build time only |
+      | `ef` (efSearch) | higher recall | query latency |
+
+      ---
+
+      ## HNSW trade-offs
+
+      - **Wins:** excellent recall/latency (often >0.95 recall@10 at ~1 ms for millions of vectors); incremental inserts.
+      - **Memory:** all vectors in RAM, **plus** the links. With 768-dim float32 vectors (3 KB each), M=16 links add about 4%.
+        With 64-dim vectors they add about 50%.
+      - **Deletes:** usually tombstones, so recall degrades until you rebuild.
+      - **Filters:** a strict filter ("only module C docs") can cut the graph into unreachable islands. Use pre-filtering
+        with brute force for small filtered sets, or a filter-aware engine.
+      - **Build time:** minutes to hours for large $N$, so it's a real cost when you rebuild after a model change.
+
+  - id: greedy-walk
+    type: coding
+    title: The greedy walk
+    context: |
+      `X` holds 5,000 unit vectors, `G` their k-NN graph (`G[i]` is an array of the 16 nearest neighbours of node `i`),
+      `Q` 100 queries and `truth[i, 0]` the exact nearest neighbour of query `i`. `np` is imported.
+    instructions:
+      - "Write `greedy(q, entry=0)` that walks the graph from `entry` and returns `(node, evals)`. At each step, score all neighbours of the current node; move to the best one if its score is **higher** than the current node's, otherwise stop."
+      - "`evals` counts distance computations: 1 for the entry node, plus one per neighbour scored at each step."
+      - "Run it for every query. Store the share of queries where `node == truth[i, 0]` in `recall1`, and the mean `evals` in `avg_evals`."
+    hint: |
+      `nb = G[cur]; s = X[nb] @ q; evals += len(nb); j = np.argmax(s)`. If `s[j] <= best`, return; otherwise set
+      `cur, best = nb[j], s[j]`.
+    pre_code: |
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries, knn_graph, exact_topk
+      X = make_vectors(5_000)
+      Q = make_queries(X, 100)
+      G = knn_graph(X, 16)
+      truth = exact_topk(X, Q, 10)
+    sample_code: |
+      def greedy(q, entry=0):
+          cur = entry
+          best = float(X[entry] @ q)
+          evals = 1
+          while True:
+              nb = G[cur]
+              s = X[nb] @ q
+              evals += ____
+              j = int(np.argmax(s))
+              if ____:
+                  return cur, evals
+              cur, best = int(nb[j]), float(s[j])
+
+      runs = [greedy(q) for q in Q]
+      recall1 = ____
+      avg_evals = ____
+      print(f"greedy recall@1 {recall1:.2f} using {avg_evals:.0f} of {len(X)} distance computations")
+    solution: |
+      def greedy(q, entry=0):
+          cur = entry
+          best = float(X[entry] @ q)
+          evals = 1
+          while True:
+              nb = G[cur]
+              s = X[nb] @ q
+              evals += len(nb)
+              j = int(np.argmax(s))
+              if s[j] <= best:
+                  return cur, evals
+              cur, best = int(nb[j]), float(s[j])
+
+      runs = [greedy(q) for q in Q]
+      recall1 = float(np.mean([node == truth[i, 0] for i, (node, _) in enumerate(runs)]))
+      avg_evals = float(np.mean([e for _, e in runs]))
+      print(f"greedy recall@1 {recall1:.2f} using {avg_evals:.0f} of {len(X)} distance computations")
+    tests: |
+      from kits.embeddings_vector_search import greedy_search
+      f = check_object("greedy")
+      X, G, Q = sol["X"], sol["G"], sol["Q"]
+      for i in [0, 7, 42, 99]:
+          for entry in [0, 1234]:
+              got = f(Q[i], entry)
+              want = greedy_search(Q[i], X, G, entry)
+              assert int(got[0]) == want[0], f"For query {i} from entry {entry}, the walk should stop at node {want[0]}, got {got[0]}. Move only while the best neighbour scores higher than the current node."
+              assert int(got[1]) == want[1], f"For query {i} from entry {entry}, `evals` should be {want[1]}, got {got[1]}. Count 1 for the entry plus len(G[cur]) per step."
+      check_equal("recall1", msg="`recall1` should be the share of queries whose greedy node equals `truth[i, 0]`.")
+      check_equal("avg_evals", msg="`avg_evals` should be the mean of the evals counts.")
+    success_msg: Greedy does only about 1% of the work of brute force, but it finds the true nearest neighbour for only about a third of the queries. It gets stuck in the wrong neighbourhood. Fast and wrong isn't a search engine yet.
+
+  - id: beam-ef
+    type: coding
+    title: Beam search and the ef knob
+    context: |
+      Same `X`, `G`, `Q` and `truth` as before. `beam(q, ef, k=10)` below is the bottom-layer search of HNSW, with two
+      lines missing. `heapq` is imported: `results` is a min-heap, so `results[0]` is the **worst** of the `ef` nodes kept.
+    instructions:
+      - "Fill in the stopping rule: stop when the best remaining candidate scores lower than the worst kept result **and** `results` already holds `ef` nodes."
+      - "Fill in the admission rule: keep a newly scored neighbour if `results` has fewer than `ef` nodes or it beats the worst kept result."
+      - "For `ef` in `[10, 50, 100]`, store `curve[ef] = (recall_at_10, mean_evals)` over all 100 queries. recall@10 is the overlap between the top 10 and `truth[i]`, divided by 10."
+    hint: |
+      Stopping: `if -neg < results[0][0] and len(results) >= ef: break`.
+      Admission: `if len(results) < ef or s > results[0][0]:`.
+      Recall for one query: `len(set(top) & set(truth[i])) / 10`.
+    pre_code: |
+      import heapq
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries, knn_graph, exact_topk
+      X = make_vectors(5_000)
+      Q = make_queries(X, 100)
+      G = knn_graph(X, 16)
+      truth = exact_topk(X, Q, 10)
+    sample_code: |
+      def beam(q, ef, k=10, entry=0):
+          visited = {entry}
+          s0 = float(X[entry] @ q)
+          evals = 1
+          candidates = [(-s0, entry)]   # max-heap (negated scores): the next node to expand
+          results = [(s0, entry)]       # min-heap: the ef best so far; results[0] is the worst of them
+          while candidates:
+              neg, c = heapq.heappop(candidates)
+              if ____:
+                  break
+              for nb in G[c]:
+                  nb = int(nb)
+                  if nb in visited:
+                      continue
+                  visited.add(nb)
+                  s = float(X[nb] @ q)
+                  evals += 1
+                  if ____:
+                      heapq.heappush(candidates, (-s, nb))
+                      heapq.heappush(results, (s, nb))
+                      if len(results) > ef:
+                          heapq.heappop(results)
+          top = [i for _, i in sorted(results, reverse=True)[:k]]
+          return top, evals
+
+      curve = {}
+      for ef in [10, 50, 100]:
+          runs = [beam(q, ef) for q in Q]
+          recall = ____
+          evals = np.mean([e for _, e in runs])
+          curve[ef] = (recall, evals)
+          print(f"ef={ef:3d}: recall@10 {recall:.2f}, {evals:.0f} distance computations")
+    solution: |
+      def beam(q, ef, k=10, entry=0):
+          visited = {entry}
+          s0 = float(X[entry] @ q)
+          evals = 1
+          candidates = [(-s0, entry)]   # max-heap (negated scores): the next node to expand
+          results = [(s0, entry)]       # min-heap: the ef best so far; results[0] is the worst of them
+          while candidates:
+              neg, c = heapq.heappop(candidates)
+              if -neg < results[0][0] and len(results) >= ef:
+                  break
+              for nb in G[c]:
+                  nb = int(nb)
+                  if nb in visited:
+                      continue
+                  visited.add(nb)
+                  s = float(X[nb] @ q)
+                  evals += 1
+                  if len(results) < ef or s > results[0][0]:
+                      heapq.heappush(candidates, (-s, nb))
+                      heapq.heappush(results, (s, nb))
+                      if len(results) > ef:
+                          heapq.heappop(results)
+          top = [i for _, i in sorted(results, reverse=True)[:k]]
+          return top, evals
+
+      curve = {}
+      for ef in [10, 50, 100]:
+          runs = [beam(q, ef) for q in Q]
+          recall = float(np.mean([len(set(top) & set(truth[i])) / 10 for i, (top, _) in enumerate(runs)]))
+          evals = np.mean([e for _, e in runs])
+          curve[ef] = (recall, evals)
+          print(f"ef={ef:3d}: recall@10 {recall:.2f}, {evals:.0f} distance computations")
+    tests: |
+      from kits.embeddings_vector_search import beam_search
+      f = check_object("beam")
+      X, G, Q = sol["X"], sol["G"], sol["Q"]
+      for i in [3, 50]:
+          for ef in [10, 40]:
+              got, ge = f(Q[i], ef)
+              want, we = beam_search(Q[i], X, G, ef)
+              assert [int(x) for x in got] == want and ge == we, f"`beam(Q[{i}], ef={ef})` doesn't match a correct beam search. Check the stopping rule (best candidate worse than the worst kept result, with ef results kept) and the admission rule."
+      c = check_object("curve")
+      assert sorted(c) == [10, 50, 100], "`curve` should have keys 10, 50 and 100."
+      for ef in [10, 50, 100]:
+          assert abs(c[ef][0] - sol["curve"][ef][0]) < 1e-9, f"recall@10 for ef={ef} should be {sol['curve'][ef][0]:.3f}, got {c[ef][0]:.3f}. Average len(set(top) & set(truth[i])) / 10 over all queries."
+      assert c[100][0] >= 0.9 and c[100][1] < 0.3 * len(X), "With ef=100 you should reach recall@10 of at least 0.9 while scoring under 30% of the vectors."
+    success_msg: Raising ef from 10 to 100 lifts recall@10 from about 0.73 to about 0.96, at roughly 5x the distance computations but still around a fifth of a full scan. That curve is the dial you tune against your latency budget.
+
+  - id: express-lane
+    type: coding
+    title: A better entry point (what HNSW's layers do)
+    context: |
+      HNSW's upper layers exist to hand the bottom layer a good starting node. Imitate one upper layer: `upper` holds 64
+      node ids sampled at random. `greedy(q, entry)` is your walk from the first exercise, and `X`, `Q` and `truth` are loaded.
+    instructions:
+      - "Write `entry_for(q)`: return the node in `upper` with the highest score against `q`."
+      - "Run `greedy(q, entry_for(q))` for every query. Store recall@1 (node equals `truth[i, 0]`) in `recall1_layered`."
+      - "Store the mean distance computations in `avg_evals_layered`, **including** the 64 spent scoring `upper`."
+    hint: "`int(upper[np.argmax(X[upper] @ q)])`. Add `len(upper)` to each run's evals before averaging."
+    pre_code: |
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries, knn_graph, exact_topk, greedy_search
+      X = make_vectors(5_000)
+      Q = make_queries(X, 100)
+      G = knn_graph(X, 16)
+      truth = exact_topk(X, Q, 10)
+      upper = np.random.default_rng(7).choice(len(X), 64, replace=False)
+      def greedy(q, entry=0):
+          return greedy_search(q, X, G, entry)
+      recall1_plain = float(np.mean([greedy(q)[0] == truth[i, 0] for i, q in enumerate(Q)]))
+    sample_code: |
+      def entry_for(q):
+          return ____
+
+      runs = [greedy(q, entry_for(q)) for q in Q]
+      recall1_layered = ____
+      avg_evals_layered = ____
+      print(f"plain greedy recall@1 {recall1_plain:.2f}; with a top layer {recall1_layered:.2f} at {avg_evals_layered:.0f} evals")
+    solution: |
+      def entry_for(q):
+          return int(upper[np.argmax(X[upper] @ q)])
+
+      runs = [greedy(q, entry_for(q)) for q in Q]
+      recall1_layered = float(np.mean([node == truth[i, 0] for i, (node, _) in enumerate(runs)]))
+      avg_evals_layered = float(np.mean([e + len(upper) for _, e in runs]))
+      print(f"plain greedy recall@1 {recall1_plain:.2f}; with a top layer {recall1_layered:.2f} at {avg_evals_layered:.0f} evals")
+    tests: |
+      import numpy as np
+      f = check_object("entry_for")
+      X, Q, upper = sol["X"], sol["Q"], sol["upper"]
+      for i in [0, 11, 64]:
+          assert int(f(Q[i])) == int(upper[np.argmax(X[upper] @ Q[i])]), "`entry_for(q)` should return the id (from `upper`) of the best-scoring upper node, not its position in `upper`."
+      check_equal("recall1_layered", msg="`recall1_layered` should be the share of queries where greedy from `entry_for(q)` stops at `truth[i, 0]`.")
+      check_equal("avg_evals_layered", msg="`avg_evals_layered` should include the 64 upper-node scores in each run's evals.")
+      assert user["recall1_layered"] > sol["recall1_plain"], "Starting from a good entry point should beat starting from node 0."
+    success_msg: A better start lifts greedy recall noticeably for about 64 extra distance computations. Real HNSW stacks several such layers and then runs beam search with ef at the bottom. That combination is why it reaches high recall so cheaply.
+
+  - id: raise-ef
+    type: mc
+    title: What does raising ef buy you?
+    question: |
+      Your HNSW index (M=16) answers at p95 = 4 ms with recall@10 = 0.88 on your evaluation queries. You raise `ef`
+      (efSearch) from 50 to 200 without rebuilding. What happens?
+    options:
+      - text: Recall goes up and query latency goes up. Memory and build time don't change.
+        correct: true
+        feedback: "Right. `ef` only controls how widely each query explores the existing graph: more candidates are scored, so recall rises with diminishing returns and latency grows roughly in proportion to the extra work. Re-measure both and pick the smallest ef that meets your recall target."
+      - text: Memory goes up, because each node stores more links.
+        feedback: "That's `M`, the number of links per node, which is fixed when the index is built. `ef` is a query-time setting."
+      - text: Recall goes down, because the search wanders further from the query.
+        feedback: "A wider beam keeps more good candidates, so it can only find the same nodes or better ones. Recall doesn't drop."
+      - text: Nothing, until the index is rebuilt.
+        feedback: "You're thinking of `ef_construction`, which only matters while the graph is built. `ef` (efSearch) takes effect on the next query."
+    hint: Is ef stored in the graph, or used only while a query runs?

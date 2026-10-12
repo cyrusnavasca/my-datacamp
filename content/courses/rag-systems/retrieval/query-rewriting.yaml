@@ -1,0 +1,381 @@
+title: Query rewriting
+description: Close the gap between how the crew talks and how the handbook is written. Rewrite, multi-query and HyDE, what each costs, and how rewriting can go wrong.
+exercises:
+  - id: rewriting-slides
+    type: video
+    title: The crew doesn't talk like the handbook
+    slides: |
+      # Vocabulary mismatch
+
+      | crew asks | handbook says |
+      | --- | --- |
+      | When do the **plant lamps turn on**? | grow lights ... **switching on** at 05:00 |
+      | Where's the **heart shocker**? | the **defibrillator (AED)** hangs next to ... |
+      | How often does the **supply ship** come? | the **cargo vehicle Tern** arrives every 60 days |
+
+      On 8 slang questions, ORBIT's retrievers find the right doc in the top 3 only 25-63% of the time (recall@3:
+      BM25 0.25, dense 0.38, hybrid 0.63). Keyword search needs the same words. Our small embedder never learned
+      that "lamp" and "light" are related, and real embedding models also struggle with slang and nicknames.
+
+      An LLM, though, knows that "heart shocker" means defibrillator. So spend **one model call before
+      retrieval** to translate the question into the corpus's language.
+
+      ---
+
+      ## Rewrite: one call, one better query
+
+      ```python
+      REWRITE_SYSTEM = ("Rewrite the crew member's question as a standalone search query that uses the "
+                        "handbook's terms. Reply with the query only.")
+
+      def rewrite(question):
+          r = client.messages.create(model="claude-haiku-4-5", max_tokens=100, system=REWRITE_SYSTEM,
+                                     messages=[{"role": "user", "content": f"<query>{question}</query>"}])
+          return r.content[0].text.strip()
+
+      rewrite("When do the plant lamps turn on?")   # 'When do the grow lights switch on?'
+      ```
+
+      - A **small, fast model** is usually enough for rewriting, so the extra call stays cheap.
+      - **Standalone** matters in chats: "and the second one?" must become "How often are the SCR-2 scrubber beds swapped?" before it can be searched.
+      - Use the rewritten question for **generation too**. Our offline reader is literal, so it can't connect "plant lamps" to a chunk about "grow lights". Real models are more forgiving, but a standalone question still helps them.
+
+      ---
+
+      ## Three more patterns
+
+      **Multi-query**: ask for several phrasings, search each, fuse with RRF. The original question stays in the mix,
+      so a bad rewrite can't take over.
+
+      ```python
+      lines = ask_model("Write 3 different search queries for this question, one per line.", question).splitlines()
+      fused = rrf([[c["id"] for c in search(q, 10)] for q in lines])
+      ```
+
+      **HyDE** (hypothetical document embeddings): ask the model to *write a plausible answer passage*, then embed
+      that instead of the question. Answers look more like documents than questions do, so they land closer in
+      vector space. The risk: a confidently wrong hypothetical retrieves confidently wrong chunks.
+
+      **Decomposition**: split "Who can book the glovebox, and in which module is it?" into two sub-questions,
+      retrieve for each and merge the results. This is useful when one query can't match both halves.
+
+      ---
+
+      ## What rewriting costs
+
+      | technique | helps with | extra cost per question | latency | risk |
+      | --- | --- | --- | --- | --- |
+      | rewrite | slang, follow-ups, typos | 1 small LLM call | +0.3-1 s, before retrieval can start | **drift**: the meaning changes |
+      | multi-query | ambiguous or varied phrasing | 1 LLM call + n searches | +1 call; searches run in parallel | more candidates to rank |
+      | HyDE | short or abstract questions | 1 LLM call with a longer output | the slowest: it generates a passage | a wrong hypothetical misleads retrieval |
+      | decomposition | multi-part questions | 1 call + 1 search per part | +1 call | splitting simple questions for nothing |
+
+      Rewriting sits on the **critical path**: retrieval can't start until it returns. Options: rewrite only when
+      first-pass retrieval looks weak (a low top score), cache rewrites of frequent questions, use the smallest model that works.
+
+      ---
+
+      ## Drift: when rewriting breaks things
+
+      *"What is the Wi-Fi password?"* is unanswerable. The handbook never gives a password, and ORBIT correctly says it
+      doesn't know. The rewriter turns it into *"What is the network password?"*, which retrieves "ORBIT never asks for
+      a password", and ORBIT now answers with that sentence. **A refusal became a wrong answer.**
+
+      **Playbook: after adding rewriting,**
+
+      1. Measure accuracy **by question type**, including the unanswerables, not just overall.
+      2. Log the original and rewritten query side by side, and read the ones whose answers changed.
+      3. If rewrites drift, keep the original query in the retrieval mix (multi-query + RRF), tighten the rewrite
+         prompt ("keep every specific term"), or only rewrite when first-pass retrieval is weak.
+
+  - id: rewrite-slang
+    type: coding
+    title: Rewrite slang into handbook terms
+    context: |
+      `rw_client` is a FakeClaude acting as a small rewriting model: it knows common crew slang. `hybrid(query, k)` is
+      ORBIT's retriever, `gen` the grounded reader and `SLANG` the 8 slang questions. `evaluate(search, qs, k)` scores
+      a search function; `evaluate_pipeline(rag, qs)` scores a function `rag(question) -> (answer, chunks)`.
+    instructions:
+      - "Write `rewrite(question)`: call `rw_client.messages.create` with `model=MODEL`, `max_tokens=100`, `system=REWRITE_SYSTEM` and the question inside `<query></query>` tags. Return the stripped reply text."
+      - "Store recall@3 of `hybrid` on `SLANG` in `recall_plain`, and of `lambda q, k: hybrid(rewrite(q), k)` in `recall_rewritten`."
+      - "Write `rag(question)`: rewrite, retrieve 3 chunks with the rewritten query, and generate with `generate(gen, rewritten, chunks)`. Return `(answer, chunks)`. Store `evaluate_pipeline(rag, SLANG)[\"accuracy\"]` in `acc_rewritten`."
+      - Print the three numbers.
+    hint: |
+      `r = rw_client.messages.create(model=MODEL, max_tokens=100, system=REWRITE_SYSTEM, messages=[{"role": "user", "content": f"<query>{question}</query>"}])`
+      then `return r.content[0].text.strip()`. Recall is `evaluate(search, SLANG, k=3)["recall"]`.
+    pre_code: |
+      from kits.rag_systems import (orbit_chunks, HybridIndex, make_client, rewriter, generate, evaluate,
+                                    evaluate_pipeline, SLANG_QUESTIONS, MODEL)
+      hybrid = HybridIndex(orbit_chunks()).search
+      rw_client = make_client(rewriter())
+      gen = make_client()
+      SLANG = [q for q in SLANG_QUESTIONS if q["type"] == "slang"]
+      REWRITE_SYSTEM = ("Rewrite the crew member's question as a standalone search query that uses the "
+                        "handbook's terms. Reply with the query only.")
+      print([q["question"] for q in SLANG])
+    sample_code: |
+      def rewrite(question):
+          r = rw_client.messages.create(model=MODEL, max_tokens=100, system=REWRITE_SYSTEM,
+                                        messages=[{"role": "user", "content": ____}])
+          return ____
+
+      recall_plain = evaluate(hybrid, SLANG, k=3)["recall"]
+      recall_rewritten = evaluate(____, SLANG, k=3)["recall"]
+
+      def rag(question):
+          rewritten = ____
+          chunks = hybrid(rewritten, 3)
+          return generate(gen, ____, chunks), chunks
+
+      acc_rewritten = evaluate_pipeline(rag, SLANG)["accuracy"]
+      print(recall_plain, recall_rewritten, acc_rewritten)
+    solution: |
+      def rewrite(question):
+          r = rw_client.messages.create(model=MODEL, max_tokens=100, system=REWRITE_SYSTEM,
+                                        messages=[{"role": "user", "content": f"<query>{question}</query>"}])
+          return r.content[0].text.strip()
+
+      recall_plain = evaluate(hybrid, SLANG, k=3)["recall"]
+      recall_rewritten = evaluate(lambda q, k: hybrid(rewrite(q), k), SLANG, k=3)["recall"]
+
+      def rag(question):
+          rewritten = rewrite(question)
+          chunks = hybrid(rewritten, 3)
+          return generate(gen, rewritten, chunks), chunks
+
+      acc_rewritten = evaluate_pipeline(rag, SLANG)["accuracy"]
+      print(recall_plain, recall_rewritten, acc_rewritten)
+    tests: |
+      check_object("rewrite")
+      out = user["rewrite"]("Where is the heart shocker?")
+      assert isinstance(out, str) and "defibrillator" in out, f"`rewrite` should return the rewritten text; got {out!r}. Put the question in <query></query> tags and return `r.content[0].text.strip()`."
+      check_equal("recall_plain")
+      check_equal("recall_rewritten", msg="`recall_rewritten` should be recall@3 when `hybrid` searches with `rewrite(q)`.")
+      a = check_object("acc_rewritten")
+      assert a >= 0.85, f"Accuracy on the slang questions should reach 0.85; got {a}. Generate from the *rewritten* question, not the original."
+    success_msg: |
+      Recall on slang went from 0.63 to 1.0 with one cheap call per question, and accuracy reached 0.88 once the reader
+      also got the rewritten question (generating from the original slang leaves it at 0.25). The remaining miss is
+      the medicine cupboard: retrieval is right, but the answer sentence says "have it" instead of naming the cabinet.
+
+  - id: multi-query
+    type: coding
+    title: Multi-query with fusion
+    context: |
+      Asked for several queries, `rw_client` replies with one query per line: the original, a rewrite and a
+      keyword-only version. `dense(query, k)` is the dense retriever, `by_id` maps chunk ids to chunks and `rrf(rankings)`
+      fuses ranked id lists. `SLANG` and `HANDBOOK_QS` are question lists.
+    instructions:
+      - "Write `variants(question)`: call `rw_client` with `system=MULTI_SYSTEM` and the question in `<query>` tags, and return the non-empty, stripped lines of the reply."
+      - "Write `multi_search(question, k)`: search `dense` with each variant (top 10), fuse the id lists with `rrf`, and return the chunk dicts of the first `k` fused ids."
+      - "Store recall@3 on `SLANG` for `dense` and for `multi_search` in `recall_dense` and `recall_multi`, and recall@3 on `HANDBOOK_QS` for `multi_search` in `recall_multi_handbook`. Print them."
+    hint: |
+      `[l.strip() for l in text.splitlines() if l.strip()]` gives the lines. In `multi_search`:
+      `lists = [[c["id"] for c in dense(v, 10)] for v in variants(question)]`, then `[by_id[i] for i in rrf(lists)[:k]]`.
+    pre_code: |
+      from kits.rag_systems import (orbit_chunks, DenseIndex, rrf, make_client, rewriter, evaluate, questions,
+                                    SLANG_QUESTIONS, MODEL)
+      chunks = orbit_chunks()
+      by_id = {c["id"]: c for c in chunks}
+      dense = DenseIndex(chunks).search
+      rw_client = make_client(rewriter())
+      SLANG = [q for q in SLANG_QUESTIONS if q["type"] == "slang"]
+      HANDBOOK_QS = questions()
+      MULTI_SYSTEM = ("Write 3 different search queries for the crew member's question, one per line, using the "
+                      "handbook's terms. Reply with the queries only.")
+    sample_code: |
+      def variants(question):
+          r = rw_client.messages.create(model=MODEL, max_tokens=200, system=MULTI_SYSTEM,
+                                        messages=[{"role": "user", "content": f"<query>{question}</query>"}])
+          return ____
+
+      def multi_search(question, k):
+          lists = ____
+          return [by_id[i] for i in ____]
+
+      print(variants("When do the plant lamps turn on?"))
+      recall_dense = evaluate(dense, SLANG, k=3)["recall"]
+      recall_multi = ____
+      recall_multi_handbook = ____
+      print(recall_dense, recall_multi, recall_multi_handbook)
+    solution: |
+      def variants(question):
+          r = rw_client.messages.create(model=MODEL, max_tokens=200, system=MULTI_SYSTEM,
+                                        messages=[{"role": "user", "content": f"<query>{question}</query>"}])
+          return [l.strip() for l in r.content[0].text.splitlines() if l.strip()]
+
+      def multi_search(question, k):
+          lists = [[c["id"] for c in dense(v, 10)] for v in variants(question)]
+          return [by_id[i] for i in rrf(lists)[:k]]
+
+      print(variants("When do the plant lamps turn on?"))
+      recall_dense = evaluate(dense, SLANG, k=3)["recall"]
+      recall_multi = evaluate(multi_search, SLANG, k=3)["recall"]
+      recall_multi_handbook = evaluate(multi_search, HANDBOOK_QS, k=3)["recall"]
+      print(recall_dense, recall_multi, recall_multi_handbook)
+    tests: |
+      check_object("variants")
+      v = user["variants"]("When do the plant lamps turn on?")
+      assert isinstance(v, list) and len(v) == 3 and all(isinstance(x, str) and x == x.strip() and x for x in v), f"`variants` should return the 3 non-empty stripped lines; got {v!r}."
+      check_object("multi_search")
+      assert len(user["multi_search"]("What time is lights out?", 3)) == 3, "`multi_search(question, k)` should return k chunk dicts."
+      check_equal("recall_dense")
+      check_equal("recall_multi", msg="`recall_multi` should be recall@3 of `multi_search` on SLANG. Fuse the top-10 id lists of every variant with `rrf`.")
+      check_equal("recall_multi_handbook")
+      assert user["recall_multi"] >= 0.99, "Multi-query should find every slang question's document in the top 3."
+    success_msg: |
+      Dense recall on slang went from 0.38 to 1.0, and the handbook questions held their recall (0.95) because the
+      original question is one of the variants. The price is one LLM call plus three searches per question instead of one.
+
+  - id: rewrite-drift
+    type: mc
+    title: The rewrite that broke a refusal
+    question: |
+      After adding a rewriting step, overall accuracy went up, but one unanswerable question regressed: "What is the
+      Wi-Fi password?" used to get "I don't know" and now gets "ORBIT never asks for a password." Run `compare(QUESTION)`
+      in the console. What happened, and what's the best fix?
+    context: "`compare(question)` prints the rewritten query and ORBIT's answer with and without rewriting."
+    pre_code: |
+      from kits.rag_systems import orbit_chunks, HybridIndex, make_client, rewriter, generate, MODEL
+      hybrid = HybridIndex(orbit_chunks()).search
+      rw_client, gen = make_client(rewriter()), make_client()
+      QUESTION = "What is the Wi-Fi password?"
+
+      def rewrite(q):
+          return rw_client.messages.create(model=MODEL, max_tokens=100, system="Rewrite the question as a search query using the handbook's terms.",
+                                           messages=[{"role": "user", "content": f"<query>{q}</query>"}]).content[0].text.strip()
+
+      def compare(q):
+          rq = rewrite(q)
+          print("rewritten:     ", rq)
+          print("without rewrite:", generate(gen, q, hybrid(q, 3)))
+          print("with rewrite:   ", generate(gen, rq, hybrid(rq, 3)))
+    options:
+      - text: The reader model got worse. Switch to a larger generation model.
+        feedback: The reader behaved exactly as before. It answered from the chunks it was given. What changed is the query, and therefore the chunks. Look at the rewritten line in the console.
+      - text: The rewrite broadened "Wi-Fi password" into "network password", which matches a real but irrelevant sentence. Keep the original query in the mix (multi-query + RRF) or tell the rewriter to keep specific terms, then re-check the unanswerables.
+        correct: true
+        feedback: "Right. That's query drift: the rewrite changed what was being asked. The fixes keep the original intent in play, and the check is to measure unanswerable and by-type accuracy, not just the overall number, every time you change the rewriter."
+      - text: Unanswerable questions should never be rewritten, so skip rewriting for them.
+        feedback: You can't know a question is unanswerable before you've retrieved for it. That's the whole problem. You need a rewrite strategy that's safe on all questions.
+      - text: Raise k so the reader sees more chunks and realises the password isn't there.
+        feedback: More chunks about networks and passwords give the reader more plausible sentences to quote, not fewer. The drift is in the query, so fix it there.
+    hint: Compare the original and the rewritten query word by word. Which word changed meaning?
+
+  - id: retrieval-mission
+    type: sequential
+    title: "Mission: beat the chapter 1 retriever"
+    context: |
+      ORBIT's crew questions now include identifiers and slang. `QS` holds all 65 (45 handbook, 12 identifier,
+      8 slang). Your job: build hybrid retrieval, then reranking, then rewriting, and prove each stage pays for itself.
+
+      Available: `dense` and `hybrid` search functions, `reranker` (a `CrossEncoder` with `.rerank(query, chunks, top_n)`),
+      `rw_client` (the rewriting model) with `REWRITE_SYSTEM`, `gen` (the reader), `generate(gen, question, chunks)`,
+      `evaluate(search, QS, k=3)` and `evaluate_pipeline(rag, QS)`.
+    pre_code: |
+      from kits.rag_systems import (orbit_chunks, DenseIndex, HybridIndex, CrossEncoder, make_client, rewriter, generate,
+                                    evaluate, evaluate_pipeline, questions, SLANG_QUESTIONS, MODEL)
+      chunks = orbit_chunks()
+      dense = DenseIndex(chunks).search
+      hybrid = HybridIndex(chunks).search
+      reranker = CrossEncoder()
+      rw_client, gen = make_client(rewriter()), make_client()
+      QS = questions() + SLANG_QUESTIONS
+      REWRITE_SYSTEM = ("Rewrite the crew member's question as a standalone search query that uses the "
+                        "handbook's terms. Reply with the query only.")
+    steps:
+      - instructions:
+          - "**Baseline.** Evaluate `dense` on `QS` with `k=3` into `baseline`."
+          - "Store accuracy per question type (a dict type → mean `correct`) in `baseline_by_type` and print it with the overall accuracy."
+        hint: "`baseline[\"rows\"].groupby(\"type\")[\"correct\"].mean().to_dict()`"
+        sample_code: |
+          baseline = ____
+          baseline_by_type = ____
+          print(baseline["accuracy"], baseline_by_type)
+        solution: |
+          baseline = evaluate(dense, QS, k=3)
+          baseline_by_type = baseline["rows"].groupby("type")["correct"].mean().to_dict()
+          print(baseline["accuracy"], baseline_by_type)
+        tests: |
+          b = check_object("baseline")
+          assert isinstance(b, dict) and b.get("accuracy") == sol["baseline"]["accuracy"], "`baseline` should be `evaluate(dense, QS, k=3)`."
+          check_equal("baseline_by_type")
+      - instructions:
+          - "**Hybrid + rerank.** Write `retrieve(query, k)`: take 20 candidates from `hybrid` and return `reranker.rerank(query, candidates, k)`."
+          - "Evaluate it on `QS` with `k=3` into `stage2` and print its accuracy."
+        hint: "`return reranker.rerank(query, hybrid(query, 20), k)`"
+        sample_code: |
+          def retrieve(query, k):
+              candidates = ____
+              return ____
+
+          stage2 = evaluate(retrieve, QS, k=3)
+          print(stage2["accuracy"])
+        solution: |
+          def retrieve(query, k):
+              candidates = hybrid(query, 20)
+              return reranker.rerank(query, candidates, k)
+
+          stage2 = evaluate(retrieve, QS, k=3)
+          print(stage2["accuracy"])
+        tests: |
+          check_object("retrieve")
+          s = check_object("stage2")
+          assert s["accuracy"] > user["baseline"]["accuracy"], f"Hybrid + rerank ({s['accuracy']}) should beat the dense baseline ({user['baseline']['accuracy']}). Rerank 20 hybrid candidates."
+          assert abs(s["accuracy"] - sol["stage2"]["accuracy"]) < 1e-9, "Take 20 candidates from `hybrid`, then `reranker.rerank(query, candidates, k)`."
+      - instructions:
+          - "**Rewrite.** Write `rewrite(question)` with `rw_client` (`system=REWRITE_SYSTEM`, question in `<query>` tags), and `rag(question)`: rewrite, `retrieve` 3 chunks for the rewritten query, generate from the rewritten query, and return `(answer, chunks)`."
+          - "Store `evaluate_pipeline(rag, QS)` in `final` and print its accuracy and context tokens."
+          - "Pass when accuracy ≥ 0.9 with at most 150 context tokens per question."
+        hint: |
+          `rewritten = rewrite(question)`, `chunks = retrieve(rewritten, 3)`, `return generate(gen, rewritten, chunks), chunks`.
+        sample_code: |
+          def rewrite(question):
+              r = rw_client.messages.create(model=MODEL, max_tokens=100, system=REWRITE_SYSTEM,
+                                            messages=[{"role": "user", "content": ____}])
+              return r.content[0].text.strip()
+
+          def rag(question):
+              rewritten = ____
+              chunks = ____
+              return ____, chunks
+
+          final = evaluate_pipeline(rag, QS)
+          print(final["accuracy"], final["context_tokens"])
+        solution: |
+          def rewrite(question):
+              r = rw_client.messages.create(model=MODEL, max_tokens=100, system=REWRITE_SYSTEM,
+                                            messages=[{"role": "user", "content": f"<query>{question}</query>"}])
+              return r.content[0].text.strip()
+
+          def rag(question):
+              rewritten = rewrite(question)
+              chunks = retrieve(rewritten, 3)
+              return generate(gen, rewritten, chunks), chunks
+
+          final = evaluate_pipeline(rag, QS)
+          print(final["accuracy"], final["context_tokens"])
+        tests: |
+          f = check_object("final")
+          assert f["context_tokens"] <= 150, f"Context is {f['context_tokens']} tokens per question; keep it at most 150 (k=3)."
+          assert f["accuracy"] >= 0.9, f"Accuracy is {f['accuracy']}; the target is 0.9. Rewrite before retrieving, and generate from the rewritten question."
+      - instructions:
+          - "**Count the cost.** Store the mean `latency_ms` of the rewriter's calls (`rw_client.calls`) in `rewrite_ms`."
+          - "Build `summary`, a dict mapping `\"dense\"`, `\"hybrid+rerank\"` and `\"+rewrite\"` to the accuracy of `baseline`, `stage2` and `final`. Print `summary` and `rewrite_ms`."
+        hint: "`sum(c[\"latency_ms\"] for c in rw_client.calls) / len(rw_client.calls)`"
+        sample_code: |
+          rewrite_ms = ____
+          summary = {"dense": ____, "hybrid+rerank": ____, "+rewrite": ____}
+          print(summary, round(rewrite_ms), "ms per rewrite")
+        solution: |
+          rewrite_ms = sum(c["latency_ms"] for c in rw_client.calls) / len(rw_client.calls)
+          summary = {"dense": baseline["accuracy"], "hybrid+rerank": stage2["accuracy"], "+rewrite": final["accuracy"]}
+          print(summary, round(rewrite_ms), "ms per rewrite")
+        tests: |
+          check_equal("rewrite_ms", msg="`rewrite_ms` should be the mean `latency_ms` over `rw_client.calls`.")
+          check_equal("summary")
+    success_msg: |
+      Dense 0.78 → hybrid + rerank 0.86 → + rewrite 0.92, each stage measured on the same 65 questions. The bill is about
+      20 reranker passes plus one rewriting call per question, the rewrite on the critical path. And the Wi-Fi
+      question now gets a wrong answer instead of a refusal. Rewriting drifted it, and chapter 4 makes ORBIT refuse
+      when the evidence is weak.

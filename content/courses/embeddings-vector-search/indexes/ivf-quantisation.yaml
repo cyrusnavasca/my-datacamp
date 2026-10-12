@@ -1,0 +1,228 @@
+title: IVF and quantisation
+description: Cluster the vectors and scan only the nearest buckets, shrink every vector to bytes, and choose between brute force, HNSW and IVF-PQ for a given budget.
+exercises:
+  - id: ivf-quantisation-slides
+    type: video
+    title: Scan less, store less
+    slides: |
+      # IVF: search only the nearest buckets
+
+      An **inverted file index** (IVF) splits the space into `nlist` regions with k-means:
+
+      1. **Train:** run k-means on a sample of the vectors, which gives `nlist` centroids.
+      2. **Add:** put each vector in the list (bucket) of its nearest centroid.
+      3. **Search:** score the query against all centroids, then scan only the `nprobe` closest lists.
+
+      Cost per query is about $\text{nlist} + N \cdot \frac{\text{nprobe}}{\text{nlist}}$ distance computations
+      instead of $N$. With nlist = 1,000 and nprobe = 10 that's about 1% of the work.
+
+      For cosine search, normalise the centroids and use the dot product for both assignment and probing.
+
+      ---
+
+      ## The boundary problem, and `nprobe`
+
+      A query near the edge of its region often has true neighbours in the **next** region over. With `nprobe = 1`
+      you miss them, and recall drops.
+
+      | knob | raises recall | costs |
+      | --- | --- | --- |
+      | `nprobe` (query time) | scan more lists | latency grows about linearly |
+      | `nlist` (build time) | smaller lists, finer regions | more centroids to score; needs `nprobe` raised too |
+
+      Rules of thumb: nlist ≈ $\sqrt{N}$ to $4\sqrt{N}$; train on a representative sample (30 to 250 vectors per
+      centroid); re-train when the data drifts. Watch for **unbalanced lists**: a few giant lists make some queries
+      far slower than others, which shows up in p95 latency, not in the mean.
+
+      ---
+
+      ## Quantisation: fewer bytes per vector
+
+      - **Scalar (int8):** scale each dimension into −127..127 and store one byte per value instead of four.
+        Memory drops 4x and recall barely moves.
+      - **Product quantisation (PQ):** cut the vector into $m$ sub-vectors and replace each with the id of its nearest
+        "code" from a small learned codebook. A 768-dim float32 vector (3,072 bytes) becomes, for example, 96 bytes.
+        That's 32x smaller, with a bigger recall loss.
+      - **Rescoring:** search the compressed vectors for the top 50 or 100, then re-score just those with the full vectors
+        (kept on SSD) and return the top 10. It recovers most of the lost recall for a small extra cost.
+
+      ---
+
+      ## Choosing an index
+
+      | | brute force | HNSW | IVF (flat) | IVF-PQ |
+      | --- | --- | --- | --- | --- |
+      | recall | 1.0 (exact) | very high (0.95-0.99) | tunable (nprobe) | lower; rescoring helps |
+      | latency | grows with N | ~ms, grows slowly | tunable | fast |
+      | memory | N·d·4 bytes | vectors + links | vectors + centroids | ~N·m bytes (tiny) |
+      | build | none | slow, incremental | k-means training | k-means + codebooks |
+      | updates and deletes | trivial | inserts ok, deletes awkward | easy (append to a list) | easy |
+      | sweet spot | < ~1M, filters, exact | millions, in RAM, low latency | large, simple to operate | billions, memory-bound |
+
+      ```python
+      import faiss
+      quantizer = faiss.IndexFlatIP(d)
+      index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)   # or faiss.IndexIVFPQ(quantizer, d, nlist, 96, 8)
+      index.train(X_sample); index.add(X)
+      index.nprobe = 16
+      scores, ids = index.search(Q, 10)
+      ```
+
+  - id: build-ivf
+    type: coding
+    title: Build an IVF index
+    context: |
+      `X` holds 50,000 unit vectors (64 dims), `Q` 200 queries and `truth` the exact top 10 for each query. `KMeans` and
+      `np` are imported. Build an IVF index by hand and measure the recall you get for the work you do.
+    instructions:
+      - "Fit `KMeans(n_clusters=100, n_init=1, random_state=0, max_iter=25)` on the sample `X[::5]`. Normalise its `cluster_centers_` to unit length and store them in `centroids`."
+      - "Assign every vector to its best centroid by dot product (`argmax` of `X @ centroids.T`), and store `lists`, a list of 100 arrays of row ids, one per centroid."
+      - "Write `ivf_search(q, nprobe, k=10)`: pick the `nprobe` best centroids for `q`, concatenate their lists into the candidates, score the candidates, and return `(top-k ids best first, number of candidates scanned)`."
+      - "For `nprobe` in `[1, 8, 32]`, store `results[nprobe] = (recall_at_10, mean_fraction_scanned)` over all queries."
+    hint: |
+      `assign = np.argmax(X @ centroids.T, axis=1)`; `lists = [np.where(assign == c)[0] for c in range(100)]`.
+      In `ivf_search`: `probe = np.argsort(-(centroids @ q))[:nprobe]`, `cand = np.concatenate([lists[c] for c in probe])`,
+      `top = cand[np.argsort(-(X[cand] @ q))[:k]]`. The fraction scanned is `n / len(X)`.
+    pre_code: |
+      import numpy as np
+      from sklearn.cluster import KMeans
+      from kits.embeddings_vector_search import make_vectors, make_queries, exact_topk
+      X = make_vectors(50_000)
+      Q = make_queries(X, 200)
+      truth = exact_topk(X, Q, 10)
+    sample_code: |
+      km = KMeans(n_clusters=100, n_init=1, random_state=0, max_iter=25).fit(X[::5])
+      centroids = ____
+      assign = ____
+      lists = [np.where(assign == c)[0] for c in range(100)]
+
+      def ivf_search(q, nprobe, k=10):
+          probe = ____
+          cand = ____
+          top = ____
+          return top, len(cand)
+
+      results = {}
+      for nprobe in [1, 8, 32]:
+          runs = [ivf_search(q, nprobe) for q in Q]
+          recall = np.mean([len(set(top) & set(truth[i])) / 10 for i, (top, _) in enumerate(runs)])
+          scanned = np.mean([n / len(X) for _, n in runs])
+          results[nprobe] = (recall, scanned)
+          print(f"nprobe={nprobe:2d}: recall@10 {recall:.2f}, scanned {scanned:.1%}")
+    solution: |
+      km = KMeans(n_clusters=100, n_init=1, random_state=0, max_iter=25).fit(X[::5])
+      centroids = km.cluster_centers_ / np.linalg.norm(km.cluster_centers_, axis=1, keepdims=True)
+      assign = np.argmax(X @ centroids.T, axis=1)
+      lists = [np.where(assign == c)[0] for c in range(100)]
+
+      def ivf_search(q, nprobe, k=10):
+          probe = np.argsort(-(centroids @ q))[:nprobe]
+          cand = np.concatenate([lists[c] for c in probe])
+          top = cand[np.argsort(-(X[cand] @ q))[:k]]
+          return top, len(cand)
+
+      results = {}
+      for nprobe in [1, 8, 32]:
+          runs = [ivf_search(q, nprobe) for q in Q]
+          recall = np.mean([len(set(top) & set(truth[i])) / 10 for i, (top, _) in enumerate(runs)])
+          scanned = np.mean([n / len(X) for _, n in runs])
+          results[nprobe] = (recall, scanned)
+          print(f"nprobe={nprobe:2d}: recall@10 {recall:.2f}, scanned {scanned:.1%}")
+    tests: |
+      import numpy as np
+      c = check_object("centroids")
+      assert np.shape(c) == (100, 64) and np.allclose(np.linalg.norm(c, axis=1), 1, atol=1e-5), "`centroids` should be the 100 k-means centres, each normalised to length 1."
+      L = check_object("lists")
+      assert len(L) == 100 and sum(len(x) for x in L) == 50_000, "`lists` should have 100 arrays that together hold all 50,000 row ids."
+      f = check_object("ivf_search")
+      for i in [0, 5]:
+          top, n = f(sol["Q"][i], 4)
+          wt, wn = sol["ivf_search"](sol["Q"][i], 4)
+          assert int(n) == int(wn), f"With nprobe=4, query {i} should scan {wn} vectors (the 4 best lists), got {n}."
+          assert list(top) == list(wt), f"`ivf_search` should return the top 10 candidates by score, best first."
+      r = check_object("results")
+      for p in [1, 8, 32]:
+          assert abs(r[p][0] - sol["results"][p][0]) < 1e-9 and abs(r[p][1] - sol["results"][p][1]) < 1e-9, f"`results[{p}]` should be {tuple(round(x, 3) for x in sol['results'][p])}."
+    timeout: 60
+    success_msg: With nprobe=1 you scan about 1% of the vectors but find less than half of the true top 10. With nprobe=32 you scan about a third and find about 94%. Neighbours just over a region boundary are the whole story. The mission at the end of this chapter tunes this curve against a latency budget.
+
+  - id: int8-quantise
+    type: coding
+    title: Quantise to int8
+    context: |
+      Same `X`, `Q` and `truth`. Store the vectors in one byte per value instead of four, and measure what that costs in
+      recall, with and without rescoring.
+    instructions:
+      - "Compute a per-dimension `scale = np.abs(X).max(axis=0) / 127`, and store `X8 = np.round(X / scale).astype(np.int8)`."
+      - "Store `X.nbytes / X8.nbytes` in `memory_ratio`."
+      - "Approximate scores are `(Q * scale) @ X8.T.astype(np.float32)` (shape 200 x 50,000). Store the mean recall@10 of their top 10 in `recall_int8`."
+      - "Rescore: for each query take the top 50 by approximate score, re-score those 50 with the full `X`, and keep the top 10. Store the mean recall@10 in `recall_rescored`."
+    hint: |
+      `S8 = (Q * scale) @ X8.T.astype(np.float32)`; `top8 = np.argsort(-S8, axis=1)[:, :10]`.
+      Rescoring one query: `c = np.argsort(-S8[i])[:50]`, then `c[np.argsort(-(X[c] @ Q[i]))[:10]]`.
+    pre_code: |
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries, exact_topk
+      X = make_vectors(50_000)
+      Q = make_queries(X, 200)
+      truth = exact_topk(X, Q, 10)
+
+      def recall_at_10(tops):
+          return float(np.mean([len(set(t) & set(truth[i])) / 10 for i, t in enumerate(tops)]))
+    sample_code: |
+      scale = ____
+      X8 = ____
+      memory_ratio = ____
+
+      S8 = (Q * scale) @ X8.T.astype(np.float32)
+      top8 = ____
+      recall_int8 = recall_at_10(top8)
+
+      rescored = []
+      for i in range(len(Q)):
+          c = ____
+          rescored.append(____)
+      recall_rescored = recall_at_10(rescored)
+      print(memory_ratio, round(recall_int8, 3), round(recall_rescored, 3))
+    solution: |
+      scale = np.abs(X).max(axis=0) / 127
+      X8 = np.round(X / scale).astype(np.int8)
+      memory_ratio = X.nbytes / X8.nbytes
+
+      S8 = (Q * scale) @ X8.T.astype(np.float32)
+      top8 = np.argsort(-S8, axis=1)[:, :10]
+      recall_int8 = recall_at_10(top8)
+
+      rescored = []
+      for i in range(len(Q)):
+          c = np.argsort(-S8[i])[:50]
+          rescored.append(c[np.argsort(-(X[c] @ Q[i]))[:10]])
+      recall_rescored = recall_at_10(rescored)
+      print(memory_ratio, round(recall_int8, 3), round(recall_rescored, 3))
+    tests: |
+      import numpy as np
+      X8 = check_object("X8")
+      assert X8.dtype == np.int8 and X8.shape == (50_000, 64), f"`X8` should be int8 with shape (50000, 64); got {X8.dtype} {X8.shape}."
+      check_equal("X8", msg="`X8` should be `np.round(X / scale).astype(np.int8)` with `scale = np.abs(X).max(axis=0) / 127`.")
+      check_equal("memory_ratio", 4.0, msg="`memory_ratio` should be `X.nbytes / X8.nbytes`, which is 4.")
+      check_equal("recall_int8", tol=1e-6, msg="`recall_int8` should be the recall@10 of the top 10 by approximate int8 scores.")
+      check_equal("recall_rescored", tol=1e-6, msg="`recall_rescored` should re-score the top 50 int8 candidates with the full `X` and keep 10.")
+      assert user["recall_rescored"] >= user["recall_int8"], "Rescoring with full vectors shouldn't lower recall. Check that you re-score the 50 candidates with `X[c] @ Q[i]`."
+    timeout: 60
+    success_msg: A quarter of the memory for about 2 points of recall, and rescoring 50 candidates wins those back. Scalar quantisation is usually the first compression to try. Product quantisation goes much further, with a bigger recall loss.
+
+  - id: pick-an-index
+    type: classify
+    title: Which index for the job?
+    prompt: Sort each situation by the index you'd start with.
+    hint: Exactness, filters and small N favour brute force. Plenty of RAM with low latency favours HNSW. When memory is the binding constraint at huge N, compress with IVF-PQ.
+    zones: [Brute force, HNSW, IVF-PQ]
+    items:
+      - { text: "200k vectors; results must be exact for an audit", zone: Brute force }
+      - { text: "500k vectors; every query has a strict per-user permission filter", zone: Brute force }
+      - { text: "Computing ground truth for an offline recall evaluation", zone: Brute force }
+      - { text: "5M vectors that fit in RAM; p95 under 5 ms with recall@10 above 0.95", zone: HNSW }
+      - { text: "A steady stream of inserts, millisecond latency, RAM is plentiful", zone: HNSW }
+      - { text: "Interactive chat search over 2M chunks; recall matters most and memory is cheap", zone: HNSW }
+      - { text: "1 billion vectors across a few machines; memory is the binding constraint", zone: IVF-PQ }
+      - { text: "300M vectors whose float32 copy would need 900 GB; recall@10 of 0.85 is acceptable", zone: IVF-PQ }

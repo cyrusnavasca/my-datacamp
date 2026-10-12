@@ -1,0 +1,297 @@
+title: Getting JSON out of a model
+description: Why model JSON breaks, the fixes and what each costs, and how to measure a parse-success rate instead of hoping.
+exercises:
+  - id: json-slides
+    type: video
+    title: JSON is just text to the model
+    slides: |
+      # Why model JSON breaks
+
+      ORBIT now has to file crew tickets as incident reports that the station's maintenance system can read:
+
+      ```json
+      {"crew": "Priya Raman", "module": "E", "severity": "high", "summary": "Leak near the hatch seal"}
+      ```
+
+      The model writes this one token at a time, like any other text. Unless the API constrains decoding, nothing forces
+      the result to be valid. The usual failures:
+
+      | failure | looks like | cause |
+      | --- | --- | --- |
+      | preamble | `Here is the report: {...}` | chatty default behaviour |
+      | code fences | `` ```json {...} ``` `` | trained on markdown answers |
+      | syntax | trailing comma, single quotes | sloppy imitation of JSON |
+      | truncation | `{"crew": "Priya", "sev` | `max_tokens` hit mid-object |
+      | wrong fields | `"severity": "urgent"`, `"module": "Module E"` | valid JSON, wrong content (next lesson) |
+
+      ---
+
+      ## Ask clearly, then prefill
+
+      ```python
+      SYSTEM = """Extract an incident report from the crew ticket.
+      Reply with only a JSON object, no prose and no markdown, with keys:
+      crew (string), module (single letter A-F or null), severity (low, normal or high), summary (string)."""
+
+      r = client.messages.create(
+          model="claude-sonnet-5-5", max_tokens=300, system=SYSTEM,
+          messages=[
+              {"role": "user", "content": ticket},
+              {"role": "assistant", "content": "{"},       # prefill: the reply must continue from here
+          ],
+      )
+      data = json.loads("{" + r.content[0].text)          # the reply doesn't repeat the prefill
+      ```
+
+      **Prefill** puts words in the model's mouth. It's already inside the object, so there's no room for a preamble or fences.
+      Some newer models and extended thinking don't allow prefill, so check the docs for your model.
+      APIs that offer **structured outputs** (decoding constrained to a JSON schema) rule out syntax errors altogether.
+
+      ---
+
+      ## Parse defensively
+
+      ```python
+      def parse_json(text):
+          text = text.strip()
+          text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)      # strip fences
+          start, end = text.find("{"), text.rfind("}")               # slice the outermost object
+          if start == -1 or end == -1:
+              raise ValueError("no JSON object in reply")
+          return json.loads(text[start:end + 1])                     # JSONDecodeError is a ValueError
+      ```
+
+      - Never `eval()` model output: it's arbitrary code.
+      - A robust parser fixes **wrappers** (preamble, fences). It can't fix truncation or broken syntax. Those need a retry (lesson 3).
+
+      ---
+
+      ## Which fix, at what cost?
+
+      | fix | removes | cost | catch |
+      | --- | --- | --- | --- |
+      | clear format spec | most preambles and fences | a sentence of input | not a guarantee |
+      | an example object | key and shape drift | ~50 input tokens | the model may copy example values |
+      | prefill `{` | preambles and fences | free | not on every model or feature |
+      | robust parser | wrapper noise | free | hides nothing else |
+      | tool use / structured outputs | syntax errors | schema tokens per call | still validate the meaning |
+      | validate and retry | anything transient | extra calls and latency | wasted if the cause is systematic |
+
+      ---
+
+      ## Playbook: "the pipeline crashes on `json.loads`"
+
+      1. **Measure:** the parse-success rate over **30+ real inputs**. One good reply proves nothing; failures are probabilistic.
+      2. **Diagnose:** bucket the failures (preamble, fence, syntax, truncated) and count each bucket.
+      3. **Fix** the biggest bucket with the cheapest fix that removes it: spec, then prefill or a robust parser, then retries for what's left.
+      4. **Verify:** re-run the same inputs. Report the new rate, and keep the measurement as a regression test.
+
+  - id: robust-parse
+    type: coding
+    title: A parser that survives real replies
+    context: |
+      `raws` holds seven replies from ORBIT's incident extractor, copied from the logs. Some are clean, some have
+      a preamble or code fences, one has a nested object, one was cut off by `max_tokens`, and one has no JSON at all.
+    instructions:
+      - "Write `parse_json(text)`: strip code fences, slice from the first `{` to the last `}`, and return `json.loads` of that. Raise `ValueError` when there's no object or it doesn't parse."
+      - "Store a list in `results`: the parsed dict for each reply in `raws`, or `None` where `parse_json` raised `ValueError`."
+    hint: |
+      `text.find("{")` and `text.rfind("}")` give the slice; return -1 when missing. `json.JSONDecodeError` is a subclass of
+      `ValueError`, so `except ValueError:` catches both.
+    pre_code: |
+      import json
+      import re
+      raws = [
+          '{"crew": "Kenji Watanabe", "module": "E", "severity": "high"}',
+          'Here is the incident report:\n{"crew": "Noor Haddad", "module": null, "severity": "normal"}',
+          '```json\n{"crew": "Priya Raman", "module": "B", "severity": "low"}\n```',
+          '{"crew": "Tomas Lindqvist", "notes": {"seen_by": "Amara Okafor"}, "severity": "normal"}',
+          'Sure! ```\n{"crew": "Lucía Ferreira", "module": "F", "severity": "high"}\n``` Let me know if you need more.',
+          '{"crew": "Amara Okafor", "module": "A", "sev',
+          'I could not find a ticket in your message.',
+      ]
+    sample_code: |
+      def parse_json(text):
+          text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+          start, end = ____, ____
+          if start == -1 or end == -1:
+              raise ValueError("no JSON object in reply")
+          return ____
+
+      results = []
+      for raw in raws:
+          try:
+              results.append(____)
+          except ____:
+              results.append(None)
+      print(results)
+    solution: |
+      def parse_json(text):
+          text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+          start, end = text.find("{"), text.rfind("}")
+          if start == -1 or end == -1:
+              raise ValueError("no JSON object in reply")
+          return json.loads(text[start:end + 1])
+
+      results = []
+      for raw in raws:
+          try:
+              results.append(parse_json(raw))
+          except ValueError:
+              results.append(None)
+      print(results)
+    tests: |
+      check_object("parse_json")
+      f = user["parse_json"]
+      assert f('{"a": {"b": 1}}') == {"a": {"b": 1}}, "Nested objects should parse: slice to the **last** `}` (`rfind`), not the first."
+      try:
+          f("no json here")
+          raise AssertionError("`parse_json` should raise ValueError when there's no JSON object.")
+      except ValueError:
+          pass
+      check_equal("results", msg="`results` isn't right yet. Check the fenced reply, the reply with text after the closing fence, and the cut-off reply (which should give None).")
+    success_msg: Five of seven replies were usable after cleaning. The cut-off one can't be saved by parsing; it needs a retry.
+
+  - id: parse-rate
+    type: coding
+    title: "Troubleshoot: the extractor crashes the pipeline"
+    context: |
+      The maintenance system crashes on about half of ORBIT's incident reports. `client` is the extractor model,
+      `TICKETS` holds 30 crew tickets (dicts with `crew` and `text`), and `ask(system, ticket, prefill=None)` returns the raw reply
+      text (pass `prefill="{"` to prefill; the returned text then starts after the `{`). `LOOSE` is the current system prompt.
+    instructions:
+      - "**Measure:** store the share of the 30 `ask(LOOSE, t)` replies that `json.loads` accepts as-is in `baseline_rate`."
+      - "**Diagnose:** store a dict `kinds` counting the failed replies by kind: `\"fence\"` if the reply starts with ```` ``` ````, `\"preamble\"` if it otherwise doesn't start with `{`, else `\"other\"`."
+      - "**Fix:** write `pipeline(ticket)` that returns the report as a dict (raising if it can't). Use any fix: a stricter prompt, prefill, a robust parser, or a combination. It must use the global `client` (through `ask`)."
+      - "**Verify:** store the share of the 30 tickets for which `pipeline` returns a dict in `fixed_rate`. It must be at least 0.95."
+    hint: |
+      Combine fixes: `ask(STRICT, t, prefill="{")` and then `json.loads("{" + reply)`. A strict prompt says "Reply with only a
+      JSON object, no prose and no markdown" and lists the keys.
+    pre_code: |
+      import json
+      import re
+      import aikit
+      from kits.llm_apis_prompting import incident_extractor, incident_records, MODEL
+      client = aikit.FakeClaude(incident_extractor(), clock=aikit.VirtualClock())
+      TICKETS = incident_records(30)
+      LOOSE = "Extract an incident report from the crew ticket as JSON with keys crew, module, severity, summary."
+
+      def ask(system, ticket, prefill=None):
+          messages = [{"role": "user", "content": f"Ticket from {ticket['crew']}: {ticket['text']}"}]
+          if prefill:
+              messages.append({"role": "assistant", "content": prefill})
+          return client.messages.create(model=MODEL, max_tokens=300, system=system, messages=messages).content[0].text
+    sample_code: |
+      # Measure
+      replies = [ask(LOOSE, t) for t in TICKETS]
+
+      def loads_ok(text):
+          try:
+              json.loads(text)
+              return True
+          except ValueError:
+              return False
+
+      baseline_rate = ____
+
+      # Diagnose
+      kinds = {"fence": 0, "preamble": 0, "other": 0}
+      for r in replies:
+          if loads_ok(r):
+              continue
+          ____
+
+      # Fix
+      def pipeline(ticket):
+          ____
+
+      # Verify
+      def safe(ticket):
+          try:
+              return pipeline(ticket)
+          except ValueError:
+              return None
+
+      fixed_rate = ____
+      print(baseline_rate, kinds, fixed_rate)
+    solution: |
+      # Measure
+      replies = [ask(LOOSE, t) for t in TICKETS]
+
+      def loads_ok(text):
+          try:
+              json.loads(text)
+              return True
+          except ValueError:
+              return False
+
+      baseline_rate = sum(loads_ok(r) for r in replies) / len(replies)
+
+      # Diagnose
+      kinds = {"fence": 0, "preamble": 0, "other": 0}
+      for r in replies:
+          if loads_ok(r):
+              continue
+          if r.startswith("```"):
+              kinds["fence"] += 1
+          elif not r.startswith("{"):
+              kinds["preamble"] += 1
+          else:
+              kinds["other"] += 1
+
+      # Fix
+      STRICT = ("Extract an incident report from the crew ticket. Reply with only a JSON object, no prose and no "
+                "markdown, with keys crew, module, severity and summary.")
+
+      def pipeline(ticket):
+          reply = ask(STRICT, ticket, prefill="{")
+          return json.loads("{" + reply)
+
+      # Verify
+      def safe(ticket):
+          try:
+              return pipeline(ticket)
+          except ValueError:
+              return None
+
+      fixed_rate = sum(isinstance(safe(t), dict) for t in TICKETS) / len(TICKETS)
+      print(baseline_rate, kinds, fixed_rate)
+    tests: |
+      check_equal("baseline_rate", msg="`baseline_rate` is the share of the 30 LOOSE replies that `json.loads` accepts unchanged.")
+      check_equal("kinds", msg="`kinds` should count failed replies: 'fence' if it starts with ```, 'preamble' if it otherwise doesn't start with {, else 'other'.")
+      check_object("pipeline")
+      import aikit
+      from kits.llm_apis_prompting import incident_extractor
+      user["client"] = aikit.FakeClaude(incident_extractor(), clock=aikit.VirtualClock(), seed=7)
+      ok = 0
+      for t in user["TICKETS"]:
+          try:
+              d = user["pipeline"](t)
+              ok += isinstance(d, dict) and d.get("crew") == t["crew"]
+          except Exception:
+              pass
+      rate = ok / len(user["TICKETS"])
+      assert rate >= 0.95, f"On a fresh run your pipeline produced a report with the right `crew` for only {rate:.0%} of tickets; it needs 95%. Check which kind of failure remains and pick a fix that removes it."
+      assert user.get("fixed_rate", 0) >= 0.95, "Store the verified share in `fixed_rate`."
+    success_msg: |
+      The parse rate went from under half to (nearly) every ticket, and you know why: the failures were fences and preambles,
+      exactly what a strict spec plus prefill or a robust parser removes. You verified the fix on a fresh run, not on the replies you debugged.
+
+  - id: json-fix-choice
+    type: mc
+    title: Pick the fix for the constraints
+    question: |
+      A second extractor runs with **extended thinking**, so prefill isn't available. Over 50 calls its parse rate is 64%.
+      All 18 failures are wrappers: 13 are code fences, 5 are a one-line preamble. No reply was truncated or syntactically broken.
+      What's the cheapest fix that should take it to about 100%?
+    options:
+      - text: Add a robust parser that strips fences and slices from the first `{` to the last `}`.
+        correct: true
+        feedback: Right. Every failure is a wrapper, and the parser removes wrappers at zero cost per call. Verify on the same 50 inputs, and keep measuring in case truncation shows up later.
+      - text: Validate and retry each failed call up to three times.
+        feedback: It would work, but each retry is another full call with thinking tokens. You'd pay extra on about a third of all requests to fix something a few lines of parsing handle for free.
+      - text: Prefill the reply with `{`.
+        feedback: Prefill isn't available with extended thinking here. Constraints rule it out.
+      - text: Switch to a larger model.
+        feedback: A larger model may wrap less often, but it costs more on every call and isn't guaranteed. Fix the measured failure type directly.
+    hint: Match the fix to the failure bucket you measured, then pick the cheapest one that's allowed.

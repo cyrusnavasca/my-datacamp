@@ -1,0 +1,245 @@
+title: Embedding text
+description: What an embedding model does, what real embedding APIs look like, the rules that keep vectors comparable, and how to trade dimensions for memory.
+exercises:
+  - id: embedding-text-slides
+    type: video
+    title: From text to vectors
+    slides: |
+      # What an embedding model does
+
+      ```
+      "How long is the leak check?"
+         -> tokenise -> transformer encoder -> pool token vectors -> normalise
+         -> [0.12, -0.03, 0.41, ...]      (always d numbers, whatever the text length)
+      ```
+
+      - **Fixed size.** A 3-word query and a 400-word page both become $d$ numbers (typically 384 to 3,072).
+      - **Pooling** averages (or picks) the token vectors, so one vector summarises the whole input. A long text
+        covering five topics becomes a blurry average of all five. That is why we embed **chunks**, not whole manuals.
+      - **Max input length.** Text beyond the model's limit (often 512 to 32k tokens) is usually cut off **silently**.
+        Anything past the cut can never be found.
+
+      ---
+
+      ## A real embedding API
+
+      Anthropic doesn't offer an embedding model; its docs point to providers such as Voyage AI. With Voyage:
+
+      ```python
+      import voyageai
+      vo = voyageai.Client()                      # reads VOYAGE_API_KEY
+      docs = vo.embed(chunk_texts, model="voyage-3.5", input_type="document").embeddings
+      query = vo.embed(["How long is the leak check?"], model="voyage-3.5", input_type="query").embeddings[0]
+      ```
+
+      Or locally, with no API: `SentenceTransformer("all-MiniLM-L6-v2").encode(texts, normalize_embeddings=True)`.
+      Model names change often; check the provider's docs for the current ones.
+
+      **In this course** you call `aikit.embed(texts)`: TF-IDF followed by SVD (latent semantic analysis), fitted on the
+      Helios handbook, 64 dims, unit length. Same interface and habits as a real model, and it runs offline. Its
+      limit: it only knows words that appear in the handbook.
+
+      ---
+
+      ## Rules that prevent silent bugs
+
+      1. **One model for both sides.** Vectors from different models live in different spaces, even when $d$ is the
+         same. Comparing them doesn't raise an error; it returns nonsense.
+      2. **Store the model name and version with the index.** Changing models means re-embedding **everything**.
+      3. **Use `input_type` (or the model's query/passage prefixes) if it has them.** Asymmetric models embed short
+         questions and long passages differently on purpose.
+      4. **Batch** (many texts per request, up to the provider's limit) and **cache** by `hash(model + text)`:
+         re-index only the chunks that changed.
+      5. **Check what you actually embedded.** Empty strings, HTML, or text past the length limit all produce
+         vectors that look fine and can't be found.
+
+      ---
+
+      ## Dimensions: quality vs memory
+
+      Memory for the vectors alone is $N \times d \times$ bytes per number (4 for float32):
+
+      | 1M chunks | 384 dims | 768 dims | 1,024 dims | 3,072 dims |
+      | --- | --- | --- | --- | --- |
+      | float32 | 1.5 GB | 3.1 GB | 4.1 GB | 12.3 GB |
+
+      Search cost grows with $d$ too. Some models are trained so that the **first** $k$ dimensions are a good embedding
+      on their own ("Matryoshka" embeddings; APIs expose this as a `dimensions` or `output_dimension` parameter): truncate,
+      re-normalise, done. Truncating an ordinary model's vectors loses much more quality.
+      The SVD in `aikit.embed` orders its dimensions by importance, so truncation works the same way here.
+
+      ---
+
+      ## Choosing an embedding model
+
+      | option | quality | latency | cost | privacy | catch |
+      | --- | --- | --- | --- | --- | --- |
+      | small local model (384 dims) | ok | fast on CPU, no network | hardware only | data stays home | weaker on rare topics |
+      | API general model (1k dims) | good | +network round trip | per token | data leaves | rate limits, vendor changes |
+      | API large model (3k dims) | best on leaderboards | slower | highest | data leaves | 3x memory per vector |
+      | domain-tuned model | best on **your** data | as base | training effort | your choice | needs labelled pairs |
+
+      How to choose: drop the options your **hard constraints** rule out (privacy, offline use, languages, memory),
+      then pick by **recall on your own labelled queries**. Public leaderboards are a shortlist, not an answer.
+
+  - id: nearest-titles
+    type: coding
+    title: The two most similar handbook titles
+    context: |
+      `titles` lists the titles of all 35 handbook documents, including one that was superseded. `aikit` and `np` are imported.
+      Find the pair of titles the embedding model considers most alike.
+    instructions:
+      - "Embed `titles` with `aikit.embed` into `T` (one row per title)."
+      - "Store the matrix of all pairwise cosine similarities in `S`. The rows are already unit length."
+      - "Set the diagonal of `S` to `-np.inf` so a title can't match itself, then store the two indices of the largest value in `i, j`."
+      - "Store the pair of titles, sorted alphabetically, as a tuple in `pair`, and print it with `S[i, j]`."
+    hint: |
+      `S = T @ T.T`. `np.fill_diagonal(S, -np.inf)`. `np.unravel_index(np.argmax(S), S.shape)` turns the flat argmax
+      into `(row, column)`. `tuple(sorted([titles[i], titles[j]]))`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      titles = [d["title"] for d in aikit.helios.handbook()]
+    sample_code: |
+      T = ____
+      S = ____
+      np.fill_diagonal(S, ____)
+      i, j = ____
+      pair = ____
+      print(pair, round(float(S[i, j]), 3))
+    solution: |
+      T = aikit.embed(titles)
+      S = T @ T.T
+      np.fill_diagonal(S, -np.inf)
+      i, j = np.unravel_index(np.argmax(S), S.shape)
+      pair = tuple(sorted([titles[i], titles[j]]))
+      print(pair, round(float(S[i, j]), 3))
+    tests: |
+      import numpy as np
+      T = check_object("T")
+      assert np.shape(T) == (35, 64), f"`T` should have one 64-dim row per title, shape (35, 64); got {np.shape(T)}. Pass the whole list to `aikit.embed`."
+      S = check_object("S")
+      assert np.shape(S) == (35, 35), "`S` should be the 35 x 35 matrix `T @ T.T`."
+      assert np.all(np.isneginf(np.diag(S))), "Set the diagonal of `S` to `-np.inf` with `np.fill_diagonal`, or every title matches itself best."
+      check_equal("pair", msg="`pair` should be the two titles at `(i, j)`, sorted alphabetically, as a tuple.")
+    success_msg: The closest pair is the current airlock procedure and its superseded 2024 version. Near-duplicates are the first thing similarity finds, which makes it a good tool for deduplicating a corpus, and a warning that outdated copies will compete with the real document in search.
+
+  - id: truncate-dims
+    type: coding
+    title: How many dimensions do you need?
+    context: |
+      `D` holds the embeddings of the 34 current handbook docs (`ids` gives their ids), `Q` the embeddings of 41 crew
+      questions, and `gold[i]` the set of doc ids that answer question `i`. Measure how quality changes when you keep
+      only the first `m` dimensions, then pick the cheapest setting that loses almost nothing.
+    instructions:
+      - "Write `hit1_at_dims(m)`: keep the first `m` columns of `D` and `Q`, re-normalise each row, take each question's best doc, and return the share of questions whose best doc is in `gold`."
+      - "Store `{m: hit1_at_dims(m) for m in [4, 8, 16, 32, 64]}` in `scores`."
+      - "Store the **smallest** `m` whose score is within 0.01 of the best score in `best_dims`."
+      - "Store the megabytes needed for 1 million float32 vectors of `best_dims` dimensions in `mb_per_million` (1 MB = 1,000,000 bytes)."
+    hint: |
+      `Dm = D[:, :m]`, then `Dm / np.linalg.norm(Dm, axis=1, keepdims=True)`; same for `Q`.
+      `top = np.argmax(Qm @ Dm.T, axis=1)`, then `np.mean([ids[t] in g for t, g in zip(top, gold)])`.
+      `min(m for m, s in scores.items() if s >= max(scores.values()) - 0.01)`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_docs, labelled_questions
+      _docs = handbook_docs()
+      ids = [d["id"] for d in _docs]
+      D = aikit.embed([d["title"] + ". " + d["text"] for d in _docs])
+      _qs = labelled_questions()
+      Q = aikit.embed([q["question"] for q in _qs])
+      gold = [set(q["doc_ids"]) for q in _qs]
+    sample_code: |
+      def hit1_at_dims(m):
+          Dm = ____
+          Qm = ____
+          top = np.argmax(Qm @ Dm.T, axis=1)
+          return ____
+
+      scores = {m: hit1_at_dims(m) for m in [4, 8, 16, 32, 64]}
+      best_dims = ____
+      mb_per_million = ____
+      print(scores)
+      print(best_dims, mb_per_million)
+    solution: |
+      def hit1_at_dims(m):
+          Dm = D[:, :m] / np.linalg.norm(D[:, :m], axis=1, keepdims=True)
+          Qm = Q[:, :m] / np.linalg.norm(Q[:, :m], axis=1, keepdims=True)
+          top = np.argmax(Qm @ Dm.T, axis=1)
+          return float(np.mean([ids[t] in g for t, g in zip(top, gold)]))
+
+      scores = {m: hit1_at_dims(m) for m in [4, 8, 16, 32, 64]}
+      best_dims = min(m for m, s in scores.items() if s >= max(scores.values()) - 0.01)
+      mb_per_million = 1_000_000 * best_dims * 4 / 1_000_000
+      print(scores)
+      print(best_dims, mb_per_million)
+    tests: |
+      sc = check_object("scores")
+      assert isinstance(sc, dict) and sorted(sc) == [4, 8, 16, 32, 64], "`scores` should be a dict with keys 4, 8, 16, 32 and 64."
+      for m in [4, 8, 16, 32, 64]:
+          assert abs(float(sc[m]) - sol["scores"][m]) < 1e-9, f"`scores[{m}]` should be {sol['scores'][m]:.3f}, got {float(sc[m]):.3f}. Slice the first m columns of both D and Q and re-normalise each row before comparing."
+      check_equal("best_dims", msg="`best_dims` should be the smallest m whose score is at least `max(scores.values()) - 0.01`.")
+      check_equal("mb_per_million", msg="`mb_per_million` is 1,000,000 vectors x best_dims x 4 bytes, divided by 1,000,000.")
+    success_msg: Half the dimensions, the same top-1 accuracy on these questions, half the memory and half the search work. Below that, quality falls off a cliff. Only a measurement on your own queries tells you where the cliff is.
+
+  - id: mixed-models
+    type: mc
+    title: Two models, one index
+    question: |
+      The handbook index `V_old` was built with last year's model, `model_v1`, which also outputs 64 dimensions.
+      New queries are embedded with `aikit.embed`. What happens when you search `V_old` with them?
+    context: |
+      The console has `V_old`, `model_v1`, `ids`, the 41 `questions` and their `gold` doc sets. Try
+      `top = np.argmax(aikit.embed(questions) @ V_old.T, axis=1)` and count how many land in `gold`, then compare with
+      `model_v1.embed(questions)`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_docs, labelled_questions, split_sentences
+      _docs = handbook_docs()
+      ids = [d["id"] for d in _docs]
+      _texts = [d["title"] + ". " + d["text"] for d in _docs]
+      model_v1 = aikit.Embedder([s for d in _docs for s in split_sentences(d["text"])], dim=64)
+      V_old = model_v1.embed(_texts)
+      questions = [q["question"] for q in labelled_questions()]
+      gold = [set(q["doc_ids"]) for q in labelled_questions()]
+    options:
+      - text: A shape error, because the models differ.
+        feedback: "Both models output 64 numbers, so `@` works and nothing fails. That's what makes this bug dangerous: there's no error to catch."
+      - text: It works, because both vectors have 64 dimensions.
+        feedback: "Same size doesn't mean same space. Dimension 7 of one model means something unrelated to dimension 7 of the other. Count the hits in the console."
+      - text: Results look almost random, with no error raised.
+        correct: true
+        feedback: "Right. About 3 of 41 questions find a correct doc, close to chance. Query and documents must come from the same model and version, which is why you store the model name with the index and re-embed everything when it changes."
+      - text: Slightly worse results, because last year's model is older.
+        feedback: "If both sides used `model_v1`, results would be somewhat worse than `aikit.embed`'s (try `model_v1.embed(questions)`). Mixing the two models is much worse than either one alone."
+    hint: Compare the hit count when queries use `aikit.embed` with the count when they use `model_v1.embed`.
+
+  - id: choose-embedding-model
+    type: mc
+    title: Pick the embedding model
+    question: |
+      ORBIT's search must run on the station's own server. Crew medical notes may not leave the station, and during
+      loss of signal there is no network. The corpus will grow to 2 million chunks, and the server has 8 GB of RAM for
+      vectors. You measured four candidates on 200 labelled crew queries:
+
+      | model | runs | dims | recall@5 on crew queries | float32 vectors for 2M chunks |
+      | --- | --- | --- | --- | --- |
+      | A | cloud API | 3,072 | 0.93 | 24.6 GB |
+      | B | cloud API | 1,024 | 0.90 | 8.2 GB |
+      | C | on the station | 768 | 0.88 | 6.1 GB |
+      | D | on the station | 384 | 0.79 | 3.1 GB |
+
+      Which model do you choose?
+    options:
+      - text: A, because it has the best recall.
+        feedback: "A breaks two hard constraints: data would leave the station, it won't work during loss of signal, and its vectors need 3x the RAM. Recall only decides between the options that are left."
+      - text: B, because it is a good balance of recall and size.
+        feedback: "B is a cloud API, so it fails the privacy and offline constraints, and 8.2 GB doesn't fit in 8 GB either."
+      - text: C, the best recall among the models that meet every constraint.
+        correct: true
+        feedback: "Right. Constraints first (on-station, offline, under 8 GB), which leaves C and D. Then choose by measured recall: C is 9 points better and still fits, with about 1.9 GB of headroom for growth. If memory gets tight later, int8 quantisation (chapter 3) cuts it 4x."
+      - text: D, because it is the smallest and fastest.
+        feedback: "D meets the constraints, but so does C, and C finds the right chunk for 9 more crew queries in every 100. Paying 9 points of recall for memory you don't need is a bad trade."
+    hint: Strike out every option that breaks a hard constraint (privacy, offline, memory), then compare what's left.

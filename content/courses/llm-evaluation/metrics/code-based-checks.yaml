@@ -1,0 +1,213 @@
+title: Code-based checks
+description: Many requirements are objective, so check them with plain code. Write an assertion suite, measure refusal behaviour without a judge, and decide which kind of check fits each requirement.
+exercises:
+  - id: code-checks-slides
+    type: video
+    title: Cheap checks first
+    slides: |
+      # Most requirements are checkable in code
+
+      Look at ORBIT's spec and the failure taxonomy. Many requirements don't need a model to judge them:
+
+      | requirement | check |
+      | --- | --- |
+      | every answer cites a document | regex for `[doc-id]` |
+      | citations only point at retrieved documents | cited ids ⊆ retrieved ids |
+      | unanswerable questions get a refusal | refusal phrase present ⟺ `type == "unanswerable"` |
+      | answers stay short enough for a headset display | word count ≤ limit |
+      | JSON replies parse and have the right keys | `json.loads` + key check |
+      | the airlock override code never appears | substring check |
+
+      Code checks are free, instant, deterministic, and they never drift. Write them first.
+
+      ---
+
+      ## An assertion suite
+
+      Each check is a small function that returns `True` or `False`. Run all of them on every output to get a table:
+
+      ```python
+      CITE = re.compile(r"\[([a-z0-9-]+)\]")
+
+      def cites_only_retrieved(answer, retrieved):
+          return all(doc in retrieved for doc in CITE.findall(answer))
+
+      report = pd.DataFrame({
+          "has_citation": [...],
+          "cites_retrieved": [cites_only_retrieved(a, r) for a, r in zip(df["answer"], df["retrieved"])],
+      })
+      report.mean()                      # pass rate per check
+      df[~report.all(axis=1)]            # the outputs to read
+      ```
+
+      Reuse the same functions as **runtime guardrails**: a check that catches a bad citation in the eval can block it in
+      production too.
+
+      ---
+
+      ## Refusals are a code check too
+
+      Refusal behaviour has two error rates, and each can be computed without a judge:
+
+      - **over-refusal** = share of *answerable* questions where ORBIT refused
+      - **under-refusal** = share of *unanswerable* questions where ORBIT answered anyway
+
+      They trade off against each other: a prompt that makes ORBIT more willing to answer lowers the first and raises the
+      second. Always report the pair, never one alone.
+
+      ---
+
+      ## Code, metric, judge or human?
+
+      | | code check | reference metric | LLM judge | human review |
+      | --- | --- | --- | --- | --- |
+      | cost per 1,000 outputs | ~0 | ~0 | about $1-3 (one call each, illustrative prices) | about 8 hours at 30 s each |
+      | speed | ms | ms | seconds | days |
+      | can judge | format, presence, rules | overlap with a gold answer | meaning, support, tone | anything, including what matters |
+      | consistency | perfect | perfect | good if calibrated | varies between people |
+      | failure mode | only checks what you wrote down | rewards overlap, not truth | its own biases | slow, expensive, tired |
+
+      Build a **cascade**: code checks on everything, the judge only on what passes them, and humans on a sample of
+      judge verdicts plus every disagreement.
+
+  - id: assertion-suite
+    type: coding
+    title: An assertion suite for ORBIT
+    context: |
+      `batch` holds 35 ORBIT outputs with `type`, `answer` and `retrieved` (the list of document ids that were in the
+      prompt). Some have problems. `CITE` is a compiled regex that captures the id inside each `[doc-id]` citation.
+    instructions:
+      - "`refuses`: the answer contains `\"I don't know\"`. `has_citation`: the answer refuses **or** has at least one citation."
+      - "`cites_retrieved`: every cited id is in `retrieved` (true when there are no citations). `refusal_ok`: refuses exactly when `type == 'unanswerable'`. `short_enough`: at most 45 words (`len(answer.split())`)."
+      - "Build `report`, a DataFrame with the columns `has_citation`, `cites_retrieved`, `refusal_ok`, `short_enough` (one row per output, booleans)."
+      - Store the pass rate of each check in `pass_rates` (a Series), and the `id`s of outputs that fail at least one check in the list `to_read`.
+    hint: |
+      Build lists with comprehensions over `zip(batch["answer"], batch["retrieved"], batch["type"])`.
+      `CITE.findall(answer)` returns the cited ids. `report.mean()` gives pass rates; `batch.loc[~report.all(axis=1), "id"]`
+      gives the failing ids.
+    pre_code: |
+      import re
+      import pandas as pd
+      from kits.llm_evaluation import check_batch
+      batch = check_batch().drop(columns="defect")
+      CITE = re.compile(r"\[([a-z0-9-]+)\]")
+    sample_code: |
+      def refuses(answer):
+          return "I don't know" in answer
+
+      rows = list(zip(batch["answer"], batch["retrieved"], batch["type"]))
+      report = pd.DataFrame({
+          "has_citation": [refuses(a) or len(CITE.findall(a)) > 0 for a, r, t in rows],
+          "cites_retrieved": [____ for a, r, t in rows],
+          "refusal_ok": [____ for a, r, t in rows],
+          "short_enough": [____ for a, r, t in rows],
+      })
+      pass_rates = ____
+      to_read = ____
+      print(pass_rates)
+      print(to_read)
+    solution: |
+      def refuses(answer):
+          return "I don't know" in answer
+
+      rows = list(zip(batch["answer"], batch["retrieved"], batch["type"]))
+      report = pd.DataFrame({
+          "has_citation": [refuses(a) or len(CITE.findall(a)) > 0 for a, r, t in rows],
+          "cites_retrieved": [all(doc in r for doc in CITE.findall(a)) for a, r, t in rows],
+          "refusal_ok": [refuses(a) == (t == "unanswerable") for a, r, t in rows],
+          "short_enough": [len(a.split()) <= 45 for a, r, t in rows],
+      })
+      pass_rates = report.mean()
+      to_read = list(batch.loc[~report.all(axis=1), "id"])
+      print(pass_rates)
+      print(to_read)
+    tests: |
+      check_object("report")
+      rep = user["report"]
+      cols = ["has_citation", "cites_retrieved", "refusal_ok", "short_enough"]
+      missing = [c for c in cols if c not in rep.columns]
+      assert not missing, f"`report` is missing the columns {missing}."
+      for c in cols:
+          assert list(rep[c].astype(bool)) == list(sol["report"][c]), f"The `{c}` column isn't right yet. Re-read its definition in the instructions."
+      check_object("pass_rates")
+      assert dict(user["pass_rates"][cols].round(6)) == dict(sol["pass_rates"].round(6)), "`pass_rates` should be `report.mean()`."
+      check_object("to_read")
+      assert sorted(user["to_read"]) == sorted(sol["to_read"]), "`to_read` should list the `id` of every output that fails at least one check."
+    success_msg: |
+      The suite flags 13 outputs in milliseconds: padded answers, citations to a `maintenance-log` that was never
+      retrieved, missing citations, answers to unanswerable questions, and three over-refusals you already met in
+      error analysis. Only these need a human (or a judge) to look at them.
+
+  - id: refusal-rates
+    type: coding
+    title: Over- and under-refusal
+    context: |
+      `runs` maps each ORBIT version to its answers on all 45 questions: `v2` is the shipped prompt, `v3` adds "Be as
+      helpful as possible: always give the crew an answer." Each DataFrame has `type` and `answer`.
+    instructions:
+      - "Write `refusal_rates(df)` that returns a tuple `(over, under)`: `over` is the share of answerable questions (`type != 'unanswerable'`) whose answer refuses, and `under` the share of unanswerable questions whose answer does **not** refuse."
+      - A refusal is an answer containing `"I don't know"`.
+      - Store a dict `rates` mapping `"v2"` and `"v3"` to `refusal_rates(...)` of their runs.
+    hint: |
+      `refused = df["answer"].str.contains("I don't know")` and `unans = df["type"] == "unanswerable"`.
+      Then `over = refused[~unans].mean()` and `under = (~refused[unans]).mean()`.
+    pre_code: |
+      import pandas as pd
+      from kits.llm_evaluation import run_orbit
+      runs = {"v2": run_orbit("v2"), "v3": run_orbit("v3")}
+    sample_code: |
+      def refusal_rates(df):
+          refused = df["answer"].str.contains("I don't know")
+          unans = df["type"] == "unanswerable"
+          over = ____
+          under = ____
+          return over, under
+
+      rates = {v: ____ for v, df in runs.items()}
+      print(rates)
+    solution: |
+      def refusal_rates(df):
+          refused = df["answer"].str.contains("I don't know")
+          unans = df["type"] == "unanswerable"
+          over = refused[~unans].mean()
+          under = (~refused[unans]).mean()
+          return over, under
+
+      rates = {v: refusal_rates(df) for v, df in runs.items()}
+      print(rates)
+    tests: |
+      check_object("refusal_rates")
+      import pandas as pd
+      toy = pd.DataFrame({"type": ["factual", "factual", "unanswerable", "unanswerable"],
+                          "answer": ["I don't know.", "Every week.", "I don't know.", "It is 42."]})
+      o, u = user["refusal_rates"](toy)
+      assert abs(o - 0.5) < 1e-9 and abs(u - 0.5) < 1e-9, f"On a toy set with 1 of 2 answerable refused and 1 of 2 unanswerable answered, expected (0.5, 0.5); got ({o}, {u})."
+      check_object("rates")
+      for v in ("v2", "v3"):
+          got, exp = user["rates"][v], sol["rates"][v]
+          assert abs(got[0] - exp[0]) < 1e-9 and abs(got[1] - exp[1]) < 1e-9, f"rates['{v}'] should be {tuple(round(x, 3) for x in exp)}."
+    success_msg: |
+      v3 halves over-refusal (9.8% to 4.9%) and triples under-refusal (25% to 75%): it now invents answers to 3 of the 4
+      unanswerable questions. One line of prompt moved both rates, which is why you always report them as a pair.
+
+  - id: which-check
+    type: classify
+    title: Code, metric, judge or human?
+    prompt: |
+      For each requirement on ORBIT's answers, pick the **cheapest check that is reliable enough**.
+    hint: |
+      If a regex or a set comparison can decide it, use code. If it needs a gold answer and the wording is predictable,
+      use a reference metric. If it needs understanding of meaning, use a judge. If even a careful model could be wrong
+      in a costly way, or you're deciding what "good" means, use people.
+    zones: [Code check, Reference metric, LLM judge, Human review]
+    items:
+      - { text: "Every answer cites at least one [doc-id]", zone: Code check }
+      - { text: "Replies parse as JSON with the keys answer and sources", zone: Code check }
+      - { text: "The airlock override code never appears in an answer", zone: Code check }
+      - { text: "Questions in the unanswerable set get a refusal", zone: Code check }
+      - { text: "The module letter in the answer equals the gold module letter", zone: Reference metric }
+      - { text: "The answer contains the key facts listed for the question", zone: Reference metric }
+      - { text: "Every claim in the answer is supported by the retrieved documents", zone: LLM judge }
+      - { text: "During an emergency question the tone is calm and the steps are in order", zone: LLM judge }
+      - { text: "A medical answer is safe for the crew to act on", zone: Human review }
+      - { text: "Cases where the judge and the reference metric disagree", zone: Human review }

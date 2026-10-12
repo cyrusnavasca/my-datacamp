@@ -1,0 +1,332 @@
+title: Loss masking
+description: Train only on the tokens the model should learn to write. Build the labels by hand, check the loss, and debug a run whose loss looks great while its answers are wrong.
+exercises:
+  - id: intro
+    type: video
+    title: Which tokens should the loss count?
+    slides: |
+      # How a causal LM learns from one example
+
+      The whole conversation is rendered with the chat template and tokenised into `input_ids`. The
+      model predicts every next token, and the loss is the average cross-entropy over the positions you
+      **choose to supervise**:
+
+      ```python
+      logits = model(input_ids)                    # (batch, T, vocab)
+      loss = F.cross_entropy(
+          logits[:, :-1].reshape(-1, vocab),       # position t predicts ...
+          labels[:, 1:].reshape(-1),               # ... token t + 1
+          ignore_index=-100)                       # label -100 = "don't score this position"
+      ```
+
+      Hugging Face models take `labels` **unshifted** and do this shift inside `forward`. Any position
+      whose label is `-100` adds nothing to the loss or the gradients.
+
+      ---
+
+      ## Mask the prompt, train the answer
+
+      ```python
+      prompt_ids = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)  # ends with <|assistant|>
+      full_ids   = tok.apply_chat_template(msgs)
+      labels     = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+      ```
+
+      ```
+      token   <|system|> you triage ... <|end|> <|user|> printer ... <|end|> <|assistant|>   it   <|end|>
+      label     -100     -100   -100    -100    -100    -100     -100    -100        it   <|end|>
+      ```
+
+      The model is scored only on writing `it <|end|>`. Including `<|end|>` matters: it is how the model
+      learns to **stop**. Padding positions get `-100` too.
+
+      ---
+
+      ## Why masking matters
+
+      In a triage example the system prompt plus ticket is about 35 tokens and the answer is 2. Without a mask:
+
+      - **About 95% of the gradient** goes to predicting the system prompt and the crew's wording, and
+        about 5% to the answer you care about. Learning the task is slower for the same compute.
+      - **The loss you watch mostly measures prompt prediction.** It can look great while answers are wrong.
+      - The model learns to **write like your users** and can memorise their text, which is a privacy risk.
+      - With padding left unmasked, the model learns that a pad follows a pad. That is easy, so the loss
+        drops even further without telling you anything.
+
+      ---
+
+      ## Trade-offs
+
+      | choice | when it wins | cost |
+      | --- | --- | --- |
+      | Assistant tokens only (default SFT) | instruction and chat tuning | none, it's the standard |
+      | All tokens | continued pretraining on domain text (manuals, logs), where the text itself is what you want learned | learns user phrasing; the loss isn't the task metric |
+      | Every assistant turn in a multi-turn chat | teaching a dialogue style | more signal per example |
+      | Last assistant turn only | the earlier turns came from another model or are low quality | less signal |
+
+      ---
+
+      ## Playbook: "the loss looks great, the answers are wrong"
+
+      Check first, in this order:
+
+      1. **What are you training on?** `tok.decode([t for t in labels[0] if t != -100])` should be the answer, nothing else.
+      2. **Answer share**: answer tokens ÷ supervised positions. With correct masking it is 1.0.
+      3. **Off-by-one**: is the first answer token masked, or `<|assistant|>` trained? Compare `len(prompt_ids)` with where the answer starts.
+      4. **Template mismatch**: is the inference prompt rendered exactly like the training prompt, including `add_generation_prompt=True`?
+
+      The usual causes are a missing prompt mask, `pad_token_id` used as the padding label instead of
+      `-100`, and an off-by-one. Fix the labels, then re-run with the **same budget** and compare answer
+      accuracy, not loss: masked and unmasked losses average over different tokens, so they can't be compared.
+
+  - id: build-labels
+    type: coding
+    title: Build the labels for one example
+    context: |
+      `tok` is a word-level tokenizer with a chat template, shaped like a Hugging Face tokenizer.
+      `msgs` is one training conversation (system, user, assistant).
+    instructions:
+      - "Store the rendered prompt (every message except the last, with `add_generation_prompt=True`) in `prompt_ids`, and the full conversation in `full_ids`."
+      - "Store `labels`: `-100` for each prompt position, then the remaining tokens of `full_ids`."
+      - "Store how many positions are trained (labels other than -100) in `n_trained`, and the decoded trained tokens in `trained_text`."
+    hint: "`tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)`. Decode with `tok.decode([t for t in labels if t != -100])`."
+    pre_code: |
+      from kits.fine_tuning_llms import ChatTokenizer, triage_messages
+      tok = ChatTokenizer()
+      msgs = triage_messages("Printer in Module C says offline.", "it")
+    sample_code: |
+      prompt_ids = tok.apply_chat_template(____, add_generation_prompt=True)
+      full_ids = tok.apply_chat_template(msgs)
+      labels = ____
+
+      n_trained = ____
+      trained_text = ____
+      print(tok.apply_chat_template(msgs, tokenize=False))
+      print(f"{len(full_ids)} tokens, {n_trained} trained: {trained_text!r}")
+    solution: |
+      prompt_ids = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)
+      full_ids = tok.apply_chat_template(msgs)
+      labels = [-100] * len(prompt_ids) + full_ids[len(prompt_ids):]
+
+      n_trained = sum(t != -100 for t in labels)
+      trained_text = tok.decode([t for t in labels if t != -100])
+      print(tok.apply_chat_template(msgs, tokenize=False))
+      print(f"{len(full_ids)} tokens, {n_trained} trained: {trained_text!r}")
+    tests: |
+      check_equal("prompt_ids", msg="`prompt_ids` should render `msgs[:-1]` with `add_generation_prompt=True`, so it ends with the `<|assistant|>` token.")
+      lab = check_object("labels")
+      assert len(lab) == len(sol["full_ids"]), f"`labels` should have one entry per token of `full_ids` ({len(sol['full_ids'])}); it has {len(lab)}."
+      assert list(lab) == sol["labels"], "`labels` should be -100 for every prompt position, then the tokens of `full_ids` after the prompt. Check you didn't mask the answer or train `<|assistant|>`."
+      check_equal("n_trained", msg="`n_trained` counts the labels that are not -100 (the answer and the end token).")
+      check_equal("trained_text", msg="`trained_text` should decode only the trained tokens: `'it <|end|>'`.")
+    success_msg: "Out of 38 tokens, 2 are trained: the label and the end token. Everything else is context."
+
+  - id: loss-by-hand
+    type: coding
+    title: The masked loss by hand
+    context: |
+      `logits` has shape `(1, T, V)` (random scores from an untrained model), `input_ids` is the
+      example's tokens and `labels` the masked labels from the last exercise. `torch` and
+      `torch.nn.functional as F` are imported.
+    instructions:
+      - "Shift: `shift_logits = logits[:, :-1]` and `shift_labels = labels[:, 1:]`. Compute `logp = torch.log_softmax(shift_logits, dim=-1)`."
+      - "Keep the positions where `shift_labels != -100`, pick the log-probability of each true label, and store minus their mean as a float in `manual`."
+      - "Store `F.cross_entropy(shift_logits.reshape(-1, V), shift_labels.reshape(-1), ignore_index=-100).item()` in `builtin`, and the same with `input_ids` as labels (no mask) in `unmasked`."
+    hint: "`valid = shift_labels != -100`, then `logp[valid].gather(-1, shift_labels[valid].unsqueeze(-1))` gives the picked log-probs, shape `(n, 1)`."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      from kits.fine_tuning_llms import ChatTokenizer, triage_messages
+      tok = ChatTokenizer()
+      _msgs = triage_messages("Printer in Module C says offline.", "it")
+      _p = tok.apply_chat_template(_msgs[:-1], add_generation_prompt=True)
+      _f = tok.apply_chat_template(_msgs)
+      input_ids = torch.tensor([_f])
+      labels = torch.tensor([[-100] * len(_p) + _f[len(_p):]])
+      V = len(tok)
+      torch.manual_seed(1)
+      logits = torch.randn(1, len(_f), V)
+    sample_code: |
+      shift_logits = logits[:, :-1]
+      shift_labels = labels[:, 1:]
+      logp = torch.log_softmax(shift_logits, dim=-1)
+
+      valid = ____
+      picked = logp[valid].gather(-1, ____)
+      manual = ____
+
+      builtin = F.cross_entropy(shift_logits.reshape(-1, V), shift_labels.reshape(-1), ignore_index=-100).item()
+      unmasked = ____
+      print(f"manual {manual:.4f}  builtin {builtin:.4f}  unmasked {unmasked:.4f}")
+    solution: |
+      shift_logits = logits[:, :-1]
+      shift_labels = labels[:, 1:]
+      logp = torch.log_softmax(shift_logits, dim=-1)
+
+      valid = shift_labels != -100
+      picked = logp[valid].gather(-1, shift_labels[valid].unsqueeze(-1))
+      manual = -picked.mean().item()
+
+      builtin = F.cross_entropy(shift_logits.reshape(-1, V), shift_labels.reshape(-1), ignore_index=-100).item()
+      unmasked = F.cross_entropy(shift_logits.reshape(-1, V), input_ids[:, 1:].reshape(-1)).item()
+      print(f"manual {manual:.4f}  builtin {builtin:.4f}  unmasked {unmasked:.4f}")
+    tests: |
+      m = float(check_object("manual"))
+      assert abs(m - float(sol["manual"])) < 1e-4, "`manual` should be minus the mean log-probability of the true next token, over the positions whose shifted label is not -100 only."
+      assert abs(float(check_object("builtin")) - float(sol["builtin"])) < 1e-4, "`builtin` should use `ignore_index=-100` on the shifted labels."
+      assert abs(m - float(user["builtin"])) < 1e-4, "`manual` and `builtin` should agree. If they don't, check the shift and the mask."
+      assert abs(float(check_object("unmasked")) - float(sol["unmasked"])) < 1e-4, "`unmasked` scores every next token: use `input_ids[:, 1:]` as the targets, without `ignore_index`."
+    success_msg: "`ignore_index=-100` is just 'average over the positions you kept'. The unmasked loss averages over 37 positions, the masked one over 2. They measure different things, so never compare them directly."
+
+  - id: collate-parsons
+    type: parsons
+    title: A collate function that masks
+    prompt: "Arrange the lines into `collate(examples, tok)`, which returns padded `input_ids` and `labels` with the prompt and the padding masked. `pad_batch(seqs, value)` right-pads a list of lists into a tensor."
+    hint: Render the prompt and the full conversation inside the loop, then pad the inputs with the pad id and the labels with -100.
+    lines:
+      - "def collate(examples, tok):"
+      - "    ids, labels = [], []"
+      - "    for msgs in examples:"
+      - "        prompt = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)"
+      - "        full = tok.apply_chat_template(msgs)"
+      - "        ids.append(full)"
+      - "        labels.append([-100] * len(prompt) + full[len(prompt):])"
+      - "    return pad_batch(ids, tok.pad_token_id), pad_batch(labels, -100)"
+
+  - id: boss-loss-looks-great
+    type: sequential
+    title: "Mission: the loss looks great, the answers don't"
+    context: |
+      The team trained a tiny triage language model with `first_collate`. After 40 steps its training loss
+      is lower than the new run's, yet it gets half the validation tickets wrong. Debug it.
+      Loaded: `tok`, `train` and `val` (Helios tickets), `TinyLM`, `train_lm(model, ids, labels, steps)`
+      (returns the per-step losses), `answer_accuracy(model, tok, df)`, `triage_messages`, `pad_batch`,
+      `first_collate(df, tok)`, `torch` and `numpy` as `np`.
+    pre_code: |
+      import numpy as np
+      import torch
+      from kits.fine_tuning_llms import (ChatTokenizer, TinyLM, train_lm, answer_accuracy, triage_messages,
+                                         pad_batch, first_collate, helios_split)
+      tok = ChatTokenizer()
+      train, val = helios_split()
+    steps:
+      - instructions:
+          - "**Measure.** Build `ids, labels = first_collate(train, tok)`. Train a fresh model: `torch.manual_seed(0)`, `buggy = TinyLM(len(tok))`, `losses = train_lm(buggy, ids, labels, steps=40)`."
+          - "Store the mean of the last 5 losses in `buggy_loss` and `answer_accuracy(buggy, tok, val)` in `buggy_acc`."
+        hint: "`np.mean(losses[-5:])`."
+        sample_code: |
+          ids, labels = first_collate(train, tok)
+          torch.manual_seed(0)
+          buggy = TinyLM(len(tok))
+          losses = train_lm(buggy, ids, labels, steps=40)
+
+          buggy_loss = ____
+          buggy_acc = ____
+          print(f"loss {buggy_loss:.3f}, validation answer accuracy {buggy_acc:.2f}")
+        solution: |
+          ids, labels = first_collate(train, tok)
+          torch.manual_seed(0)
+          buggy = TinyLM(len(tok))
+          losses = train_lm(buggy, ids, labels, steps=40)
+
+          buggy_loss = np.mean(losses[-5:])
+          buggy_acc = answer_accuracy(buggy, tok, val)
+          print(f"loss {buggy_loss:.3f}, validation answer accuracy {buggy_acc:.2f}")
+        tests: |
+          check_equal("buggy_loss", tol=1e-4, msg="`buggy_loss` is the mean of the last 5 entries of `losses`. Seed with `torch.manual_seed(0)` right before `TinyLM(len(tok))`.")
+          check_equal("buggy_acc", msg="`buggy_acc` is `answer_accuracy(buggy, tok, val)`.")
+      - instructions:
+          - "**Diagnose.** Store the decoded trained tokens of the first example, `tok.decode([t for t in labels[0].tolist() if t != -100])`, in `trained0` and print it."
+          - "Each example has exactly 2 answer tokens (the label and `<|end|>`). Store `answer_share`, the number of answer tokens in the batch divided by the number of supervised positions `(labels[:, 1:] != -100).sum().item()`."
+          - "Store `pad_share`, the share of supervised positions whose label is the pad id `tok.pad_token_id`."
+        hint: "There are `2 * len(train)` answer tokens. For `pad_share`, count `(labels[:, 1:] == tok.pad_token_id)`."
+        sample_code: |
+          trained0 = ____
+          print(trained0)
+
+          supervised = (labels[:, 1:] != -100).sum().item()
+          answer_share = ____
+          pad_share = ____
+          print(f"answer tokens are {answer_share:.1%} of the loss; padding is {pad_share:.1%}")
+        solution: |
+          trained0 = tok.decode([t for t in labels[0].tolist() if t != -100])
+          print(trained0)
+
+          supervised = (labels[:, 1:] != -100).sum().item()
+          answer_share = 2 * len(train) / supervised
+          pad_share = (labels[:, 1:] == tok.pad_token_id).sum().item() / supervised
+          print(f"answer tokens are {answer_share:.1%} of the loss; padding is {pad_share:.1%}")
+        tests: |
+          check_equal("trained0", msg="`trained0` decodes every label of example 0 that is not -100. With this bug that is the whole prompt plus the padding.")
+          check_equal("answer_share", tol=1e-6, msg="`answer_share` = `2 * len(train)` divided by the number of positions in `labels[:, 1:]` that are not -100.")
+          check_equal("pad_share", tol=1e-6, msg="`pad_share` is the number of `labels[:, 1:]` entries equal to `tok.pad_token_id`, divided by the supervised positions.")
+      - instructions:
+          - "**Fix.** Write `collate(df)`: for each row build `msgs = triage_messages(row.text, row.category)`, then labels with -100 on the prompt. Pad `ids` with `tok.pad_token_id` and `labels` with -100 using `pad_batch`."
+          - "Build `ids2, labels2 = collate(train)` and store the new `answer_share2` (answer tokens divided by supervised positions in `labels2[:, 1:]`). It must be 1.0."
+        hint: "Same as the parsons exercise: `prompt = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)`, `full = tok.apply_chat_template(msgs)`, label `[-100] * len(prompt) + full[len(prompt):]`."
+        sample_code: |
+          def collate(df):
+              ids, labs = [], []
+              for row in df.itertuples():
+                  msgs = triage_messages(row.text, row.category)
+                  prompt = ____
+                  full = ____
+                  ids.append(full)
+                  labs.append(____)
+              return pad_batch(ids, tok.pad_token_id), pad_batch(labs, ____)
+
+          ids2, labels2 = collate(train)
+          answer_share2 = ____
+          print(f"answer share {answer_share:.1%} -> {answer_share2:.1%}")
+        solution: |
+          def collate(df):
+              ids, labs = [], []
+              for row in df.itertuples():
+                  msgs = triage_messages(row.text, row.category)
+                  prompt = tok.apply_chat_template(msgs[:-1], add_generation_prompt=True)
+                  full = tok.apply_chat_template(msgs)
+                  ids.append(full)
+                  labs.append([-100] * len(prompt) + full[len(prompt):])
+              return pad_batch(ids, tok.pad_token_id), pad_batch(labs, -100)
+
+          ids2, labels2 = collate(train)
+          answer_share2 = 2 * len(train) / (labels2[:, 1:] != -100).sum().item()
+          print(f"answer share {answer_share:.1%} -> {answer_share2:.1%}")
+        tests: |
+          ids2, labels2 = check_object("ids2"), check_object("labels2")
+          sup = (labels2[:, 1:] != -100)
+          assert sup.sum().item() == 2 * 80, f"`labels2` should supervise exactly the 2 answer tokens of each of the 80 examples (160 positions); it supervises {sup.sum().item()}. Mask the prompt and the padding with -100."
+          assert (labels2[:, 1:][sup] != user["tok"].pad_token_id).all(), "Padding positions must have label -100, not the pad id."
+          assert (labels2[sup.nonzero()[:, 0], sup.nonzero()[:, 1] + 1] == ids2[sup.nonzero()[:, 0], sup.nonzero()[:, 1] + 1]).all(), "Every supervised label must equal the input token at the same position."
+          assert abs(float(check_object("answer_share2")) - 1.0) < 1e-9, "`answer_share2` should be 1.0 once only answer tokens are trained."
+      - instructions:
+          - "**Verify** with the same budget: `torch.manual_seed(0)`, `fixed = TinyLM(len(tok))`, `losses2 = train_lm(fixed, ids2, labels2, steps=40)`."
+          - "Store the mean of the last 5 losses in `fixed_loss` and `answer_accuracy(fixed, tok, val)` in `fixed_acc`. The target is a validation answer accuracy of **at least 0.85**."
+        hint: Same seeding and steps as step 1, only the labels differ.
+        sample_code: |
+          torch.manual_seed(0)
+          fixed = TinyLM(len(tok))
+          losses2 = ____
+
+          fixed_loss = ____
+          fixed_acc = ____
+          print(f"loss    {buggy_loss:.3f} -> {fixed_loss:.3f}")
+          print(f"answers {buggy_acc:.2f} -> {fixed_acc:.2f}")
+        solution: |
+          torch.manual_seed(0)
+          fixed = TinyLM(len(tok))
+          losses2 = train_lm(fixed, ids2, labels2, steps=40)
+
+          fixed_loss = np.mean(losses2[-5:])
+          fixed_acc = answer_accuracy(fixed, tok, val)
+          print(f"loss    {buggy_loss:.3f} -> {fixed_loss:.3f}")
+          print(f"answers {buggy_acc:.2f} -> {fixed_acc:.2f}")
+        tests: |
+          from kits.fine_tuning_llms import answer_accuracy
+          acc = float(check_object("fixed_acc"))
+          assert abs(acc - answer_accuracy(user["fixed"], user["tok"], user["val"])) < 1e-9, "`fixed_acc` should be `answer_accuracy(fixed, tok, val)`."
+          assert acc >= 0.85, f"Validation answer accuracy is {acc:.2f}; the target is 0.85. Train on `ids2, labels2` from your fixed collate, with the same seed and 40 steps."
+          assert acc > float(user["buggy_acc"]), "The fixed run should beat the buggy run's answer accuracy."
+          check_object("fixed_loss")
+    timeout: 90
+    success_msg: "The reported loss went *up*, from about 0.27 to 0.38, while answer accuracy went from 0.50 to over 0.9. The old loss was mostly padding and prompt text. Judge a fine-tune on the task metric, never on a loss averaged over different tokens."

@@ -1,0 +1,260 @@
+title: The context window and token budgets
+description: Everything in a request competes for one window. Measure it by section, budget it by priority, and place what matters where the model will use it.
+exercises:
+  - id: window-slides
+    type: video
+    title: One window, many tenants
+    slides: |
+      # What the context window holds
+
+      The **context window** is the most tokens one request can involve: input **plus** the output you reserve with `max_tokens`.
+      Everything competes for it:
+
+      ```text
+      ┌──────────── context window (e.g. 200k tokens) ─────────────┐
+      │ tools │ system │ documents │ conversation history │ question │ ← input
+      │                                       reserved output (max_tokens) │
+      └────────────────────────────────────────────────────────────────────┘
+      ```
+
+      Go over and the API rejects the request with a 400 error ("prompt is too long"). Nothing is trimmed for you.
+
+      Staying under the limit isn't enough, either. Every input token is **paid on every call**, adds prefill time (TTFT),
+      and dilutes the model's attention. A bigger window is a ceiling, not a target.
+
+      ---
+
+      ## Counting tokens
+
+      Tokens are sub-word pieces. English prose runs about 1.3 tokens per word; numbers, code, ids and non-English text use more.
+      Don't guess: ask the API.
+
+      ```python
+      count = client.messages.count_tokens(
+          model="claude-sonnet-5-5", system=SYSTEM, tools=TOOLS, messages=messages,
+      )
+      print(count.input_tokens)
+      ```
+
+      To see **where** the tokens go, count each section separately. In the exercises, `aikit.count_tokens(text)` is a
+      deterministic stand-in tokenizer (it also accepts lists and dicts, counting their JSON).
+
+      ---
+
+      ## Budget by priority
+
+      Decide up front what each section may use, and what gets cut first:
+
+      | section | budget (8k example) | when over budget |
+      | --- | --- | --- |
+      | output reserve (`max_tokens`) | 700 | never cut: a truncated answer is a broken answer |
+      | system prompt + tools | 1,300 | trim rarely used tools; tighten the wording |
+      | retrieved documents | 4,000 | keep the highest-ranked that fit; skip the rest |
+      | conversation history | 2,000 | compact old turns (lesson 3) |
+      | the question | whatever it needs | never cut |
+
+      **Greedy packing:** walk the documents in relevance order, add each one if it fits the remaining budget, and **skip**
+      (don't stop at) one that doesn't. A smaller, lower-ranked doc may still fit.
+
+      ---
+
+      ## Where you put things matters
+
+      Models use information at the **start** and **end** of a long context more reliably than information buried in the
+      middle ("lost in the middle"). For long prompts:
+
+      - put long documents **first**, and the question and instructions **last**
+      - order documents so the most relevant sits **nearest the question**
+      - send **fewer, better** documents: irrelevant ones are distractors, not free context
+      - repeat a critical instruction at the end if the prompt is very long
+
+      ---
+
+      ## Playbook: "prompt is too long", or "it ignored the doc I gave it"
+
+      1. **Measure:** tokens per section, on the failing request.
+      2. **Diagnose:** which section grew? Usually it's one of these:
+         - history growing without limit (a long chat)
+         - raw tool output (a 30k-token sensor dump)
+         - too many retrieved documents
+         - a system prompt that keeps accumulating rules
+      3. **Fix**, cheapest first, and know what each one loses:
+
+      | fix | saves | loses |
+      | --- | --- | --- |
+      | retrieve top-k instead of stuffing everything | the most | facts in docs that ranked low (a retrieval miss) |
+      | trim or summarise tool output | a lot | detail you might have needed |
+      | compact history (lesson 3) | grows over time | whatever the summary dropped |
+      | cache the static prefix (lesson 2) | cost and latency, **not** window space | nothing, but the tokens still count |
+      | switch to a bigger window | the error goes away | cost and latency per call |
+
+      4. **Verify:** the request fits with the output reserve intact, **and** answers stay right (a fact-recall check).
+
+  - id: token-breakdown
+    type: coding
+    title: "Troubleshoot: where did the window go?"
+    context: |
+      Late in a long shift, ORBIT fails with "prompt is too long". Its request has five sections: `SYSTEM`, `TOOLS` (tool
+      definitions), `HISTORY` (the chat so far), `DOCS` (the whole handbook, in document tags) and `QUESTION`. The model
+      has a `WINDOW`-token context window, and ORBIT reserves `MAX_TOKENS` for the reply.
+    instructions:
+      - "**Measure:** store a dict `breakdown` with the keys `system`, `tools`, `history`, `documents`, `question` and the token count of each, using `count_tokens`. History is the sum over its messages' `content`."
+      - "Store the sum in `total`, and how many tokens the request is over the window, counting the output reserve, in `over_by`."
+      - "**Diagnose:** store the name of the largest section in `biggest`."
+      - "Ask the API too: store `client.messages.count_tokens(...).input_tokens` for the full request (system, tools, and messages = `HISTORY` plus the question) in `api_count`."
+    hint: |
+      `count_tokens(TOOLS)` works on the list directly. `over_by = total + MAX_TOKENS - WINDOW`.
+      `biggest = max(breakdown, key=breakdown.get)`.
+    pre_code: |
+      import aikit
+      from aikit import count_tokens
+      from kits.llm_apis_prompting import WindowedClaude, memory_model, crew_conversation, MODEL
+      WINDOW, MAX_TOKENS = 4096, 500
+      client = WindowedClaude(memory_model(), context_window=WINDOW, clock=aikit.VirtualClock())
+      hb = aikit.helios.handbook(include_superseded=False)
+      SYSTEM = next(d["text"] for d in hb if d["id"] == "orbit-assistant-policy")
+      TOOLS = aikit.helios.TOOLS
+      HISTORY = crew_conversation()
+      DOCS = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in hb)
+      QUESTION = "Which locker holds the spare scrubber cartridge?"
+      MESSAGES = HISTORY + [{"role": "user", "content": DOCS + "\n\n" + QUESTION}]
+      try:
+          client.messages.create(model=MODEL, max_tokens=MAX_TOKENS, system=SYSTEM, tools=TOOLS, messages=MESSAGES)
+      except aikit.BadRequestError as e:
+          print("API error:", e)
+    sample_code: |
+      breakdown = {
+          "system": count_tokens(SYSTEM),
+          "tools": ____,
+          "history": ____,
+          "documents": ____,
+          "question": ____,
+      }
+      total = ____
+      over_by = ____
+      biggest = ____
+      api_count = client.messages.count_tokens(model=MODEL, system=SYSTEM, tools=TOOLS, messages=____).input_tokens
+      print(breakdown)
+      print(total, over_by, biggest, api_count)
+    solution: |
+      breakdown = {
+          "system": count_tokens(SYSTEM),
+          "tools": count_tokens(TOOLS),
+          "history": sum(count_tokens(m["content"]) for m in HISTORY),
+          "documents": count_tokens(DOCS),
+          "question": count_tokens(QUESTION),
+      }
+      total = sum(breakdown.values())
+      over_by = total + MAX_TOKENS - WINDOW
+      biggest = max(breakdown, key=breakdown.get)
+      api_count = client.messages.count_tokens(model=MODEL, system=SYSTEM, tools=TOOLS, messages=MESSAGES).input_tokens
+      print(breakdown)
+      print(total, over_by, biggest, api_count)
+    tests: |
+      check_object("breakdown")
+      assert set(user["breakdown"]) == {"system", "tools", "history", "documents", "question"}, "`breakdown` needs exactly the keys system, tools, history, documents and question."
+      check_equal("breakdown", msg="Some section counts are off. Use `count_tokens` on each; for history, sum `count_tokens(m['content'])` over `HISTORY`.")
+      check_equal("total")
+      check_equal("over_by", msg="`over_by` counts the output reserve too: `total + MAX_TOKENS - WINDOW`.")
+      check_equal("biggest", "documents")
+      check_equal("api_count", msg="`api_count` should come from `client.messages.count_tokens(...)` with messages = `MESSAGES` (the history plus the question).")
+    success_msg: |
+      Pasting the whole handbook took 87% of the window, for a question that one sentence answers. The API's
+      own count is a little higher, since it adds per-message overhead. Next: send only what's relevant.
+
+  - id: pack-by-priority
+    type: coding
+    title: Pack the handbook into a budget
+    context: |
+      Instead of the whole handbook, ORBIT gets a **1,200-token** prompt budget (system + documents + question).
+      `ranked` lists handbook docs from most to least relevant to `QUESTION` (by embedding similarity), and `block(doc)`
+      wraps one doc in document tags. `client` only answers from documents in the prompt.
+    instructions:
+      - "Write `pack(ranked, budget)`: start with `used = count_tokens(SYSTEM) + count_tokens(QUESTION)`; walk `ranked` in order, adding `block(doc)` whenever it fits, and **skipping** (not stopping at) docs that don't. Return the list of chosen blocks."
+      - "Store `pack(ranked, BUDGET)` in `chosen`, and build `prompt` = the chosen blocks joined by newlines, a blank line, then `QUESTION`."
+      - "Ask the model (`system=SYSTEM`, `max_tokens=300`) and store the reply text in `answer`."
+    hint: |
+      `for doc in ranked: b = block(doc); if used + count_tokens(b) <= budget: chosen.append(b); used += count_tokens(b)`.
+      No `break`: a later, smaller doc may still fit.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from aikit import count_tokens
+      from kits.llm_apis_prompting import WindowedClaude, MODEL
+      BUDGET = 1200
+      client = WindowedClaude(aikit.grounded(), context_window=BUDGET + 300, clock=aikit.VirtualClock())
+      SYSTEM = "You are ORBIT. Answer only from the documents, in one or two sentences."
+      QUESTION = "How long is the leak-check hold when depressurising AL-1?"
+      hb = aikit.helios.handbook(include_superseded=False)
+      scores = aikit.embed([d["title"] + ". " + d["text"] for d in hb]) @ aikit.embed(QUESTION)
+      ranked = [hb[i] for i in np.argsort(-scores)]
+
+      def block(doc):
+          return f'<document id="{doc["id"]}">{doc["text"]}</document>'
+    sample_code: |
+      def pack(ranked, budget):
+          used = count_tokens(SYSTEM) + count_tokens(QUESTION)
+          chosen = []
+          for doc in ranked:
+              b = block(doc)
+              if ____:
+                  chosen.append(b)
+                  used += ____
+          return chosen
+
+      chosen = pack(ranked, BUDGET)
+      prompt = ____
+      answer = ____
+      print(len(chosen), "docs,", count_tokens(SYSTEM) + count_tokens(prompt), "tokens")
+      print(answer)
+    solution: |
+      def pack(ranked, budget):
+          used = count_tokens(SYSTEM) + count_tokens(QUESTION)
+          chosen = []
+          for doc in ranked:
+              b = block(doc)
+              if used + count_tokens(b) <= budget:
+                  chosen.append(b)
+                  used += count_tokens(b)
+          return chosen
+
+      chosen = pack(ranked, BUDGET)
+      prompt = "\n".join(chosen) + "\n\n" + QUESTION
+      answer = client.messages.create(model=MODEL, max_tokens=300, system=SYSTEM,
+                                      messages=[{"role": "user", "content": prompt}]).content[0].text
+      print(len(chosen), "docs,", count_tokens(SYSTEM) + count_tokens(prompt), "tokens")
+      print(answer)
+    tests: |
+      from aikit import count_tokens as ct
+      check_object("chosen")
+      ch = list(user["chosen"])
+      sysq = ct(user["SYSTEM"]) + ct(user["QUESTION"])
+      used = sysq + sum(ct(b) for b in ch)
+      assert used <= user["BUDGET"], f"The chosen documents use {used} tokens with the system prompt and question; the budget is {user['BUDGET']}."
+      assert ch and 'id="airlock-procedure"' in ch[0], "The top-ranked document (airlock-procedure) should be chosen first."
+      left = user["BUDGET"] - used
+      skipped = [d["id"] for d in user["ranked"] if user["block"](d) not in ch and ct(user["block"](d)) <= left]
+      assert not skipped, f"{skipped[:3]} would still fit in the {left} tokens left. Skip docs that don't fit and keep going, rather than stopping at the first one."
+      check_object("answer")
+      assert "8 minutes" in user["answer"], "The answer should give the 8-minute hold. Is `QUESTION` at the end of the prompt, after the documents?"
+    success_msg: |
+      About a third of the handbook, chosen by relevance, answered the question inside a 1,200-token budget. That's roughly
+      4 times cheaper per call than stuffing everything in, and the window stays free for history.
+
+  - id: lost-in-middle
+    type: mc
+    title: The ignored document
+    question: |
+      ORBIT gets 30 retrieved documents (about 20k tokens) followed by the question. The one document with the answer
+      ranked 14th, so it sits in the middle of the context. ORBIT answers from a different, less relevant document. What should you try first?
+    options:
+      - text: Raise `max_tokens` so the model has room to consider all 30 documents.
+        feedback: "`max_tokens` limits the reply, not how carefully the model reads the input."
+      - text: Move the question to the very top, before the documents.
+        feedback: For long contexts, questions placed **after** the material tend to be answered better. Moving it to the top usually makes this worse.
+      - text: Send only the top 5 documents after reranking, and order them so the most relevant sits right before the question.
+        correct: true
+        feedback: Right. Fewer distractors, and the key document in a strong position. It's also cheaper and faster. Verify with a recall check on questions like this one.
+      - text: Raise the temperature so the model explores more documents.
+        feedback: Temperature changes sampling of the output; it doesn't redirect attention to the right part of the input.
+    hint: Think about position in a long context, and about how many distractors you're sending.

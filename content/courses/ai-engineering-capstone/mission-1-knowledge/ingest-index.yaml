@@ -1,0 +1,280 @@
+title: Ingest and index the handbook
+description: Mission briefing for the capstone, then rebuild ORBIT's first index. Measure it, find why it misses, fix the ingest and the query side, and prove recall@5 against a target.
+exercises:
+  - id: briefing-slides
+    type: video
+    title: "Mission briefing: ship ORBIT"
+    slides: |
+      # Mission briefing
+
+      Helios-7 launches **ORBIT** next week. The crew wants an assistant that:
+
+      1. answers from the station handbook, with citations, and says "I don't know" when the handbook doesn't say;
+      2. reads sensors, books modules and messages crew through tools served over **MCP**, and never opens an airlock without a person saying yes;
+      3. comes with proof: an eval suite with a calibrated judge, and a red-team run;
+      4. survives production: retries, tracing, a cost budget and a latency target.
+
+      You've built every piece in earlier courses. Here you assemble them into one system, and each mission ends
+      in a number checked against a target. The last lesson produces the **launch report**: every metric next to its
+      target. When all of them pass, ORBIT ships.
+
+      ---
+
+      ## The launch targets
+
+      | mission | metric | target |
+      | --- | --- | --- |
+      | 1 knowledge | recall@5 | ≥ 0.95 |
+      | | answer accuracy (answerable questions) | ≥ 0.90 |
+      | | refusal rate on unanswerable questions | = 1.0 |
+      | | answers with an unsupported claim | 0 |
+      | 2 agency | night-shift replay | passes |
+      | | unsafe actions | 0 |
+      | 3 quality | judge agreement with humans, held-out κ | ≥ 0.6 |
+      | | leak rate, unsafe-action rate | 0 |
+      | | over-blocking of legitimate requests | ≤ 10% |
+      | 4 launch | cost per question | ≤ $0.0018 |
+      | | p95 latency under load | ≤ 3,500 ms |
+      | | error rate under load | 0 |
+
+      Targets pull against each other. The verifier that gets refusals to 1.0 costs a model call, and that call
+      shows up in the cost and p95 rows. Expect to trade, and to measure every trade.
+
+      ---
+
+      ## The test set: 77 crew questions
+
+      ```python
+      from kits.ai_engineering_capstone import crew_test_set, retrieval_report
+      QS = crew_test_set()      # 45 handbook + 20 crew-style + 12 near-miss unanswerable
+      ```
+
+      | type | n | what makes it hard |
+      | --- | --- | --- |
+      | factual | 37 | the baseline |
+      | multi-hop | 4 | two documents needed |
+      | identifier | 12 | exact ids like `DF-1`, `SCR-2`, `P-2` |
+      | slang | 8 | "plant lamps", "heart shocker": words the handbook never uses |
+      | unanswerable | 16 | 4 obvious, 12 **near-misses** that look answerable |
+
+      `retrieval_report(retrieve, QS, k=5)` measures retrieval alone: recall@5, evidence (the answer fact is inside
+      the top 5), the **stale rate** (a superseded document came back), context tokens per question, and recall
+      by type. Measure retrieval separately from generation, so you know which stage to fix.
+
+      ---
+
+      ## Mission 1 trade-offs: what each choice buys
+
+      Measured on the 77 questions, k = 5:
+
+      | ingest + query | recall@5 | slang | tokens/q | extra cost per query | failure mode |
+      | --- | --- | --- | --- | --- | --- |
+      | 200-char windows, all docs, dense (v0) | 0.92 | 0.50 | 195 | none | stale hits, split facts |
+      | sentences + titles, dense | 0.92 | 0.50 | 112 | none | slang, exact ids |
+      | sentences + titles, hybrid | 0.92 | 0.63 | 114 | BM25 index | slang |
+      | + LLM query rewrite | 0.97 | 1.00 | 115 | 1 small-model call (~300 ms) | rewrite drift |
+      | + rerank 20 → 5 | 0.97 | 1.00 | 119 | 20 pairs (~240 ms) | latency |
+      | headings + hybrid + rewrite + rerank | 1.00 | 1.00 | 372 | as above, 3× the tokens | cost, noisy context |
+
+      Bigger chunks win recall but triple the tokens every answer pays for. Rewriting fixes vocabulary at the price of
+      a model call on the critical path. Reranking costs latency per candidate. Choose with the constraints in view.
+
+      ---
+
+      ## Playbook: "relevant documents are not found"
+
+      1. **Split recall by question type** before changing anything. One global number hides which fix you need.
+      2. **Slang or paraphrase** misses: the query and the document use different words. Rewrite the query, or add synonyms. A better embedding model helps too, at a cost.
+      3. **Exact identifiers** missed (`SCR-2`): add keyword search (BM25) and fuse it with RRF.
+      4. **Stale documents** retrieved: filter on metadata at ingest (`SUPERSEDED`, dates). Never rely on the model to ignore them.
+      5. **Facts split across chunks**, or chunks that lose their topic: split on sentences or headings, and put the **title** into each chunk.
+      6. **Two-document questions** with one document crowding the top 5: cap chunks per document, or retrieve parents.
+
+      Then re-measure with the *same* report and keep the change only if the number moved.
+
+  - id: pick-retrieval-stack
+    type: mc
+    title: Pick the retrieval stack
+    question: |
+      ORBIT's constraints: recall@5 **≥ 0.95** overall, slang recall **≥ 0.9**, **no stale documents**, and at most
+      **150 context tokens** per question (every answer pays for them). Retrieval may spend up to 700 ms. Using the
+      measurements from the slides, which stack do you build?
+    options:
+      - text: Heading-sized chunks with titles, hybrid search, query rewriting and reranking.
+        feedback: |
+          Perfect recall, but 372 context tokens per question: more than double the budget. Every answer would pay for
+          that context, and the extra text gives the model more chances to quote the wrong sentence.
+      - text: Sentence chunks with titles, superseded documents dropped, hybrid search, query rewriting and reranking 20 candidates down to 5.
+        correct: true
+        feedback: |
+          Right. 0.97 recall with every slang question found, no stale hits, about 119 tokens, and roughly 300 + 240 ms
+          for the rewrite and the reranker, inside the 700 ms. Each part earns its place: titles and the superseded
+          filter at ingest, rewriting for slang, hybrid for exact ids, reranking for order.
+      - text: Sentence chunks with titles and dense search, no rewriting. It's the cheapest and fastest option.
+        feedback: |
+          Cheap and fast, but slang recall is 0.5: "plant lamps" and "heart shocker" never match handbook words.
+          This stack fails a stated constraint. Low cost doesn't make up for that.
+      - text: Keep the v0 index (200-character windows over every document) and add a reranker on top.
+        feedback: |
+          A reranker reorders what the first stage found. It can't find slang questions' documents the first stage
+          missed, and it can't remove a superseded document that's in the index. Fix the ingest first.
+    hint: Check each option against all four constraints, not just recall.
+
+  - id: index-mission
+    type: sequential
+    title: "Mission: rebuild ORBIT's index"
+    timeout: 90
+    context: |
+      A teammate built ORBIT's first index (`v0_index()`): 200-character windows over every handbook document, dense
+      search only. The crew says ORBIT "can't find things" and once quoted an old airlock hold time. `QS` is the
+      77-question test set, `retrieval_report` measures retrieval, and `rewrite(question)` is a small-model call that
+      swaps crew slang for handbook words. `reranker` is a cross-encoder stand-in that costs 12 ms per pair on `clk`.
+    pre_code: |
+      import aikit
+      from kits.ai_engineering_capstone import (crew_test_set, v0_index, retrieval_report, make_chunks, chunk_sentences,
+                                                chunk_headings, chunk_fixed, DenseIndex, BM25Index, HybridIndex,
+                                                CrossEncoder, rewriter, rewrite_request, helios, SUPERSEDED, VirtualClock)
+      QS = crew_test_set()
+      clk = VirtualClock()
+      rw = aikit.FakeClaude(rewriter(), clock=clk)
+      reranker = CrossEncoder(clock=clk)
+      FIXES = ["rewrite queries", "hybrid keyword search", "drop superseded docs", "titles in chunks", "bigger chunks"]
+
+      def rewrite(question):
+          """One small-model call: crew slang -> handbook words."""
+          return rw.messages.create(**rewrite_request(question)).content[0].text.strip()
+    steps:
+      - instructions:
+          - "**Measure.** Build `v0 = v0_index()` and store `retrieval_report(v0.search, QS, k=5)` in `base`."
+          - "Print `base['recall']`, `base['recall_by_type']`, `base['stale_rate']` and `base['context_tokens']`."
+        hint: "`retrieval_report` takes the search function itself: `retrieval_report(v0.search, QS, k=5)`."
+        sample_code: |
+          v0 = ____
+          base = ____
+          print("recall@5", base["recall"], base["recall_by_type"])
+          print("stale rate", base["stale_rate"], "| context tokens", base["context_tokens"])
+        solution: |
+          v0 = v0_index()
+          base = retrieval_report(v0.search, QS, k=5)
+          print("recall@5", base["recall"], base["recall_by_type"])
+          print("stale rate", base["stale_rate"], "| context tokens", base["context_tokens"])
+        tests: |
+          b = check_object("base")
+          assert isinstance(b, dict) and "recall" in b, "`base` should be the dict returned by `retrieval_report(v0.search, QS, k=5)`."
+          for key in ["recall", "stale_rate", "context_tokens", "recall_by_type"]:
+              assert b[key] == sol["base"][key], f"`base['{key}']` is {b[key]}, expected {sol['base'][key]}. Pass `v0.search`, the full `QS` and `k=5`."
+      - instructions:
+          - "**Diagnose.** From `base['rows']`, store the answerable questions that missed (`hit` is `False`) in `misses`, and `misses['type'].value_counts().to_dict()` in `miss_by_type`."
+          - "Store the sorted list of question `id`s whose results contained a superseded document (`stale` is `True`) in `stale_ids`."
+          - "Store `diagnosis`: a dict mapping `\"slang misses\"` and `\"stale hits\"` to the fix from `FIXES` that addresses each one."
+        hint: |
+          `rows = base["rows"]`, then `rows[rows["hit"] == False]` and `sorted(rows.loc[rows["stale"], "id"])`. Slang
+          misses are a vocabulary problem; stale hits come from a document that should never have been indexed.
+        sample_code: |
+          rows = base["rows"]
+          misses = ____
+          miss_by_type = ____
+          stale_ids = ____
+          print(misses[["id", "type", "question"]])
+          print(miss_by_type, stale_ids)
+
+          diagnosis = {"slang misses": ____, "stale hits": ____}
+        solution: |
+          rows = base["rows"]
+          misses = rows[rows["hit"] == False]
+          miss_by_type = misses["type"].value_counts().to_dict()
+          stale_ids = sorted(rows.loc[rows["stale"], "id"])
+          print(misses[["id", "type", "question"]])
+          print(miss_by_type, stale_ids)
+
+          diagnosis = {"slang misses": "rewrite queries", "stale hits": "drop superseded docs"}
+        tests: |
+          check_equal("miss_by_type", msg="Count the missed answerable questions by `type`: `misses['type'].value_counts().to_dict()`.")
+          check_equal("stale_ids", msg="List the `id` of every row where `stale` is True, sorted.")
+          d = check_object("diagnosis")
+          assert d.get("slang misses") == "rewrite queries", "Slang questions use words the handbook never uses. Which fix changes the *query's* words?"
+          assert d.get("stale hits") == "drop superseded docs", "A superseded document can only be retrieved if it was indexed. Which fix removes it at ingest?"
+      - instructions:
+          - "**Fix the ingest.** Build `chunks` with `make_chunks` from the handbook **without** superseded documents, with titles in every chunk. Pick a chunker that keeps context at **150 tokens or less** per question."
+          - "Build `index = HybridIndex(chunks)` and store `retrieval_report(index.search, QS, k=5)` in `ingest`. Print its recall, recall by type, stale rate and context tokens."
+        hint: |
+          `helios.handbook(include_superseded=False)`, then `make_chunks(docs, chunk_sentences, title=True)`. Heading-sized
+          chunks find more but cost about 350 tokens per question.
+        sample_code: |
+          docs = ____
+          chunks = make_chunks(docs, ____, title=____)
+          index = HybridIndex(chunks)
+          ingest = ____
+          print(len(chunks), "chunks")
+          print("recall@5", ingest["recall"], ingest["recall_by_type"])
+          print("stale rate", ingest["stale_rate"], "| context tokens", ingest["context_tokens"])
+        solution: |
+          docs = helios.handbook(include_superseded=False)
+          chunks = make_chunks(docs, chunk_sentences, title=True)
+          index = HybridIndex(chunks)
+          ingest = retrieval_report(index.search, QS, k=5)
+          print(len(chunks), "chunks")
+          print("recall@5", ingest["recall"], ingest["recall_by_type"])
+          print("stale rate", ingest["stale_rate"], "| context tokens", ingest["context_tokens"])
+        tests: |
+          ch = check_object("chunks")
+          bad = sorted({c["doc_id"] for c in ch if c["doc_id"] in SUPERSEDED})
+          assert not bad, f"`chunks` still contains superseded documents {bad}. Load the handbook with `include_superseded=False`."
+          untitled = [c["id"] for c in ch if not c["text"].startswith(c["title"] + ": ")]
+          assert not untitled, f"{len(untitled)} chunks don't start with their document title (e.g. {untitled[0]}). Use `title=True`."
+          check_object("index")
+          r = check_object("ingest")
+          assert isinstance(r, dict) and "stale_rate" in r, "`ingest` should be `retrieval_report(index.search, QS, k=5)`."
+          assert r["stale_rate"] == 0, f"The stale rate is {r['stale_rate']}; it must be 0."
+          assert r["context_tokens"] <= 150, f"Context is {r['context_tokens']} tokens per question; the budget is 150. Use smaller chunks (sentences)."
+          assert r["recall_by_type"].get("identifier", 0) >= 0.9, "Identifier questions (DF-1, SCR-2) should be found: is `index` a HybridIndex?"
+      - instructions:
+          - "**Fix the query side, then verify.** Write `retrieve(question, k)`: rewrite the question, take 20 candidates from `index`, and return the top `k` after `reranker.rerank(query, candidates, k)`."
+          - "Record `t0 = clk.now_ms`, store `retrieval_report(retrieve, QS, k=5)` in `final`, and store the mean simulated time per question in `ms_per_query`."
+          - "Targets: recall@5 **≥ 0.95**, slang recall **≥ 0.9**, stale rate **0**, context **≤ 150** tokens, **≤ 700 ms** per query."
+        hint: |
+          Rerank against the **rewritten** query: `q = rewrite(question)`, then `reranker.rerank(q, index.search(q, 20), k)`.
+          `ms_per_query = (clk.now_ms - t0) / len(QS)`.
+        sample_code: |
+          def retrieve(question, k):
+              q = ____
+              candidates = ____
+              return ____
+
+          t0 = clk.now_ms
+          final = retrieval_report(retrieve, QS, k=5)
+          ms_per_query = ____
+          print("recall@5", final["recall"], final["recall_by_type"])
+          print("stale", final["stale_rate"], "| tokens", final["context_tokens"], "|", round(ms_per_query), "ms per query")
+          print("v0 -> final recall:", base["recall"], "->", final["recall"])
+        solution: |
+          def retrieve(question, k):
+              q = rewrite(question)
+              candidates = index.search(q, 20)
+              return reranker.rerank(q, candidates, k)
+
+          t0 = clk.now_ms
+          final = retrieval_report(retrieve, QS, k=5)
+          ms_per_query = (clk.now_ms - t0) / len(QS)
+          print("recall@5", final["recall"], final["recall_by_type"])
+          print("stale", final["stale_rate"], "| tokens", final["context_tokens"], "|", round(ms_per_query), "ms per query")
+          print("v0 -> final recall:", base["recall"], "->", final["recall"])
+        tests: |
+          check_object("retrieve")
+          f = check_object("final")
+          assert isinstance(f, dict) and "recall" in f, "`final` should be `retrieval_report(retrieve, QS, k=5)`."
+          got = user["retrieve"]("When do the plant lamps turn on?", 5)
+          assert isinstance(got, list) and len(got) == 5, "`retrieve(question, k)` should return k chunk dicts."
+          slang = f["recall_by_type"].get("slang", 0)
+          assert slang >= 0.9, f"Slang recall is {slang}; the target is 0.9. Rewrite the question before searching, and search with the rewritten text."
+          assert f["recall"] >= 0.95, f"Recall@5 is {f['recall']}; the target is 0.95."
+          assert f["stale_rate"] == 0, "Stale documents came back. Keep using the index you built in the previous step."
+          assert f["context_tokens"] <= 150, f"Context is {f['context_tokens']} tokens per question; the budget is 150."
+          ms = check_object("ms_per_query")
+          assert ms <= 700, f"Retrieval takes {ms:.0f} ms per query; the budget is 700. Rerank fewer candidates (20 is enough)."
+          assert ms > 0, "`ms_per_query` should be the clock time spent in `retrieval_report`, divided by `len(QS)`."
+    success_msg: |
+      Recall@5 went from 0.92 to 0.97, slang from 0.50 to 1.00, stale hits from 10% of questions to none, and context
+      shrank from 195 to about 119 tokens, for roughly 550 ms of rewriting and reranking per query. The two remaining
+      misses are multi-hop questions whose five slots all went to one document: capping chunks per document is the
+      next fix if those matter. Keep this stack: Mission 1's second lesson answers from it.

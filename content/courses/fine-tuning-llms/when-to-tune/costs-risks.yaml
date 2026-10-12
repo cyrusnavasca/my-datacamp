@@ -1,0 +1,152 @@
+title: Costs, risks and evaluating before you tune
+description: The hidden costs of a fine-tune, the ways it fails, and a go/no-go gate you write before training starts.
+exercises:
+  - id: intro
+    type: video
+    title: What a fine-tune really costs
+    slides: |
+      # The bill is more than GPU hours
+
+      | cost | what it is | how often |
+      | --- | --- | --- |
+      | Data | collecting, cleaning and labelling hundreds to thousands of examples | once, then for every change |
+      | Evaluation | a task set, a general regression suite and a safety suite | once, then every run |
+      | Training | GPU time, or a provider's per-token training price | every run (expect several) |
+      | Serving | fine-tuned models may cost more per token, or need dedicated hosting | every call |
+      | Maintenance | your tune is pinned to one base model: when it is deprecated or improved, you retrain | every base-model change |
+      | Iteration speed | a prompt edit takes seconds; a fine-tune change takes hours | every change |
+
+      A prompt change ships in minutes. A fine-tune turns behaviour into an artefact you now own.
+
+      ---
+
+      ## How fine-tunes fail
+
+      | risk | what happens | why |
+      | --- | --- | --- |
+      | **Catastrophic forgetting** | general skills degrade: it stops following unrelated instructions, or squeezes every answer into the trained format | narrow data pulls shared weights towards one task |
+      | **Overfitting** | near-perfect on training examples, worse on new ones | too many epochs, too much capacity, too little or noisy data |
+      | **Invented facts** | confident answers about things never in the data | it learned the *style* of answering, not a lookup table |
+      | **Stale facts** | quotes rules that changed after training | weights are a snapshot |
+      | **Safety regression** | refuses less than the base model | tuning can weaken refusal behaviour even on harmless data |
+      | **Memorisation** | training text comes back verbatim, codes and medical notes included | models can memorise rare strings; never train on secrets |
+
+      ---
+
+      ## Evaluate before you tune
+
+      The playbook, in order:
+
+      1. **Task set**: held-out examples from real traffic, never used for training or prompt design.
+      2. **General regression suite**: things the base model already does well that you must keep
+         (follow formats, summarise, refuse unsafe requests). This is how you catch forgetting.
+      3. **Baseline**: measure your *best prompt* on all suites. That is the bar to beat, not the zero-shot score.
+      4. **Gate**: write the go/no-go rule *before* the first training run, so a shiny task number can't
+         talk you into shipping a regression.
+
+      ---
+
+      ## A gate in code
+
+      ```python
+      def gate(cand, base, min_gain=0.05, max_drop=0.02):
+          gain = cand["task_acc"] - base["task_acc"]
+          drops = [base[m] - cand[m] for m in ("general_acc", "safety_refusal")]
+          return gain >= min_gain and max(drops) <= max_drop
+      ```
+
+      - **Gain** must be big enough to pay for the costs on slide 1. Two points rarely is.
+      - **No suite may drop** more than the tolerance. A tune that wins on the task but loses 9 points
+        of general skill is a regression, not an improvement.
+      - Record *why* each candidate failed: it tells you which knob to turn next (epochs, data mix, rank).
+
+  - id: one-word-summaries
+    type: mc
+    title: Summaries that come back as one word
+    question: |
+      ORBIT's model was fine-tuned for 8 epochs on 5,000 triage tickets. Triage accuracy on a held-out
+      ticket set rose from 88% to 97%. A week later, crew report that when they ask ORBIT to summarise a
+      handbook section, it often replies with a single word such as "maintenance". What is going on, and
+      what measurement would have caught it before release?
+    options:
+      - text: "Overfitting. The held-out triage accuracy would have shown it."
+        feedback: "Held-out triage accuracy is 97%, so the triage skill generalises fine. The failure is on a *different* task, which a triage-only test set never measures."
+      - text: "Catastrophic forgetting. A general regression suite (summarising, following other instructions), run on the base model and the tune, would have shown the drop."
+        correct: true
+        feedback: "Right. Narrow training pulled the model towards always emitting a category. Only an eval of tasks outside the training set catches that, which is why the gate needs a general suite as well as the task set."
+      - text: "Data leakage between train and test tickets."
+        feedback: "Leakage inflates the test score, but it doesn't make the model answer a summary request with a label. The symptom is on tasks that were never in the training data."
+      - text: "The summarisation prompt is too long; shorten it."
+        feedback: "The same prompt worked before the fine-tune, so the prompt didn't change; the weights did. Look for what the training changed."
+    hint: The broken behaviour is on a task that was not in the training data.
+
+  - id: name-the-risk
+    type: classify
+    title: Name the risk
+    prompt: Each report comes from a team that shipped a fine-tune. Sort it by the risk it shows.
+    hint: "Is the problem on new examples of the *same* task, on *other* tasks, about facts, or about training text coming back?"
+    zones: [Overfitting, Forgetting, Wrong or stale facts, Memorised private data]
+    items:
+      - { text: "Train loss keeps falling, validation loss has risen for three epochs", zone: Overfitting }
+      - { text: "Near-perfect on the training tickets, 70% on next month's tickets", zone: Overfitting }
+      - { text: "Since the tune, ORBIT ignores requests to answer in French", zone: Forgetting }
+      - { text: "Task accuracy up 6 points, general-skills suite down 9 points", zone: Forgetting }
+      - { text: "Asked about a pump that was never in the data, it gives a confident part number", zone: Wrong or stale facts }
+      - { text: "It quotes the old CO2 alert threshold, revised after training", zone: Wrong or stale facts }
+      - { text: "Prompted with 'The door code for Module E is', it completes four digits", zone: Memorised private data }
+      - { text: "A crew member's medical note from the training set appears word for word in a reply", zone: Memorised private data }
+
+  - id: release-gate
+    type: coding
+    title: Write the release gate
+    context: |
+      `results` has one row per system: the best prompt (`prompt-baseline`) and five fine-tune candidates,
+      with `task_acc`, `general_acc` (regression suite), `safety_refusal` (share of unsafe requests
+      refused) and `cost_per_1k` (USD). `pandas` is imported as `pd`.
+    instructions:
+      - "Write `gate(cand, base, min_gain=0.05, max_drop=0.02)`: `True` when `task_acc` beats the baseline by at least `min_gain` **and** neither `general_acc` nor `safety_refusal` drops by more than `max_drop`."
+      - "Store the baseline row in `base`, then a list of the names of candidates (not the baseline) that pass, in table order, in `passing`."
+      - "Store the passing candidate with the highest `task_acc` in `best` (its name, a string)."
+    hint: "`base = results.set_index(\"name\").loc[\"prompt-baseline\"]`, then loop over the other rows and call `gate(row, base)`."
+    pre_code: |
+      import pandas as pd
+      results = pd.DataFrame([
+          ("prompt-baseline", 0.88, 0.95, 0.98, 2.40),
+          ("ft-3ep", 0.95, 0.94, 0.98, 0.30),
+          ("ft-10ep", 0.97, 0.86, 0.97, 0.30),
+          ("ft-mixed-data", 0.94, 0.95, 0.97, 0.30),
+          ("ft-no-safety-data", 0.96, 0.95, 0.90, 0.30),
+          ("ft-1ep", 0.90, 0.95, 0.98, 0.30),
+      ], columns=["name", "task_acc", "general_acc", "safety_refusal", "cost_per_1k"])
+    sample_code: |
+      def gate(cand, base, min_gain=0.05, max_drop=0.02):
+          gain = ____
+          drops = [base[m] - cand[m] for m in ("general_acc", "safety_refusal")]
+          return ____
+
+      table = results.set_index("name")
+      base = table.loc["prompt-baseline"]
+      passing = [name for name, row in table.iterrows() if name != "prompt-baseline" and ____]
+      best = ____
+      print(passing, best)
+    solution: |
+      def gate(cand, base, min_gain=0.05, max_drop=0.02):
+          gain = cand["task_acc"] - base["task_acc"]
+          drops = [base[m] - cand[m] for m in ("general_acc", "safety_refusal")]
+          return gain >= min_gain and max(drops) <= max_drop
+
+      table = results.set_index("name")
+      base = table.loc["prompt-baseline"]
+      passing = [name for name, row in table.iterrows() if name != "prompt-baseline" and gate(row, base)]
+      best = table.loc[passing, "task_acc"].idxmax()
+      print(passing, best)
+    tests: |
+      g = check_object("gate")
+      b = {"task_acc": 0.80, "general_acc": 0.90, "safety_refusal": 0.95}
+      assert g({"task_acc": 0.90, "general_acc": 0.90, "safety_refusal": 0.95}, b), "`gate` should pass a candidate with a 10-point gain and no drops."
+      assert not g({"task_acc": 0.83, "general_acc": 0.90, "safety_refusal": 0.95}, b), "`gate` should fail a candidate whose gain (3 points) is below `min_gain`."
+      assert not g({"task_acc": 0.95, "general_acc": 0.80, "safety_refusal": 0.95}, b), "`gate` should fail a candidate whose `general_acc` drops by more than `max_drop`, however good its task score."
+      assert not g({"task_acc": 0.95, "general_acc": 0.90, "safety_refusal": 0.85}, b), "`gate` should fail a candidate whose `safety_refusal` drops by more than `max_drop`."
+      check_equal("passing", msg="`passing` should list, in table order, every candidate name for which `gate(row, base)` is True (not the baseline).")
+      check_equal("best", msg="`best` is the name of the passing candidate with the highest `task_acc`.")
+    success_msg: "Only ft-3ep and ft-mixed-data pass. ft-10ep forgot (general -9 points), ft-no-safety-data regressed on safety, and ft-1ep didn't gain enough to justify the cost. Each failure reason points to a different fix."

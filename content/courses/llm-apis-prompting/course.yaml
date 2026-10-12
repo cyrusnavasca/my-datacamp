@@ -1,0 +1,44 @@
+title: LLM APIs and Prompt Engineering
+description: 'Call large language models from Python and get reliable results: messages and parameters,
+  prompting techniques, structured output, and context engineering under a token budget.'
+level: beginner
+est_hours: 4
+prerequisites: []
+objectives:
+- Call an LLM API, read the response and handle truncation and multi-turn state
+- Write prompts that work, and explain why they work
+- Get valid structured (JSON) output and recover when it breaks
+- Manage the context window, prompt caching and cost trade-offs
+requires:
+- pydantic
+chapters:
+- id: first-calls
+  title: Your first API calls
+  description: Messages, roles, parameters, multi-turn conversations and streaming.
+  lessons:
+  - messages-roles
+  - parameters
+  - multi-turn
+  - streaming
+- id: prompting
+  title: Prompting techniques
+  description: Clear instructions, few-shot examples, XML structure and reasoning.
+  lessons:
+  - clear-instructions
+  - few-shot
+  - xml-structure
+  - reasoning
+- id: structured-output
+  title: Structured output
+  description: JSON, schemas and validation, and repair loops when output breaks.
+  lessons:
+  - json-output
+  - schemas-validation
+  - retry-repair
+- id: context-engineering
+  title: Context engineering
+  description: Token budgets, prompt caching and compacting long conversations.
+  lessons:
+  - context-window
+  - prompt-caching
+  - compaction-memory

@@ -1,0 +1,296 @@
+title: How models choose the next token
+description: Write the generation loop by hand, then implement temperature, top-k and top-p on a logits vector, and choose settings for the job.
+exercises:
+  - id: intro
+    type: video
+    title: From logits to text
+    slides: |
+      # Generation is a loop
+
+      A decoder outputs **logits**, one score per vocabulary token, for the next position only. Text
+      comes from running it again and again:
+
+      ```python
+      ids = tok("Pressure in the airlock is", return_tensors="pt")["input_ids"]
+      for _ in range(20):
+          with torch.no_grad():
+              logits = model(ids).logits[0, -1]      # scores for the next token, shape (V,)
+          next_id = choose(logits)                   # greedy, or sampled
+          ids = torch.cat([ids, next_id.view(1, 1)], dim=1)
+      ```
+
+      **Greedy** decoding takes `logits.argmax()`. It is deterministic and often dull, and small models
+      fall into loops with it. Everything else in this lesson is a different `choose`.
+
+      ---
+
+      ## Temperature
+
+      $$p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}$$
+
+      | $T$ | effect | top token's probability in our example |
+      | --- | --- | --- |
+      | $\to 0$ | becomes greedy (argmax) | 1.00 |
+      | 0.5 | sharper, safer | 0.59 |
+      | 1.0 | the model's own distribution | 0.37 |
+      | 2.0 | flatter, more surprising, more errors | 0.25 |
+
+      Temperature does not change the **ranking**, only how much mass the tail gets.
+
+      ---
+
+      ## Truncation: top-k and top-p
+
+      Even at $T = 1$ the long tail of 50,000 unlikely tokens adds up to real probability, and one bad
+      draw derails the text. So cut the tail before sampling:
+
+      - **top-k:** keep the $k$ most likely tokens.
+      - **top-p (nucleus):** keep the smallest set of top tokens whose total probability reaches $p$.
+
+      ```python
+      order = np.argsort(-probs)
+      before = np.cumsum(probs[order]) - probs[order]  # mass of the tokens ranked above
+      keep = order[before < p]
+      ```
+
+      Top-p adapts: when the model is confident the nucleus has 1-2 tokens, when it is unsure it has many.
+      Fixed $k$ cannot do that. After filtering, renormalise and sample.
+
+      ---
+
+      ## In transformers
+
+      ```python
+      out = model.generate(**enc, max_new_tokens=40, do_sample=True,
+                           temperature=0.7, top_p=0.9, top_k=0,   # top_k=0 disables top-k
+                           pad_token_id=tok.eos_token_id)
+      ```
+
+      Set `torch.manual_seed(...)` first if you need reproducible samples. With `do_sample=False`,
+      temperature and top-p are ignored. The LLM APIs in the next course expose the same knobs.
+
+      ---
+
+      ## Trade-offs: settings for the job
+
+      | job | settings | why |
+      | --- | --- | --- |
+      | extraction, classification, answers from documents, code | $T$ = 0 to 0.3 (greedy-like) | one right answer; variety only adds errors |
+      | assistant replies, summaries | $T \approx$ 0.5-0.8, top-p 0.9 | natural wording without wandering |
+      | brainstorming, stories, many diverse candidates | $T \approx$ 0.9-1.2, top-p 0.95 | diversity is the goal |
+
+      Low temperature does **not** make a model factual, it only makes it consistent: a wrong answer
+      repeated with confidence. Grounding (RAG) fixes facts; temperature controls variety.
+
+  - id: temperature
+    type: coding
+    title: Temperature on a logits vector
+    context: |
+      After "Pressure in the airlock is", a model gives `logits` for 8 candidate tokens listed in `tokens`
+      (`normal`, `stable`, `low`, `rising`, `fine`, `dropping`, `purple`, `singing`). `np` is imported.
+    instructions:
+      - "Write `softmax_t(logits, T)`: divide by `T`, subtract the max for stability, exponentiate and normalise."
+      - "Store the probabilities at `T = 0.5`, `1.0` and `2.0` in `p_cold`, `p_base` and `p_hot`."
+      - "Store the total probability of the two nonsense tokens (`purple`, `singing`, the last two) at `T = 2.0` in `nonsense_hot`."
+    hint: "`z = logits / T`, then `e = np.exp(z - z.max())` and `e / e.sum()`. The nonsense mass is `p_hot[-2:].sum()`."
+    pre_code: |
+      import numpy as np
+      tokens = ["normal", "stable", "low", "rising", "fine", "dropping", "purple", "singing"]
+      logits = np.array([3.1, 2.6, 2.2, 1.9, 1.5, 1.1, -1.0, -2.5])
+    sample_code: |
+      def softmax_t(logits, T):
+          z = ____
+          e = np.exp(z - z.max())
+          return ____
+
+      p_cold = ____
+      p_base = ____
+      p_hot = ____
+      nonsense_hot = ____
+
+      for name, p in [("T=0.5", p_cold), ("T=1.0", p_base), ("T=2.0", p_hot)]:
+          print(name, p.round(2))
+      print(f"nonsense mass at T=2: {nonsense_hot:.1%}")
+    solution: |
+      def softmax_t(logits, T):
+          z = logits / T
+          e = np.exp(z - z.max())
+          return e / e.sum()
+
+      p_cold = softmax_t(logits, 0.5)
+      p_base = softmax_t(logits, 1.0)
+      p_hot = softmax_t(logits, 2.0)
+      nonsense_hot = p_hot[-2:].sum()
+
+      for name, p in [("T=0.5", p_cold), ("T=1.0", p_base), ("T=2.0", p_hot)]:
+          print(name, p.round(2))
+      print(f"nonsense mass at T=2: {nonsense_hot:.1%}")
+    tests: |
+      import numpy as np
+      f = check_object("softmax_t")
+      got = np.asarray(f(np.array([1000.0, 999.0]), 1.0))
+      assert np.all(np.isfinite(got)), "`softmax_t` overflows on large logits. Subtract the max before `np.exp`."
+      check_equal("p_cold", msg="`p_cold` should be `softmax_t(logits, 0.5)`.")
+      check_equal("p_base", msg="`p_base` should be `softmax_t(logits, 1.0)`.")
+      check_equal("p_hot", msg="`p_hot` should be `softmax_t(logits, 2.0)`. Divide the logits by T before the softmax.")
+      check_equal("nonsense_hot", msg="`nonsense_hot` is the sum of the last two entries of `p_hot`.")
+    success_msg: At T=2 the nonsense tokens get almost 5% of the mass, so over a 40-token reply a few odd words are close to certain. That is the tail that top-p removes.
+
+  - id: top-p-filter
+    type: coding
+    title: Top-k and top-p by hand
+    context: |
+      `probs` is a probability vector over 8 candidate tokens (not sorted). `np` is imported. Write the two
+      truncation filters used before sampling.
+    instructions:
+      - "Write `top_k_filter(probs, k)`: zero every entry except the `k` largest, then renormalise to sum 1. Keep the original positions."
+      - "Write `top_p_filter(probs, p)`: keep the smallest set of top tokens whose total reaches `p` (a token is kept if the mass of the tokens ranked above it is `< p`), zero the rest, renormalise."
+      - "Store `top_p_filter(probs, 0.9)` in `nucleus` and the number of tokens it keeps in `nucleus_size`."
+    hint: |
+      `order = np.argsort(-probs)` ranks tokens. For top-p, `before = np.cumsum(probs[order]) - probs[order]`
+      and `keep = order[before < p]`. Build `out = np.zeros_like(probs)`, set `out[keep] = probs[keep]`, return `out / out.sum()`.
+    pre_code: |
+      import numpy as np
+      probs = np.array([0.04, 0.37, 0.006, 0.23, 0.15, 0.001, 0.113, 0.09])
+      probs = probs / probs.sum()
+    sample_code: |
+      def top_k_filter(probs, k):
+          keep = np.argsort(-probs)[:____]
+          out = np.zeros_like(probs)
+          out[keep] = probs[keep]
+          return ____
+
+      def top_p_filter(probs, p):
+          order = np.argsort(-probs)
+          before = ____
+          keep = order[____]
+          out = np.zeros_like(probs)
+          out[keep] = probs[keep]
+          return out / out.sum()
+
+      nucleus = top_p_filter(probs, 0.9)
+      nucleus_size = ____
+      print(nucleus.round(3), nucleus_size)
+    solution: |
+      def top_k_filter(probs, k):
+          keep = np.argsort(-probs)[:k]
+          out = np.zeros_like(probs)
+          out[keep] = probs[keep]
+          return out / out.sum()
+
+      def top_p_filter(probs, p):
+          order = np.argsort(-probs)
+          before = np.cumsum(probs[order]) - probs[order]
+          keep = order[before < p]
+          out = np.zeros_like(probs)
+          out[keep] = probs[keep]
+          return out / out.sum()
+
+      nucleus = top_p_filter(probs, 0.9)
+      nucleus_size = int((nucleus > 0).sum())
+      print(nucleus.round(3), nucleus_size)
+    tests: |
+      import numpy as np
+      tk, tp = check_object("top_k_filter"), check_object("top_p_filter")
+      x = np.array([0.15, 0.5, 0.05, 0.3])
+      assert np.allclose(tk(x, 2), [0, 0.625, 0, 0.375]), "top_k_filter([0.15, 0.5, 0.05, 0.3], 2) should keep 0.5 and 0.3 in place and renormalise: [0, 0.625, 0, 0.375]."
+      assert np.allclose(tp(x, 0.75), [0, 0.625, 0, 0.375]), "top_p_filter(x, 0.75) should keep 0.5 and 0.3 (0.5 is below 0.75, so 0.3 is kept; 0.8 is not, so 0.15 is dropped)."
+      assert np.allclose(tp(x, 0.85), [0.15 / 0.95, 0.5 / 0.95, 0, 0.3 / 0.95]), "top_p_filter(x, 0.85) should keep the top three tokens and renormalise."
+      assert np.allclose(tp(np.array([0.9, 0.06, 0.04]), 0.5), [1, 0, 0]), "When the top token alone reaches p, the nucleus is just that token."
+      check_equal("nucleus", msg="`nucleus` should be `top_p_filter(probs, 0.9)`.")
+      check_equal("nucleus_size", msg="`nucleus_size` counts the non-zero entries of `nucleus`.")
+    success_msg: Top-p kept 5 tokens here and dropped the unlikely tail, about 5% of the mass in three tokens.
+
+  - id: generation-loop
+    type: coding
+    title: Write the greedy loop yourself
+    context: |
+      `tok` and `model` are DistilGPT2 (in eval mode), and `prompt_ids` is the tokenised prompt
+      "The crew of the space station", shape `(1, 6)`. `torch` is imported. Build greedy decoding by hand and
+      check it against `model.generate`.
+    instructions:
+      - "Starting from `ids = prompt_ids`, repeat 8 times: run `model(ids).logits[0, -1]` under `torch.no_grad()`, take the argmax, and append it to `ids` with `torch.cat`."
+      - "Store the 8 new token ids (as a Python list) in `by_hand`."
+      - "Store the 8 new ids from `model.generate(prompt_ids, max_new_tokens=8, do_sample=False, pad_token_id=tok.eos_token_id)` in `by_library`."
+    hint: "`next_id = logits.argmax()` then `ids = torch.cat([ids, next_id.view(1, 1)], dim=1)`. New ids are `ids[0, prompt_ids.shape[1]:].tolist()`."
+    pre_code: |
+      import torch
+      from kits.nlp_transformers import load_gpt2
+      tok, model = load_gpt2()
+      prompt_ids = tok("The crew of the space station", return_tensors="pt")["input_ids"]
+    sample_code: |
+      ids = prompt_ids
+      for _ in range(8):
+          with torch.no_grad():
+              logits = ____
+          next_id = ____
+          ids = torch.cat([ids, next_id.view(1, 1)], dim=1)
+      by_hand = ids[0, prompt_ids.shape[1]:].tolist()
+
+      out = model.generate(prompt_ids, max_new_tokens=8, do_sample=False, pad_token_id=tok.eos_token_id)
+      by_library = ____
+      print(repr(tok.decode(by_hand)))
+      print(by_hand == by_library)
+    solution: |
+      ids = prompt_ids
+      for _ in range(8):
+          with torch.no_grad():
+              logits = model(ids).logits[0, -1]
+          next_id = logits.argmax()
+          ids = torch.cat([ids, next_id.view(1, 1)], dim=1)
+      by_hand = ids[0, prompt_ids.shape[1]:].tolist()
+
+      out = model.generate(prompt_ids, max_new_tokens=8, do_sample=False, pad_token_id=tok.eos_token_id)
+      by_library = out[0, prompt_ids.shape[1]:].tolist()
+      print(repr(tok.decode(by_hand)))
+      print(by_hand == by_library)
+    tests: |
+      bh = check_object("by_hand")
+      assert len(bh) == 8, f"`by_hand` should hold exactly the 8 new token ids, not the prompt; it has {len(bh)}."
+      check_equal("by_hand", msg="`by_hand` differs from greedy decoding. Use the logits of the **last** position, `[0, -1]`, and `argmax`.")
+      check_equal("by_library", msg="`by_library` should be the ids after the prompt in `model.generate(...)`'s output.")
+    success_msg: Identical. `generate` is this loop plus caching of past keys and values (the KV cache), so each step does not recompute the whole prefix.
+    timeout: 120
+
+  - id: temperature-zero
+    type: mc
+    title: Predict, then run - temperature towards zero
+    question: You sample from `softmax_t(logits, T)` with `T = 0.01`, 1,000 times. What do you get?
+    context: "The console has `logits`, `tokens` and `softmax_t`. Try `softmax_t(logits, 0.01).round(4)`."
+    pre_code: |
+      import numpy as np
+      tokens = ["normal", "stable", "low", "rising", "fine", "dropping", "purple", "singing"]
+      logits = np.array([3.1, 2.6, 2.2, 1.9, 1.5, 1.1, -1.0, -2.5])
+      def softmax_t(logits, T):
+          z = logits / T
+          e = np.exp(z - z.max())
+          return e / e.sum()
+    options:
+      - text: "`normal` every time: the distribution collapses onto the argmax, which is greedy decoding"
+        correct: true
+        feedback: Right. Dividing by a tiny $T$ blows up the gaps between logits, so the top token gets essentially all the mass. That is why APIs treat temperature 0 as (nearly) deterministic.
+      - text: All 8 tokens about equally often
+        feedback: That is the limit of a **large** temperature. A small one sharpens the distribution.
+      - text: An error, because dividing by a small number overflows
+        feedback: Subtracting the maximum keeps every exponent at or below 0, so nothing overflows. Try it in the console.
+      - text: The same proportions as at T = 1, because temperature does not change the ranking
+        feedback: The ranking stays the same, but the proportions change dramatically.
+    hint: What happens to $z_i / T$ for the largest logit compared with the others as $T$ shrinks?
+
+  - id: settings-for-the-job
+    type: mc
+    title: Choose decoding settings
+    question: |
+      ORBIT must answer "What is the airlock pressure limit?" from a handbook passage in its prompt, and the
+      answer is parsed by a script. Which decoding settings do you choose?
+    options:
+      - text: "`temperature=1.0, top_p=0.95` so the answer sounds natural"
+        feedback: A factual answer that a script parses needs consistency, not variety. Each sampled variation is another chance to misquote the number or break the format.
+      - text: "`temperature=0` (or close), and rely on the passage in the prompt for correctness"
+        correct: true
+        feedback: Right. Low temperature gives the same, most likely answer every time, so the script sees a stable format. Correctness comes from grounding in the passage; temperature alone cannot make a model factual.
+      - text: "`temperature=1.5` so the model explores and finds the right number"
+        feedback: High temperature spreads mass onto unlikely tokens, including wrong digits. Exploration helps brainstorming, not lookup.
+      - text: "`top_k=1` with `temperature=1.2`: the high temperature makes it creative and top-k keeps it safe"
+        feedback: With top-k = 1 only the argmax survives, so the temperature does nothing. It is just greedy decoding written in a confusing way.
+    hint: Is there one right answer here or many good ones? What does the script need?

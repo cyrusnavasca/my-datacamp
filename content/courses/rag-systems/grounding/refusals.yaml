@@ -1,0 +1,244 @@
+title: Knowing when to say "I don't know"
+description: Gate answers on retrieval confidence, sweep the threshold, and pick it from what each kind of mistake costs.
+exercises:
+  - id: refusals-slides
+    type: video
+    title: Two ways to be wrong
+    slides: |
+      # Two ways to be wrong
+
+      Add 12 near-miss unanswerable questions to the handbook set ("How many litres does the **nutrient** tank in Module C
+      hold?", "What is the password for HELIOS-NET?"), and ORBIT answers 7 of the 16 unanswerables anyway:
+
+      ```text
+      Q: How many litres does the nutrient tank in Module C hold?
+      A: The potable water tank in Module D holds 2,400 litres.      <- real sentence, wrong tank
+      ```
+
+      Every answer is a bet. ORBIT can lose it in two ways:
+
+      | mistake | example | who pays |
+      | --- | --- | --- |
+      | **wrong answer** (answered something it shouldn't) | a 2,400 L tank that doesn't exist | the crew acts on bad information |
+      | **over-refusal** (refused something it could answer) | "I don't know" about dinner time | the crew loses time and trust |
+
+      You can't drive both to zero. The job is to choose the mix, and that choice depends on the domain.
+
+      ---
+
+      ## Where to put the gate
+
+      ```python
+      def answer(question, tau):
+          chunks = reranker.rerank(question, hybrid(question, 20), 3)
+          if chunks[0]["rerank_score"] < tau:          # weak evidence: refuse
+              return REFUSAL                            # no LLM call at all
+          return generate(gen, question, chunks)
+      ```
+
+      - **Before generation** (above): refuse when the best evidence is weak. It's cheap, and it saves the LLM call too.
+      - **Inside generation**: the prompt's "say you don't know". Necessary, but the model judges its own evidence, and that is exactly the judgment that fails on near-misses.
+      - **After generation**: a support check (previous lesson) refuses when no claim survives.
+
+      **Which score?** Raw cosine similarity is a weak confidence signal: unanswerable questions often have high cosines
+      (on ORBIT the Wi-Fi password question scores 0.96). A **cross-encoder score**, which reads question and chunk
+      together and weighs the rare words, separates them better. That's another reason to rerank.
+
+      ---
+
+      ## Sweep the threshold, count both mistakes
+
+      ORBIT, 57 questions (41 answerable, 16 unanswerable), gate on the top rerank score:
+
+      | τ | correct | wrong answers | over-refusals |
+      | --- | --- | --- | --- |
+      | 0 (no gate) | 48 | 9 | 0 |
+      | 0.7 | 43 | 5 | 9 |
+      | 0.9 | 40 | 2 | 15 |
+      | 0.95 | 38 | **0** | 19 |
+      | 1.1 | 28 | 0 | 29 |
+
+      Pick τ by **cost**, not by accuracy: $\text{cost} = c_\text{wrong} \cdot \text{wrong} + c_\text{refuse} \cdot \text{over-refusals}$.
+      If a wrong answer is 5x worse than a refusal, τ = 0.95 wins. If it's 2x worse, *no gate* wins. Same system,
+      same data, opposite decisions. Ask the people who pay for the mistakes what the ratio is.
+
+      ---
+
+      ## Make refusals cheaper
+
+      Over-refusals hurt less when the refusal is useful:
+
+      - **Point somewhere**: "I couldn't find that in the handbook. The closest document is *Water recycling*."
+      - **Escalate**: "Ask the commander or Meridian Control." For safety topics, that's the right answer anyway.
+      - **Different thresholds by topic**: chunk metadata has a `section`. Be strict on `emergency`, `eva` and `medical`, lenient on `crew` and `general`.
+
+      **Playbook: "ORBIT answers questions it shouldn't".** (1) Build a test set with **near-miss** unanswerables, not
+      just absurd ones. (2) Measure wrong answers and over-refusals separately. (3) Check that your confidence score
+      separates them: sort by score and look. (4) Sweep τ, apply your cost ratio. (5) Verify on questions you didn't
+      tune on, because a threshold tuned on 57 questions is a rough estimate.
+
+  - id: threshold-sweep
+    type: coding
+    title: Sweep the refusal threshold
+    context: |
+      `records` is a DataFrame with one row per question (57 in all): `answerable` (bool), `top_score` (the best rerank
+      score), `model_refused` (ORBIT's own answer was a refusal) and `model_correct` (ORBIT's own answer was right).
+      The gate refuses when `top_score < tau`.
+    instructions:
+      - "Write `outcome(tau)`: return a dict with counts `correct`, `wrong` and `over_refused`. A question is **refused** if the gate refuses it or `model_refused`. A refused question is correct if unanswerable, else over-refused. An answered question is correct if `model_correct`, else wrong."
+      - "Build `sweep`, a DataFrame with one row per tau in `TAUS` and columns `tau`, `correct`, `wrong`, `over_refused` and `cost` = `5 * wrong + over_refused`."
+      - "Store the tau with the lowest cost in `best_tau` (the smallest tau if tied). Then do the same with `cost2 = 2 * wrong + over_refused` and store it in `best_tau_2`. Print `sweep`, `best_tau` and `best_tau_2`."
+    hint: |
+      With pandas: `refused = (records.top_score < tau) | records.model_refused`, then
+      `over = (refused & records.answerable).sum()`, `wrong = (~refused & ~records.model_correct).sum()`, and
+      `correct = len(records) - over - wrong`. For the best tau: `sweep.sort_values(["cost", "tau"]).iloc[0]["tau"]`.
+    pre_code: |
+      import pandas as pd
+      from kits.rag_systems import (orbit_chunks, HybridIndex, CrossEncoder, make_client, generate, questions,
+                                    EXTRA_UNANSWERABLE, is_correct, is_refusal)
+      hybrid = HybridIndex(orbit_chunks()).search
+      reranker, gen = CrossEncoder(), make_client()
+      rows = []
+      for q in questions() + EXTRA_UNANSWERABLE:
+          chunks = reranker.rerank(q["question"], hybrid(q["question"], 20), 3)
+          a = generate(gen, q["question"], chunks)
+          rows.append({"id": q["id"], "answerable": bool(q["doc_ids"]), "top_score": chunks[0]["rerank_score"],
+                       "model_refused": is_refusal(a), "model_correct": is_correct(q, a)})
+      records = pd.DataFrame(rows)
+      TAUS = [0.0, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0, 1.1]
+      print(records.sort_values("top_score").head(10))
+    sample_code: |
+      def outcome(tau):
+          refused = (records.top_score < tau) | records.model_refused
+          over_refused = int(____)
+          wrong = int(____)
+          correct = len(records) - over_refused - wrong
+          return {"correct": correct, "wrong": wrong, "over_refused": over_refused}
+
+      sweep = pd.DataFrame([{"tau": t, **outcome(t)} for t in TAUS])
+      sweep["cost"] = ____
+      best_tau = ____
+
+      sweep["cost2"] = 2 * sweep["wrong"] + sweep["over_refused"]
+      best_tau_2 = ____
+      print(sweep)
+      print(best_tau, best_tau_2)
+    solution: |
+      def outcome(tau):
+          refused = (records.top_score < tau) | records.model_refused
+          over_refused = int((refused & records.answerable).sum())
+          wrong = int((~refused & ~records.model_correct).sum())
+          correct = len(records) - over_refused - wrong
+          return {"correct": correct, "wrong": wrong, "over_refused": over_refused}
+
+      sweep = pd.DataFrame([{"tau": t, **outcome(t)} for t in TAUS])
+      sweep["cost"] = 5 * sweep["wrong"] + sweep["over_refused"]
+      best_tau = sweep.sort_values(["cost", "tau"]).iloc[0]["tau"]
+
+      sweep["cost2"] = 2 * sweep["wrong"] + sweep["over_refused"]
+      best_tau_2 = sweep.sort_values(["cost2", "tau"]).iloc[0]["tau"]
+      print(sweep)
+      print(best_tau, best_tau_2)
+    tests: |
+      f = check_object("outcome")
+      o = f(0.0)
+      assert o == {"correct": 48, "wrong": 9, "over_refused": 0}, f"With no gate (tau=0) expect 48 correct, 9 wrong, 0 over-refused; got {o}. A model refusal on an unanswerable question is correct."
+      o = f(10)
+      assert o["wrong"] == 0 and o["over_refused"] == 41, f"With tau=10 everything is refused: 0 wrong and 41 over-refused; got {o}."
+      s = check_object("sweep")
+      for col in ["tau", "correct", "wrong", "over_refused", "cost"]:
+          assert col in s.columns, f"`sweep` needs a `{col}` column."
+      assert list(s["cost"]) == list(sol["sweep"]["cost"]), "`cost` should be 5 * wrong + over_refused for each tau."
+      check_equal("best_tau", msg="`best_tau` should be the tau with the lowest cost (smallest tau if tied).")
+      check_equal("best_tau_2", msg="`best_tau_2` should be the tau with the lowest `2 * wrong + over_refused`.")
+    success_msg: |
+      At 5:1 the best gate is τ = 0.95: zero wrong answers for 19 over-refusals. At 2:1 the best is no gate at all.
+      The data didn't change, only what a mistake costs. A threshold is a business decision, so get the cost ratio from
+      the people who pay for the mistakes, and write it down next to the number.
+
+  - id: gate-pipeline
+    type: coding
+    title: A gated ORBIT that skips the model when evidence is weak
+    context: |
+      `retrieve(question)` returns ORBIT's top 3 reranked chunks (each with `rerank_score`, best first). `gen` is the reader, whose
+      calls are logged in `gen.calls`. `QS` holds 57 questions, 16 of them unanswerable. Safety review chose `TAU = 0.95`.
+    instructions:
+      - "Write `gated_answer(question, tau)`: retrieve; if the top chunk's `rerank_score` is below `tau`, return `REFUSAL` **without** calling the model; otherwise return `generate(gen, question, chunks)`."
+      - "Answer every question in `QS` with `TAU`. Store the number of wrong answers (answered, but `is_correct` is False) in `wrong`, over-refusals of answerable questions in `over_refused`, and `len(gen.calls)` in `llm_calls`."
+      - Print the three numbers.
+    hint: |
+      Loop over `QS`, keep `a = gated_answer(q["question"], TAU)`. If `is_refusal(a)`, count an over-refusal when
+      `q["doc_ids"]` is non-empty; otherwise count a wrong answer when `not is_correct(q, a)`.
+    pre_code: |
+      from kits.rag_systems import (orbit_chunks, HybridIndex, CrossEncoder, make_client, generate, questions,
+                                    EXTRA_UNANSWERABLE, is_correct, is_refusal, REFUSAL)
+      hybrid = HybridIndex(orbit_chunks()).search
+      reranker, gen = CrossEncoder(), make_client()
+      QS = questions() + EXTRA_UNANSWERABLE
+      TAU = 0.95
+
+      def retrieve(question):
+          return reranker.rerank(question, hybrid(question, 20), 3)
+    sample_code: |
+      def gated_answer(question, tau):
+          chunks = retrieve(question)
+          if ____:
+              return REFUSAL
+          return ____
+
+      wrong = over_refused = 0
+      for q in QS:
+          a = gated_answer(q["question"], TAU)
+          if is_refusal(a):
+              over_refused += ____
+          else:
+              wrong += ____
+      llm_calls = ____
+      print(wrong, over_refused, llm_calls, "LLM calls for", len(QS), "questions")
+    solution: |
+      def gated_answer(question, tau):
+          chunks = retrieve(question)
+          if chunks[0]["rerank_score"] < tau:
+              return REFUSAL
+          return generate(gen, question, chunks)
+
+      wrong = over_refused = 0
+      for q in QS:
+          a = gated_answer(q["question"], TAU)
+          if is_refusal(a):
+              over_refused += bool(q["doc_ids"])
+          else:
+              wrong += not is_correct(q, a)
+      llm_calls = len(gen.calls)
+      print(wrong, over_refused, llm_calls, "LLM calls for", len(QS), "questions")
+    tests: |
+      check_object("gated_answer")
+      check_equal("wrong", msg="Count answered questions (not refusals) whose answer `is_correct` rejects.")
+      check_equal("over_refused", msg="Count refusals of answerable questions (non-empty `doc_ids`).")
+      n = check_object("llm_calls")
+      assert n < len(user["QS"]), f"The gate should skip the model for low-evidence questions, so there should be fewer than {len(user['QS'])} LLM calls; got {n}. Return REFUSAL *before* calling `generate`."
+      check_equal("llm_calls")
+    success_msg: |
+      No wrong answers, and the model ran only 22 times for 57 questions, because a gated refusal costs no tokens at all.
+      The 19 over-refusals are the price you chose to pay. To bring them down without losing safety, improve the evidence
+      (better retrieval raises scores on answerable questions) or use different thresholds by topic.
+
+  - id: threshold-by-topic
+    type: mc
+    title: One threshold for everything?
+    question: |
+      ORBIT answers two kinds of questions. **Safety** (sections `emergency`, `eva`, `medical`): a wrong answer is about
+      10x worse than "I don't know, ask the commander". **Daily life** (sections `crew`, `general`): a refusal annoys the
+      crew about as much as a harmless wrong answer about lunch. With one global τ, a high value over-refuses daily life
+      and a low value under-refuses safety. What do you ship?
+    options:
+      - text: The high τ everywhere. Safety comes first.
+        feedback: Safe, but you pay over-refusals on every daily-life question where a refusal buys nothing. The crew learns to stop asking ORBIT, and that has a safety cost too.
+      - text: The low τ everywhere, plus a stronger "only answer from the documents" instruction.
+        feedback: The instruction is the model judging its own evidence, the judgment that failed on near-misses. On safety topics, you want a hard rule in code.
+      - text: Per-section thresholds read from chunk metadata, strict for safety sections and lenient for daily life, each tuned with its own cost ratio and test questions.
+        correct: true
+        feedback: "Right. Different mistakes have different costs, so they get different thresholds, and the `section` metadata from chapter 2 makes that one dictionary lookup. Tune and verify each threshold on its own slice of questions, with a useful escalation message on the strict side."
+      - text: Drop the gate and let the crew judge each answer from its citations.
+        feedback: Citations help the crew check, but in an emergency nobody checks. A near-miss answer with a real citation (the 2,400 L potable tank) looks fully sourced.
+    hint: The cost ratio differs by topic, and every chunk already carries its section.

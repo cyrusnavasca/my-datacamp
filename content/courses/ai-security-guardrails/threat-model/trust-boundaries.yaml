@@ -1,0 +1,185 @@
+title: Trust boundaries and the lethal trifecta
+description: Find where untrusted text enters ORBIT, spot features that combine private data, untrusted content and a way out, and break the cheapest leg.
+exercises:
+  - id: boundaries-slides
+    type: video
+    title: Data and instructions share one channel
+    slides: |
+      # Data and instructions share one channel
+
+      SQL injection was fixed by **parameterised queries**: the database receives code and data in separate slots, so a
+      value can never become a command. LLMs have no such slots. The system prompt, the crew request, retrieved
+      documents and tool results are joined into **one sequence of tokens**, and the model predicts what comes next.
+
+      ```text
+      [system: you are ORBIT ...][user: <document>...</document> question][tool_result: ...]  ->  model  ->  reply
+      ```
+
+      Roles and XML tags are more tokens. They help the model *guess* which text is data, but nothing enforces it, and
+      instruction tuning has trained the model to follow instructions it reads. So **any text that reaches the context
+      can steer the model**. Security has to come from what surrounds the model, not from the model.
+
+      ---
+
+      ## Trust boundaries: who wrote this text?
+
+      A trust boundary is where text from someone with **less authority** than the current user enters the context.
+      Trust follows the **author of the text**, not the channel it arrived through.
+
+      | source | who can write it | treat as |
+      | --- | --- | --- |
+      | system prompt | you, in code review | trusted instructions |
+      | the crew member's own request | an authenticated crew member | trusted, within *their* permissions |
+      | handbook pages | station ops, after review | trusted data |
+      | sensor values | station hardware | trusted data (numbers) |
+      | maintenance log | any crew member or contractor, unreviewed | **untrusted** |
+      | text a crew member pastes from an email | whoever wrote the email | **untrusted** |
+      | `read_maintenance_log` tool result | same as the log | **untrusted** |
+
+      A pasted contractor email is untrusted even though a trusted crew member pasted it: they are the messenger, not the author.
+
+      ---
+
+      ## The lethal trifecta
+
+      An injected instruction can steal data only when one feature combines all three:
+
+      1. **private data** the model can read (medical notes, the override code)
+      2. **untrusted content** in the same context (logs, emails, web pages)
+      3. **a way to send data out** (a message tool, the ground link, a rendered link or image)
+
+      With all three, text planted in (2) can ask the model to read (1) and push it through (3). **Remove any one leg and
+      that path closes**, whatever the attack text says. That's why this check doesn't depend on recognising attacks.
+
+      ---
+
+      ## Which leg to cut?
+
+      | cut this leg | how | what it costs | when it wins |
+      | --- | --- | --- | --- |
+      | private data | scope data access per feature; never put secrets in prompts | design work; some features need the data | the feature doesn't really need the data |
+      | untrusted content | only index reviewed sources; quarantine the rest | features over logs, email, web disappear or get weaker | the untrusted source adds little value |
+      | way out | no outbound tools; human approval on every send; no auto-rendered links | friction on every send | sends are rare or high-stakes |
+
+      Compare costs per feature. The cheapest leg differs from feature to feature.
+
+      ---
+
+      ## Blast radius: assume the model is fooled
+
+      For each component, ask: **if an attacker fully controlled this model's output, what is the worst that happens?**
+      The answer is the union of its tools and the data in its context. The prompt's rules don't count.
+
+      | component | tools | worst case |
+      | --- | --- | --- |
+      | handbook Q&A | none | a wrong or rude answer |
+      | night-shift agent | bookings, crew messages, ground link, `open_airlock` | a vented airlock |
+
+      Shrinking the blast radius (fewer tools, narrower tools, approvals) is the subject of the last chapter. Measuring
+      it comes next.
+
+  - id: classify-trust
+    type: classify
+    title: Trusted or untrusted?
+    prompt: ORBIT's context is built from these sources. Sort each by whether its text can be trusted to carry instructions.
+    hint: Ask who wrote the text and whether anyone reviewed it. The channel it arrived through doesn't matter.
+    zones: [Trusted, Untrusted]
+    items:
+      - { text: The system prompt you wrote and reviewed, zone: Trusted }
+      - { text: A request typed by a logged-in crew member, zone: Trusted }
+      - { text: A handbook page published by station ops after review, zone: Trusted }
+      - { text: A CO2 reading returned by the station's sensor hardware, zone: Trusted }
+      - { text: An entry in the maintenance log that any contractor can write, zone: Untrusted }
+      - { text: "A contractor's email that a crew member pasted into the chat", zone: Untrusted }
+      - { text: The result of the read_maintenance_log tool, zone: Untrusted }
+      - { text: A web page fetched by a browsing tool, zone: Untrusted }
+
+  - id: trifecta-audit
+    type: coding
+    title: Audit ORBIT for the lethal trifecta
+    context: |
+      `features` lists ORBIT's planned features with three flags: `private_data`, `untrusted_content` and
+      `external_send`. `removal_cost` gives, for the risky features, the cost (in engineering days plus lost usefulness)
+      of removing each leg.
+    instructions:
+      - Store the names of features that have **all three** flags set in the list `at_risk`, in the order they appear.
+      - "For each name in `at_risk`, pick the leg with the lowest `removal_cost` and store the choices in a dict `fixes` (name → leg)."
+      - "Store the sum of the chosen costs in `total_cost`. Then set the chosen leg to `False` in `features` and store how many features are still at risk in `remaining`."
+    hint: |
+      `at_risk = [f["name"] for f in features if f["private_data"] and f["untrusted_content"] and f["external_send"]]`.
+      The cheapest leg is `min(costs, key=costs.get)` where `costs = removal_cost[name]`.
+    pre_code: |
+      features = [
+          {"name": "handbook-qa", "private_data": False, "untrusted_content": False, "external_send": False},
+          {"name": "log-summary", "private_data": False, "untrusted_content": True, "external_send": False},
+          {"name": "medical-scheduler", "private_data": True, "untrusted_content": False, "external_send": True},
+          {"name": "ground-email-assistant", "private_data": True, "untrusted_content": True, "external_send": True},
+          {"name": "crew-chat", "private_data": True, "untrusted_content": True, "external_send": False},
+          {"name": "night-shift-agent", "private_data": True, "untrusted_content": True, "external_send": True},
+      ]
+      removal_cost = {
+          "ground-email-assistant": {"private_data": 5, "untrusted_content": 8, "external_send": 2},
+          "night-shift-agent": {"private_data": 3, "untrusted_content": 6, "external_send": 4},
+      }
+    sample_code: |
+      at_risk = ____
+
+      fixes = {}
+      for name in at_risk:
+          costs = removal_cost[name]
+          fixes[name] = ____
+
+      total_cost = ____
+      for f in features:
+          if f["name"] in fixes:
+              f[fixes[f["name"]]] = False
+      remaining = ____
+      print(at_risk, fixes, total_cost, remaining)
+    solution: |
+      at_risk = [f["name"] for f in features
+                 if f["private_data"] and f["untrusted_content"] and f["external_send"]]
+
+      fixes = {}
+      for name in at_risk:
+          costs = removal_cost[name]
+          fixes[name] = min(costs, key=costs.get)
+
+      total_cost = sum(removal_cost[name][leg] for name, leg in fixes.items())
+      for f in features:
+          if f["name"] in fixes:
+              f[fixes[f["name"]]] = False
+      remaining = sum(1 for f in features if f["private_data"] and f["untrusted_content"] and f["external_send"])
+      print(at_risk, fixes, total_cost, remaining)
+    tests: |
+      check_equal("at_risk", msg="`at_risk` should list the features where all three flags are True: two of them.")
+      check_equal("fixes", msg="For each at-risk feature, pick the leg with the smallest cost in `removal_cost[name]`, e.g. `min(costs, key=costs.get)`.")
+      check_equal("total_cost", msg="`total_cost` is the sum of the two chosen costs.")
+      check_equal("remaining", 0, msg="After switching the chosen leg to False, no feature should have all three flags. Count them again into `remaining`.")
+    success_msg: |
+      The two features break the trifecta on different legs: the email assistant loses its autonomous send (a human
+      sends), and the night-shift agent loses access to private data. Neither fix depends on what an attack says.
+
+  - id: cut-which-leg
+    type: mc
+    title: The ground email assistant
+    question: |
+      The ground email assistant reads incoming emails from Earth (untrusted), can look up crew records, and sends replies
+      to the ground. Constraints: the drafts **never need crew records**, and the crew wants routine replies to go out
+      **without extra clicks**. Which change do you make?
+    options:
+      - text: Remove crew-record access from this feature, so its context never holds private data.
+        correct: true
+        feedback: |
+          Right. The feature doesn't use the records, so cutting the private-data leg costs nothing and closes the
+          exfiltration path whatever the emails say. Sends stay one-click.
+      - text: Keep everything, but show each outgoing email to the crew member for approval.
+        feedback: |
+          That breaks the trifecta too, but it adds a click to every reply, which the constraints rule out. Approval is
+          the right cut when the feature truly needs both the data and the send.
+      - text: Stop reading incoming emails.
+        feedback: That removes the feature itself. Cut the leg the feature doesn't need, not the one it exists for.
+      - text: Filter incoming emails for suspicious instructions before the model reads them.
+        feedback: |
+          A filter recognises only the wording it was built for. The model would still hold records and a send tool, so
+          the first email the filter misses can move the data out.
+    hint: Which leg does this feature not actually use?

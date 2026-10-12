@@ -1,0 +1,248 @@
+title: Structure prompts with XML tags
+description: Separate instructions from data with tags, ask for tagged output, and parse it robustly.
+exercises:
+  - id: xml-slides
+    type: video
+    title: Tags give the model, and your code, clear boundaries
+    slides: |
+      # Why tags?
+
+      A real prompt mixes very different things: instructions, handbook documents, examples, the crew member's question.
+      Pasted together, the boundaries blur. Is "Check the seal before every cycle." a document sentence or an
+      instruction to ORBIT?
+
+      ```text
+      <documents>
+        <document id="airlock-procedure"> ...handbook text... </document>
+        <document id="eva-prep-checklist"> ...handbook text... </document>
+      </documents>
+      <question>How long is the leak-check hold?</question>
+      Answer using only the documents. Put the answer in <answer></answer> tags.
+      ```
+
+      - The model has seen a huge amount of markup and treats tags as structure.
+      - You can **refer** to parts by name: "using the documents in `<documents>`...".
+      - Document ids give the model something to cite.
+      - Text inside data tags is treated more like data than instructions. That isn't a security boundary (see the security course), but it helps.
+
+      Tag names have no special meaning. Pick clear ones and **use them consistently**.
+
+      ---
+
+      ## Building the prompt in code
+
+      ```python
+      def build_prompt(docs, question):
+          parts = ["<documents>"]
+          for d in docs:
+              parts.append(f'<document id="{d["id"]}">{d["text"]}</document>')
+          parts.append("</documents>")
+          parts.append(f"<question>{question}</question>")
+          parts.append("Answer using only the documents, inside <answer></answer> tags.")
+          return "\n".join(parts)
+      ```
+
+      For long prompts, put **long documents first and the question last**. Models tend to answer better when the
+      question comes after the material it's about (more on long contexts in chapter 4).
+
+      ---
+
+      ## Tagged output, parsed robustly
+
+      Ask for tags in the reply, then pull out what you need:
+
+      ```python
+      import re
+
+      def extract(text, tag="answer"):
+          found = re.findall(rf"<{tag}>(.*?)</{tag}>", text, re.S)   # re.S: '.' also matches newlines
+          return found[-1].strip() if found else None                 # last one wins
+      ```
+
+      Things that break naive parsers: newlines inside the tag, whitespace around the content, a **draft** answer before the
+      final one, and a missing tag. Return `None` and handle it rather than crashing.
+
+      **Stop sequences** save output tokens: `stop_sequences=["</answer>"]` ends generation at the closing tag, and
+      `stop_reason` becomes `"stop_sequence"`. The stop text itself is **not** included in the reply.
+
+      ---
+
+      ## Tags, markdown or JSON?
+
+      | output format | easy to parse | token overhead | best for |
+      | --- | --- | --- | --- |
+      | XML tags | yes, with a regex | small | free text plus a little structure: answer, reasoning, citations |
+      | markdown headings | fragile | small | text people read |
+      | JSON | yes, but strict syntax (chapter 3) | quotes, braces, escaping | many typed fields that code consumes |
+
+      A common pattern is to mix them: reasoning in `<thinking>`, the final structured answer in `<answer>` or as JSON.
+
+  - id: assemble-template
+    type: parsons
+    title: Assemble the prompt template
+    prompt: |
+      Arrange the lines into `build_prompt(docs, question)`: documents in a `<documents>` block, each with its id, then
+      the question, then the output instruction, all joined with newlines.
+    hint: Open the `<documents>` block before the loop and close it after. The question and instruction go after the documents.
+    lines:
+      - "def build_prompt(docs, question):"
+      - "    parts = [\"<documents>\"]"
+      - "    for d in docs:"
+      - "        parts.append(f'<document id=\"{d[\"id\"]}\">{d[\"text\"]}</document>')"
+      - "    parts.append(\"</documents>\")"
+      - "    parts.append(f\"<question>{question}</question>\")"
+      - "    parts.append(\"Answer inside <answer></answer> tags.\")"
+      - "    return \"\\n\".join(parts)"
+
+  - id: tag-documents
+    type: coding
+    title: Pasted text versus tagged documents
+    context: |
+      ORBIT's first RAG prototype pastes handbook text straight into the prompt (`plain_prompt`). The model here only
+      treats text as source material when it's wrapped in `<document id="...">` tags; otherwise it answers from "general
+      knowledge", confidently and wrongly. `DOCS` is a list of handbook dicts (`id`, `title`, `text`), and `score(make_prompt)` returns the
+      share of the 5 test questions answered with the expected fact.
+    instructions:
+      - "Store `score(plain_prompt)` in `plain_score`."
+      - "Write `tagged_prompt(docs, question)`: wrap every doc as `<document id=\"ID\">TEXT</document>`, put them inside `<documents></documents>`, then add the question."
+      - "Store `score(tagged_prompt)` in `tagged_score`."
+    hint: |
+      Build a list of lines: `"<documents>"`, one `f'<document id="{d["id"]}">{d["text"]}</document>'` per doc,
+      `"</documents>"`, then the question. Return `"\n".join(lines)`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import MODEL
+      client = aikit.FakeClaude(aikit.grounded(), clock=aikit.VirtualClock())
+      hb = {d["id"]: d for d in aikit.helios.handbook()}
+      DOCS = [hb[i] for i in ["airlock-procedure", "eva-prep-checklist", "hydroponics-schedule", "water-recycling", "co2-scrubbers"]]
+      QUESTIONS = [
+          "How long is the leak-check hold when depressurising AL-1?",
+          "What is the maximum length of a spacewalk?",
+          "When do the hydroponics watering cycles run?",
+          "How big is the potable water tank?",
+          "At what CO2 level does ORBIT raise an alert?",
+      ]
+      EXPECTED = ["8 minutes", "6.5 hours", "06:00", "2,400", "0.4%"]
+
+      def plain_prompt(docs, question):
+          return "\n\n".join(d["text"] for d in docs) + "\n\n" + question
+
+      def score(make_prompt):
+          hits = 0
+          for q, e in zip(QUESTIONS, EXPECTED):
+              r = client.messages.create(model=MODEL, max_tokens=300, system="You are ORBIT. Answer from the documents.",
+                                         messages=[{"role": "user", "content": make_prompt(DOCS, q)}])
+              hits += e in r.content[0].text
+          return hits / len(QUESTIONS)
+
+      print(client.messages.create(model=MODEL, max_tokens=300, messages=[{"role": "user", "content": plain_prompt(DOCS, QUESTIONS[0])}]).content[0].text)
+    sample_code: |
+      plain_score = ____
+
+      def tagged_prompt(docs, question):
+          lines = ["<documents>"]
+          for d in docs:
+              lines.append(____)
+          lines.append("</documents>")
+          lines.append(____)
+          return "\n".join(lines)
+
+      tagged_score = ____
+      print(plain_score, tagged_score)
+      print(tagged_prompt(DOCS[:1], QUESTIONS[0])[:200])
+    solution: |
+      plain_score = score(plain_prompt)
+
+      def tagged_prompt(docs, question):
+          lines = ["<documents>"]
+          for d in docs:
+              lines.append(f'<document id="{d["id"]}">{d["text"]}</document>')
+          lines.append("</documents>")
+          lines.append(question)
+          return "\n".join(lines)
+
+      tagged_score = score(tagged_prompt)
+      print(plain_score, tagged_score)
+      print(tagged_prompt(DOCS[:1], QUESTIONS[0])[:200])
+    tests: |
+      check_equal("plain_score", 0, msg="`plain_score` should be `score(plain_prompt)`.")
+      check_object("tagged_prompt")
+      p = user["tagged_prompt"](user["DOCS"][:1], "Q?")
+      assert '<document id="airlock-procedure">' in p, "Each doc should start with `<document id=\"ID\">`, using the doc's `id`."
+      assert "Q?" in p, "Add the question to the end of the prompt."
+      check_equal("tagged_score", 1.0, msg="With tagged documents every question should be answered. Check that each doc's full `text` sits between `<document id=...>` and `</document>`.")
+    success_msg: |
+      The same text, wrapped in tags, took the score from 0 to 5 out of 5. Untagged, the model couldn't tell the handbook from
+      the question and made up an answer ("4 minutes, as set by Meridian Control"). Clear boundaries are a correctness issue, not just style.
+
+  - id: parse-tags
+    type: coding
+    title: A robust tag extractor
+    context: |
+      The crew app shows only what's inside ORBIT's `<answer>` tags. `replies` holds real replies from the logs: some have
+      reasoning first, some a draft answer that ORBIT then corrected, some span several lines, and one has no tag at all.
+    instructions:
+      - "Write `extract_answer(text)`: return the content of the **last** `<answer>...</answer>` in `text`, stripped of surrounding whitespace, or `None` if there is none. Content may span several lines."
+      - "Store `[extract_answer(r) for r in replies]` in `parsed`."
+    hint: "`re.findall(r\"<answer>(.*?)</answer>\", text, re.S)` returns every match; take `[-1].strip()` if the list isn't empty."
+    pre_code: |
+      import re
+      replies = [
+          "<answer>8 minutes</answer>",
+          "<thinking>The airlock doc says to hold at 0.7 bar.</thinking>\n<answer>\n  8 minutes at 0.7 bar\n</answer>",
+          "Sorry, the documents don't cover that.",
+          "<answer>5 minutes</answer> Wait, that is the 2024 procedure. <answer>8 minutes</answer>",
+          "<answer>Raise the alarm.\nClose the hatches.</answer>",
+      ]
+    sample_code: |
+      def extract_answer(text):
+          found = re.findall(____, text, ____)
+          if ____:
+              return None
+          return ____
+
+      parsed = [extract_answer(r) for r in replies]
+      print(parsed)
+    solution: |
+      def extract_answer(text):
+          found = re.findall(r"<answer>(.*?)</answer>", text, re.S)
+          if not found:
+              return None
+          return found[-1].strip()
+
+      parsed = [extract_answer(r) for r in replies]
+      print(parsed)
+    tests: |
+      check_object("extract_answer")
+      check_equal("parsed", ["8 minutes", "8 minutes at 0.7 bar", None, "8 minutes", "Raise the alarm.\nClose the hatches."],
+                  msg="`parsed` isn't right yet. Check: multi-line content (use `re.S`), surrounding whitespace (`.strip()`), the last tag wins, and `None` when there is no tag.")
+      f = user["extract_answer"]
+      assert f("no tags here") is None, "Return `None` when there is no <answer> tag."
+      assert f("<answer>a</answer><answer>b</answer>") == "b", "When there are several <answer> tags, return the last one."
+      assert f("<answer> x </answer>") == "x", "Strip surrounding whitespace."
+    success_msg: Your extractor handles reasoning, corrected drafts, multi-line answers and missing tags. These are the cases that crash naive parsers in production.
+
+  - id: stop-sequence-predict
+    type: mc
+    title: Predict the stop sequence
+    question: |
+      The console ran a request with `stop_sequences=["</answer>"]`, and the model was going to write
+      `<answer>Every 90 days.</answer>`. What are `response.content[0].text` and `response.stop_reason`?
+    context: Predict, then print both in the console.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import MODEL
+      client = aikit.FakeClaude("<answer>Every 90 days.</answer> Let me know if you need anything else!", clock=aikit.VirtualClock())
+      response = client.messages.create(model=MODEL, max_tokens=100, stop_sequences=["</answer>"],
+                                        messages=[{"role": "user", "content": "How often are scrubber beds swapped?"}])
+    options:
+      - text: "`<answer>Every 90 days.</answer>` and `\"end_turn\"`"
+        feedback: Generation stopped when the stop sequence appeared, and the stop text isn't included. Print `response.content[0].text` to see it.
+      - text: "`<answer>Every 90 days.` and `\"stop_sequence\"`"
+        correct: true
+        feedback: "Right. The closing tag triggers the stop and is left out (`response.stop_sequence` tells you which one fired). Your parser must accept a missing closing tag when `stop_reason == \"stop_sequence\"`, for example by appending it back."
+      - text: "`Every 90 days.` and `\"stop_sequence\"`"
+        feedback: The API doesn't strip your opening tag. Only the stop sequence itself, and everything after it, is left out.
+      - text: "The full text including the chit-chat after the tag, and `\"end_turn\"`"
+        feedback: That's what you'd get without `stop_sequences`. The stop sequence saved the tokens after the answer.
+    hint: The stop sequence ends generation, and the stop text is not part of the reply.

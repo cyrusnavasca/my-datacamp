@@ -1,0 +1,164 @@
+title: "Lab: the 90% that wasn't"
+description: The dashboard says ORBIT is 90% accurate and the crew disagrees. Measure the gap, find out why the eval set misleads, fix it and verify the new estimate.
+exercises:
+  - id: eval-set-lab-slides
+    type: video
+    title: When the eval set lies
+    slides: |
+      # Symptom: the dashboard and the crew disagree
+
+      ORBIT's eval dashboard says **90%**. The crew's complaints keep coming.
+
+      The eval set is 20 questions ORBIT's developer wrote while building v2, with the handbook open, picking
+      questions as they went. It's the most common way eval sets go wrong: they're **written by the person who built the
+      feature**, from the material they tested with. They end up easier and narrower than real traffic.
+
+      An eval score only means something for the distribution it was drawn from.
+
+      ---
+
+      ## Measure: get an independent number
+
+      You need a number that doesn't come from the suspect set. Label a **random sample of production questions**: the
+      crew's real questions, in their real mix, with a human verdict on each answer.
+
+      ```python
+      prod_acc = prod["human"].mean()        # 300 labelled production questions
+      dev_acc = results[results["qid"].isin(dev_set["id"])]["human"].mean()
+      ```
+
+      With 300 cases the production estimate is good to about ±5 points. A gap much larger than that isn't noise; the
+      eval set doesn't represent the traffic.
+
+      ---
+
+      ## Diagnose: check these first
+
+      When an eval score and reality disagree, check in this order:
+
+      1. **Mix.** Compare the share of each question type (and topic) in the eval set with production.
+      2. **Per-slice accuracy.** Which slices are weak, and are they in the eval set at all?
+      3. **Stale references.** Did documents change after the gold answers were written?
+      4. **Leakage.** Did someone tune the prompt on these exact questions?
+
+      The usual causes are author bias, missing slices and tuning on the test set. Mix and per-slice accuracy take five
+      minutes to check, so start there.
+
+      ---
+
+      ## Fix and verify
+
+      | fix | what it costs | when it's enough |
+      | --- | --- | --- |
+      | add the missing slices | expert time to write cases | always needed when a slice has no cases at all |
+      | reweight per-slice accuracy to the production mix | nothing | when every slice has enough cases |
+      | build the set by sampling production | labelling time | the long-term default for realism |
+      | refresh on a schedule | a few hours a month | traffic and documents drift |
+
+      **Verify**: the corrected estimate should land within the margin of error of the production sample. If it doesn't,
+      something is still missing: a slice, a topic or a trap.
+
+  - id: troubleshooting-order
+    type: order
+    title: Put the investigation in order
+    prompt: Put the steps of this investigation in the order you'd do them.
+    hint: You can't diagnose a gap you haven't measured, and you can't verify a fix you haven't made.
+    items:
+      - "Symptom: the crew report wrong answers while the dashboard says 90%"
+      - "Measure: label a random production sample and compare its accuracy with the eval score"
+      - "Diagnose: compare the question-type mix of the eval set with production traffic"
+      - "Fix: add the missing question types and reweight to the production mix"
+      - "Verify: check the reweighted estimate lands within the production sample's margin"
+
+  - id: eval-set-boss
+    type: sequential
+    title: "Mission: an honest accuracy number"
+    context: |
+      `results` has ORBIT v2's answers to all 45 Helios questions, with the crew's verdict in `human` (1 = acceptable).
+      `dev_set` is the developer's original 20-question eval set (its `id` column holds question ids that match
+      `results["qid"]`). `prod` holds 300 randomly sampled production questions with their `type` and the crew's `human`
+      verdict on ORBIT's answer.
+    pre_code: |
+      import pandas as pd
+      from kits.llm_evaluation import run_orbit, dev_set_v0, production_sample
+      results = run_orbit("v2")
+      dev_set = dev_set_v0()
+      prod = production_sample()
+    steps:
+      - instructions:
+          - "**Measure.** Store ORBIT's accuracy on the dev set questions in `dev_acc`: the mean of `human` for rows of `results` whose `qid` is in `dev_set['id']`."
+          - "Store the production accuracy (mean of `prod['human']`) in `prod_acc`, and `dev_acc - prod_acc` in `gap`."
+        hint: "`results[results['qid'].isin(dev_set['id'])]['human'].mean()`"
+        sample_code: |
+          dev_acc = ____
+          prod_acc = ____
+          gap = ____
+          print(round(dev_acc, 3), round(prod_acc, 3), round(gap, 3))
+        solution: |
+          dev_acc = results[results["qid"].isin(dev_set["id"])]["human"].mean()
+          prod_acc = prod["human"].mean()
+          gap = dev_acc - prod_acc
+          print(round(dev_acc, 3), round(prod_acc, 3), round(gap, 3))
+        tests: |
+          check_equal("dev_acc", msg="`dev_acc` should be the mean of `human` over the rows of `results` whose `qid` is in `dev_set['id']`.")
+          check_equal("prod_acc", msg="`prod_acc` should be `prod['human'].mean()`.")
+          check_equal("gap", msg="`gap` should be `dev_acc - prod_acc`.")
+      - instructions:
+          - "**Diagnose.** Store the share of each `type` among the dev set questions in `dev_mix`, and among production questions in `prod_mix` (both from `value_counts(normalize=True)`)."
+          - "Store ORBIT's accuracy per `type` over all 45 questions in `acc_by_type` (group `results` by `type`, mean of `human`)."
+        hint: "`dev_set['type'].value_counts(normalize=True)`, `prod['type'].value_counts(normalize=True)`, `results.groupby('type')['human'].mean()`."
+        sample_code: |
+          dev_mix = ____
+          prod_mix = ____
+          acc_by_type = ____
+          print(dev_mix, prod_mix, acc_by_type, sep="\n\n")
+        solution: |
+          dev_mix = dev_set["type"].value_counts(normalize=True)
+          prod_mix = prod["type"].value_counts(normalize=True)
+          acc_by_type = results.groupby("type")["human"].mean()
+          print(dev_mix, prod_mix, acc_by_type, sep="\n\n")
+        tests: |
+          check_object("dev_mix")
+          assert dict(user["dev_mix"]) == {"factual": 1.0}, "`dev_mix` should be the type shares in `dev_set`; you'll find it has only one type."
+          check_object("prod_mix")
+          assert dict(user["prod_mix"].round(6)) == dict(sol["prod_mix"].round(6)), "`prod_mix` should be `prod['type'].value_counts(normalize=True)`."
+          check_object("acc_by_type")
+          assert dict(user["acc_by_type"].round(6)) == dict(sol["acc_by_type"].round(6)), "`acc_by_type` should be the mean of `human` per `type` in `results`."
+      - instructions:
+          - "**Fix, part 1.** The dev set has no multi-hop or unanswerable questions. Use every case you have: store the plain accuracy over all 45 questions in `full_acc`."
+          - "Store `abs(full_acc - prod_acc)` in `full_error`. It's better, but still off: the 45 questions are 82% factual, production is 60%."
+        hint: "`results['human'].mean()`"
+        sample_code: |
+          full_acc = ____
+          full_error = ____
+          print(round(full_acc, 3), round(full_error, 3))
+        solution: |
+          full_acc = results["human"].mean()
+          full_error = abs(full_acc - prod_acc)
+          print(round(full_acc, 3), round(full_error, 3))
+        tests: |
+          check_equal("full_acc", msg="`full_acc` is the mean of `human` over all of `results`.")
+          check_equal("full_error", msg="`full_error` is `abs(full_acc - prod_acc)`.")
+      - instructions:
+          - "**Fix, part 2.** Reweight: store in `weighted` the sum over types of `prod_mix[type] * acc_by_type[type]`."
+          - "**Verify.** Store `abs(weighted - prod_acc)` in `weighted_error`. It must be under 0.03 (3 points)."
+        hint: "pandas lines up the two Series by type: `(prod_mix * acc_by_type).sum()`."
+        sample_code: |
+          weighted = ____
+          weighted_error = ____
+          print(round(weighted, 3), round(weighted_error, 3))
+        solution: |
+          weighted = (prod_mix * acc_by_type).sum()
+          weighted_error = abs(weighted - prod_acc)
+          print(round(weighted, 3), round(weighted_error, 3))
+        tests: |
+          check_object("weighted")
+          w = float(user["weighted"])
+          assert 0.70 < w < 0.80, f"`weighted` should be a production-weighted accuracy around 0.75, got {w:.3f}. Multiply each type's accuracy by its production share and add them up."
+          check_object("weighted_error")
+          assert abs(float(user["weighted_error"]) - abs(w - float(user["prod_acc"]))) < 1e-9, "`weighted_error` should be `abs(weighted - prod_acc)`."
+          assert user["weighted_error"] < 0.03, f"The reweighted estimate is {user['weighted_error']:.3f} away from production; it should be within 0.03. Weight `acc_by_type` by `prod_mix`."
+    success_msg: |
+      90% on the dev set, 80% on all 45, 75% reweighted, against 74% in production. The model didn't change; the
+      measurement did. Report the weighted number with its per-type breakdown, and grow the multi-hop and unanswerable
+      slices: with 4 cases each, their accuracies are still very uncertain.

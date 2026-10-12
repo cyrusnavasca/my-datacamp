@@ -1,0 +1,279 @@
+title: Structured logs
+description: JSON logs you can query, request ids that tie everything together, and what must never reach a log.
+exercises:
+  - id: structured-logs-slides
+    type: video
+    title: Logs a machine can read
+    slides: |
+      # Metrics, traces and logs
+
+      | signal | what it is | answers |
+      | --- | --- | --- |
+      | **metrics** | numbers aggregated over time (p95 latency, error rate, $/hour) | *is something wrong right now?* |
+      | **traces** | the timeline of one request, span by span | *where did this request spend its time?* |
+      | **logs** | individual events with details (an error message, a retry, a refusal) | *what exactly happened, and why?* |
+
+      This line is useless at 3 a.m.:
+
+      ```
+      WARNING: call failed for Lucía, retrying...
+      ```
+
+      Which request? Which error? Which model and prompt? You cannot filter, count or join it with anything.
+
+      ---
+
+      ## One JSON object per line
+
+      ```json
+      {"ts": "2026-09-11T14:02:03.120Z", "level": "warning", "event": "llm_call",
+       "request_id": "req-0137", "trace_id": "tr0215", "user": "u_51d3c7e0aa",
+       "prompt_version": "orbit-answer@v2", "model": "claude-sonnet-5-5", "attempt": 2,
+       "status": "error", "error_type": "rate_limit", "latency_ms": 41.0}
+      ```
+
+      - A fixed set of **field names**, so you can query `error_type == "rate_limit"` across a million lines.
+      - A **`request_id` on every line**. It is the join key between logs, traces, feedback and the crew's complaint.
+        Return it to the user too ("reference req-0137"), so a report leads straight to the logs.
+      - Numbers as numbers (not `"41 ms"`), and timestamps in UTC.
+
+      In Python, a small `log(event, **fields)` that writes `json.dumps(...)`, or the `logging` module with a JSON
+      formatter, is enough. The fields matter more than the library.
+
+      ---
+
+      ## What must not reach the log
+
+      Logs are copied, shipped to vendors, kept for months and read by many people. LLM apps are risky
+      because the **prompt and answer contain whatever the user typed**.
+
+      | data | rule |
+      | --- | --- |
+      | ids, model, prompt version, tokens, latency, status | log as is |
+      | user identity | **pseudonymise** with a *keyed* hash (HMAC with a secret salt) |
+      | free text (questions, answers) | redact known patterns (emails, codes, names), sample, short retention |
+      | secrets (API keys, airlock override codes), medical records | never |
+
+      Why a *keyed* hash? Helios-7 has six crew. A plain `sha256("Priya Raman")` can be reversed by hashing all six
+      names. With a secret salt, the same person still maps to the same id (you can count their requests), but the
+      id cannot be reversed without the key.
+
+      ---
+
+      ## Redaction by hand
+
+      ```python
+      import hmac, hashlib, json, re
+
+      EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+      def pseudonym(name):
+          return "u_" + hmac.new(SALT, name.encode(), hashlib.sha256).hexdigest()[:10]
+
+      def redact(text):
+          text = EMAIL.sub("[EMAIL]", text)
+          for name in CREW:                       # known names -> stable pseudonyms
+              text = text.replace(name, pseudonym(name))
+          return text
+      ```
+
+      Regexes catch **formats** (emails, codes, card numbers). Names in free text need a list (as here) or an
+      entity recogniser. No redactor is perfect, so redaction is one layer: also limit who can read raw payloads,
+      and for how long.
+
+      ---
+
+      ## Trade-off: how much of the conversation to log
+
+      | option | debugging | privacy risk | storage | when it wins |
+      | --- | --- | --- | --- | --- |
+      | metadata only (ids, tokens, timings, status) | weak: you see *that*, not *what* | lowest | tiny | regulated data, very high volume |
+      | full prompts and answers | strongest | highest | large | internal tools, early development |
+      | **redacted payloads, sampled, short retention** | good | moderate | moderate | most production apps |
+      | full payloads in a separate locked store, ids in the main log | strong, on request | controlled | large | when you need replay and audits |
+
+      **Playbook:** when someone asks "can we log everything?", ask *who reads it, for how long, and what is in it*.
+
+  - id: json-logger
+    type: coding
+    title: A JSON logger that keeps secrets out
+    context: |
+      `RAW` holds five events from ORBIT's code, as dicts. They contain crew names, an email address and an airlock
+      override code. `CREW` lists the crew names and `SALT` is the secret key for pseudonyms.
+    instructions:
+      - "Write `pseudonym(name)`: `\"u_\"` followed by the first 10 hex characters of `hmac.new(SALT, name.encode(), hashlib.sha256).hexdigest()`."
+      - "Write `redact(text)`: replace email addresses with `[EMAIL]`, override codes (`OVR-` and 4 digits) with `[CODE]`, and every name in `CREW` with its pseudonym."
+      - "Write `log_line(event)`: return `json.dumps` of a copy of `event` where the `user` field is replaced by its pseudonym and every other string value is passed through `redact`."
+      - "Store `lines = [log_line(e) for e in RAW]`."
+    hint: |
+      Use `re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "[EMAIL]", text)` and `re.sub(r"\bOVR-\d{4}\b", "[CODE]", text)`.
+      In `log_line`, loop over `event.items()` and build a new dict.
+    pre_code: |
+      import json, hmac, hashlib, re
+      SALT = b"helios-7-ops-2026"
+      CREW = ["Amara Okafor", "Tomas Lindqvist", "Priya Raman", "Kenji Watanabe", "Lucía Ferreira", "Noor Haddad"]
+      RAW = [
+          {"ts": "2026-09-11T14:02:03.120Z", "level": "info", "event": "request", "request_id": "req-0201",
+           "user": "Lucía Ferreira",
+           "question": "Send the network audit to lucia.ferreira@helios7.space and copy Tomas Lindqvist."},
+          {"ts": "2026-09-11T14:02:06.530Z", "level": "info", "event": "llm_call", "request_id": "req-0201",
+           "model": "claude-sonnet-5-5", "input_tokens": 3954, "output_tokens": 212, "latency_ms": 3410.2},
+          {"ts": "2026-09-11T14:02:07.004Z", "level": "info", "event": "request", "request_id": "req-0202",
+           "user": "Tomas Lindqvist", "question": "Override OVR-4471 failed on AL-2, what now?"},
+          {"ts": "2026-09-11T14:02:07.051Z", "level": "error", "event": "llm_call", "request_id": "req-0202",
+           "model": "claude-sonnet-5-5", "error_type": "rate_limit", "latency_ms": 41.0},
+          {"ts": "2026-09-11T14:02:07.090Z", "level": "info", "event": "response", "request_id": "req-0202",
+           "status": "degraded", "answer": "ORBIT is busy. Ask Priya Raman, or mail ops@helios7.space."},
+      ]
+    sample_code: |
+      def pseudonym(name):
+          return "u_" + ____
+
+      def redact(text):
+          text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "[EMAIL]", text)
+          text = ____
+          for name in CREW:
+              text = ____
+          return text
+
+      def log_line(event):
+          out = {}
+          for key, value in event.items():
+              if key == "user":
+                  out[key] = ____
+              elif isinstance(value, str):
+                  out[key] = ____
+              else:
+                  out[key] = value
+          return json.dumps(out)
+
+      lines = [log_line(e) for e in RAW]
+      for line in lines:
+          print(line)
+    solution: |
+      def pseudonym(name):
+          return "u_" + hmac.new(SALT, name.encode(), hashlib.sha256).hexdigest()[:10]
+
+      def redact(text):
+          text = re.sub(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+", "[EMAIL]", text)
+          text = re.sub(r"\bOVR-\d{4}\b", "[CODE]", text)
+          for name in CREW:
+              text = text.replace(name, pseudonym(name))
+          return text
+
+      def log_line(event):
+          out = {}
+          for key, value in event.items():
+              if key == "user":
+                  out[key] = pseudonym(value)
+              elif isinstance(value, str):
+                  out[key] = redact(value)
+              else:
+                  out[key] = value
+          return json.dumps(out)
+
+      lines = [log_line(e) for e in RAW]
+      for line in lines:
+          print(line)
+    tests: |
+      import json
+      check_object("pseudonym")
+      assert user["pseudonym"]("Noor Haddad") == sol["pseudonym"]("Noor Haddad"), "`pseudonym` should be 'u_' plus the first 10 hex characters of the HMAC-SHA256 of the name, keyed with SALT."
+      check_object("lines")
+      lines = user["lines"]
+      assert len(lines) == 5, "Make one line per event in RAW."
+      try:
+          parsed = [json.loads(l) for l in lines]
+      except Exception:
+          raise AssertionError("Every line must be valid JSON: build a dict and return `json.dumps(...)` of it.")
+      joined = " ".join(lines)
+      for bad in ["helios7.space", "OVR-4471", "Ferreira", "Lindqvist", "Raman"]:
+          assert bad not in joined, f"`{bad}` still appears in your log lines. Check `redact` (emails, codes and crew names) and that `log_line` runs every string field through it."
+      expected = [json.loads(l) for l in sol["lines"]]
+      for p, e in zip(parsed, expected):
+          assert p == e, f"Line for {e['request_id']} / {e['event']} should be {e}, got {p}."
+    success_msg: |
+      The logs still say who asked what (as a stable pseudonym) and what went wrong, but an email address or an
+      override code no longer leaks to everyone who can read them.
+
+  - id: what-to-log
+    type: classify
+    title: Log it, mask it, or never log it?
+    prompt: ORBIT's new logging config is being reviewed. Sort each field by how it should be handled in the main application log.
+    hint: Ask of each field whether it identifies a person, whether it could let someone act as them or open something, and whether you need it to debug.
+    zones: [Log as is, Pseudonymise or redact first, Never log]
+    items:
+      - { text: request_id and trace_id, zone: Log as is }
+      - { text: prompt version and model id, zone: Log as is }
+      - { text: input and output token counts, zone: Log as is }
+      - { text: latency, TTFT and stop_reason, zone: Log as is }
+      - { text: the crew member's name, zone: Pseudonymise or redact first }
+      - { text: the crew member's email address, zone: Pseudonymise or redact first }
+      - { text: the free-text question the crew member typed, zone: Pseudonymise or redact first }
+      - { text: the Anthropic API key, zone: Never log }
+      - { text: the airlock override code, zone: Never log }
+      - { text: a diagnosis copied from the med-bay record, zone: Never log }
+
+  - id: follow-request-id
+    type: coding
+    title: Follow one request through the logs
+    context: |
+      Lucía says ORBIT gave her a "busy, try later" reply and quotes reference **req-0137**. `log_lines` holds the
+      afternoon's application log: 654 JSON lines from 150 requests, interleaved as they happened.
+    instructions:
+      - "Parse every line into a DataFrame `logs`."
+      - "Store in `story` the list of `event` names for `req-0137`, in time order (`ts`)."
+      - "Over all `llm_call` events, store `error_counts` (a dict: `error_type` to count) and `call_error_rate` (the share of calls whose `status` is `\"error\"`)."
+      - "Store in `unhappy` the sorted list of request ids whose `response` event has a `status` other than `\"ok\"`."
+    hint: |
+      `pd.DataFrame([json.loads(l) for l in log_lines])`. Filter with `logs["request_id"] == "req-0137"`, sort by `ts`,
+      then `["event"].tolist()`. `dict(calls["error_type"].value_counts())` skips the missing values for you.
+    pre_code: |
+      import json
+      import pandas as pd
+      from kits.llmops_production import app_logs
+      log_lines = app_logs()
+    sample_code: |
+      logs = pd.DataFrame(____)
+
+      story = ____
+
+      calls = logs[logs["event"] == "llm_call"]
+      error_counts = ____
+      call_error_rate = ____
+
+      responses = logs[logs["event"] == "response"]
+      unhappy = ____
+
+      print(story)
+      print(error_counts, round(call_error_rate, 3))
+      print(unhappy)
+    solution: |
+      logs = pd.DataFrame([json.loads(l) for l in log_lines])
+
+      story = logs[logs["request_id"] == "req-0137"].sort_values("ts")["event"].tolist()
+
+      calls = logs[logs["event"] == "llm_call"]
+      error_counts = dict(calls["error_type"].value_counts())
+      call_error_rate = (calls["status"] == "error").mean()
+
+      responses = logs[logs["event"] == "response"]
+      unhappy = sorted(responses.loc[responses["status"] != "ok", "request_id"])
+
+      print(story)
+      print(error_counts, round(call_error_rate, 3))
+      print(unhappy)
+    tests: |
+      check_object("logs")
+      assert len(user["logs"]) == 654, "`logs` should have one row per line (654). Parse each line with `json.loads`."
+      check_equal("story", msg="`story` should be the events of req-0137 sorted by `ts`, as a list of names. Expected " + repr(sol["story"]))
+      check_object("error_counts")
+      got = {k: int(v) for k, v in dict(user["error_counts"]).items()}
+      exp = {k: int(v) for k, v in sol["error_counts"].items()}
+      assert got == exp, f"`error_counts` should be {exp}, got {got}. Count `error_type` over `llm_call` events only."
+      check_equal("call_error_rate", tol=1e-6, msg="`call_error_rate` is the share of `llm_call` events with `status == 'error'`.")
+      check_equal("unhappy", msg="`unhappy` should list (sorted) the request ids whose `response` event status is not 'ok'.")
+    success_msg: |
+      req-0137 hit three rate limits in a row, gave up and returned a degraded reply: that is Lucía's complaint,
+      explained in one query. Across the afternoon, one LLM call in six failed, mostly with 429s. That is the
+      reliability chapter's problem, and you can now measure it.

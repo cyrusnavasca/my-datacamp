@@ -1,0 +1,332 @@
+title: Train LoRA adapters
+description: Put adapters into a pretrained model, train only them, save them as a tiny file, and choose between full fine-tuning, LoRA and QLoRA.
+exercises:
+  - id: intro
+    type: video
+    title: Adapting a pretrained model
+    slides: |
+      # The base model for this chapter
+
+      Downloading a 7B model isn't possible here, so this chapter uses **TicketNet**, a small network
+      that plays the same role:
+
+      | TicketNet | an LLM |
+      | --- | --- |
+      | `featurize(texts)`: hashed words to a 1,024-dim vector | tokenizer + embeddings |
+      | `fc1` (1024 → 512), `fc2` (512 → 512) | attention and MLP projections |
+      | `head` (512 → 5 categories) | the output layer |
+      | pretrained on 1,500 Earth help-desk tickets | pretrained on the web |
+
+      `base_model()` knows "printer", "password" and "book", but not "Tern manifest", "galley duty" or
+      the station's conventions. Frozen, it scores about **0.57** on Helios validation tickets and
+      **1.00** on general help-desk tickets.
+
+      ---
+
+      ## Inject adapters, freeze the rest
+
+      ```python
+      model = base_model()
+      for p in model.parameters():
+          p.requires_grad = False                      # freeze everything first
+      model.fc1 = LoRALinear(model.fc1, r=4, alpha=8)  # then add trainable A, B
+      model.fc2 = LoRALinear(model.fc2, r=4, alpha=8)
+      trainable, total = count_params(model)           # 10,240 of 800,261 = 1.3%
+      ```
+
+      In an LLM you choose **target modules**: commonly the attention projections (`q_proj`, `k_proj`,
+      `v_proj`, `o_proj`), often the MLP too. More targets give more capacity and more parameters. The
+      head stays frozen here because the label set doesn't change; a new label set needs a new, trainable head.
+
+      ---
+
+      ## The training loop
+
+      ```python
+      params = [p for p in model.parameters() if p.requires_grad]   # A and B only
+      opt = torch.optim.AdamW(params, lr=3e-3)
+      for epoch in range(30):
+          model.train()
+          loss = F.cross_entropy(model(X_train), y_train)
+          opt.zero_grad()
+          loss.backward()
+          opt.step()
+      ```
+
+      - Give the optimizer only the trainable parameters, so it keeps no state for frozen weights.
+      - LoRA usually wants a **higher learning rate** than full fine-tuning (for LLMs roughly 1e-4 to
+        1e-3, against 1e-5 to 2e-5 for full fine-tuning), because the update is small and starts at zero.
+      - Track validation accuracy **and** a general suite every epoch. You will need both next lesson.
+
+      ---
+
+      ## Full fine-tune, LoRA or QLoRA?
+
+      | | Full fine-tune | LoRA | QLoRA | Prompt only |
+      | --- | --- | --- | --- | --- |
+      | Trainable share | 100% | ~0.1-2% | ~0.1-2% | 0% |
+      | Training memory | weights + grads + 2 Adam states | frozen weights + small adapter state | base stored in 4-bit, adapters in 16-bit | none |
+      | Quality ceiling | highest (big domain shifts, new skills) | close to full on most narrow tasks | close to LoRA, slightly slower | limited by context |
+      | Forgetting risk | highest | lower (fewer, smaller changes), still real | like LoRA | none |
+      | Storage per variant | a full model copy | a few MB | a few MB | a text file |
+      | Serving many variants | one deployment each | one base, hot-swap adapters | one base, hot-swap adapters | one model |
+
+      Rules of thumb: **LoRA** is the default. Use **QLoRA** when the base model doesn't fit in GPU
+      memory for training. Go to **full fine-tuning** only when LoRA has plateaued below your target
+      and you have lots of data and compute.
+
+      ---
+
+      ## Save only the adapter
+
+      ```python
+      adapter = {k: v for k, v in model.state_dict().items() if k.endswith((".A", ".B"))}
+      torch.save(adapter, "helios_triage_adapter.pt")         # KB to MB, not GB
+
+      # later, or on another machine: same base, same wrapping, then load
+      fresh = add_lora(base_model(), r=4, alpha=8)
+      fresh.load_state_dict(adapter, strict=False)
+      ```
+
+      With `peft`, `model.save_pretrained(dir)` writes only the adapter. One base model can serve a
+      separate adapter per station or customer. The catch: an adapter only works on the **exact base
+      model** it was trained on. Change the base and you retrain.
+
+  - id: inject-adapters
+    type: coding
+    title: Inject adapters into TicketNet
+    context: |
+      `base_model()` returns a fresh pretrained TicketNet with layers `fc1`, `fc2` and `head`.
+      `LoRALinear(layer, r, alpha)` and `count_params(model)` (returns `(trainable, total)`) are loaded,
+      with Helios validation features `X_val`. `torch` is imported.
+    instructions:
+      - "Create `model = base_model()` and freeze **all** of its parameters."
+      - "Replace `model.fc1` and `model.fc2` with `LoRALinear(..., r=4, alpha=8)` wrappers around the original layers."
+      - "Store `trainable, total = count_params(model)` and `share = trainable / total`."
+      - "Store whether `model(X_val)` equals `base_model()(X_val)` (use `torch.allclose`) in `same_at_init`."
+    hint: "Freeze first, wrap second: the new A and B must stay trainable. `model.fc1 = LoRALinear(model.fc1, r=4, alpha=8)`."
+    pre_code: |
+      import torch
+      from kits.fine_tuning_llms import base_model, LoRALinear, count_params, featurize, helios_split
+      _, _val = helios_split()
+      X_val = featurize(_val.text)
+    sample_code: |
+      model = base_model()
+      for p in model.parameters():
+          ____
+      model.fc1 = ____
+      model.fc2 = ____
+
+      trainable, total = count_params(model)
+      share = ____
+      with torch.no_grad():
+          same_at_init = ____
+      print(f"{trainable:,} of {total:,} parameters train ({share:.2%}); unchanged at init: {same_at_init}")
+    solution: |
+      model = base_model()
+      for p in model.parameters():
+          p.requires_grad = False
+      model.fc1 = LoRALinear(model.fc1, r=4, alpha=8)
+      model.fc2 = LoRALinear(model.fc2, r=4, alpha=8)
+
+      trainable, total = count_params(model)
+      share = trainable / total
+      with torch.no_grad():
+          same_at_init = torch.allclose(model(X_val), base_model()(X_val))
+      print(f"{trainable:,} of {total:,} parameters train ({share:.2%}); unchanged at init: {same_at_init}")
+    tests: |
+      m = check_object("model")
+      names = {n for n, p in m.named_parameters() if p.requires_grad}
+      assert names == {"fc1.A", "fc1.B", "fc2.A", "fc2.B"}, f"Only the adapters should train. Trainable now: {sorted(names)}. Freeze every parameter before wrapping fc1 and fc2."
+      check_equal("trainable", 10240, msg="`trainable` should be 4 * (1024 + 512) + 4 * (512 + 512) = 10,240.")
+      check_equal("total", msg="`total` counts every parameter, frozen ones included.")
+      check_equal("share", tol=1e-9, msg="`share` = `trainable / total`.")
+      assert check_object("same_at_init") is True or bool(user["same_at_init"]) is True, "With B = 0 the wrapped model must give exactly the base model's outputs. Did you wrap the original layers?"
+    success_msg: "1.3% of the parameters train, and the model starts exactly where the base model was."
+
+  - id: adapter-file
+    type: coding
+    title: Ship the adapter, not the model
+    context: |
+      `model` is TicketNet with rank-4 adapters already trained on Helios tickets. `add_lora(model, r, alpha)`
+      wraps `fc1` and `fc2` of a model in place, `base_model()` gives a fresh base, and `X_val` holds
+      validation features. `torch` is imported.
+    instructions:
+      - "Store a dict of only the adapter tensors (state-dict keys ending in `.A` or `.B`) in `adapter`."
+      - "Store the adapter size in KB, `sum(v.numel() * 4 for v in adapter.values()) / 1024`, in `adapter_kb`, and the whole state dict's size in `full_kb`."
+      - "Build `fresh = add_lora(base_model(), r=4, alpha=8)`, load `adapter` into it with `strict=False`, and store whether its predictions on `X_val` (`argmax(1)`) equal `model`'s in `same_predictions`."
+    hint: "`k.endswith((\".A\", \".B\"))`. `torch.equal(fresh(X_val).argmax(1), model(X_val).argmax(1))`."
+    pre_code: |
+      import torch
+      from kits.fine_tuning_llms import base_model, add_lora, fit, featurize, labels_of, helios_split
+      _tr, _va = helios_split()
+      X_val = featurize(_va.text)
+      torch.manual_seed(0)
+      model = add_lora(base_model(), r=4, alpha=8)
+      fit(model, featurize(_tr.text), labels_of(_tr.category), epochs=30, lr=3e-3)
+      model.eval()
+    sample_code: |
+      adapter = {k: v.clone() for k, v in model.state_dict().items() if ____}
+      adapter_kb = sum(v.numel() * 4 for v in adapter.values()) / 1024
+      full_kb = ____
+
+      fresh = add_lora(base_model(), r=4, alpha=8)
+      fresh.load_state_dict(____, strict=False)
+      with torch.no_grad():
+          same_predictions = ____
+      print(f"adapter {adapter_kb:.0f} KB vs full model {full_kb:.0f} KB; same predictions: {same_predictions}")
+    solution: |
+      adapter = {k: v.clone() for k, v in model.state_dict().items() if k.endswith((".A", ".B"))}
+      adapter_kb = sum(v.numel() * 4 for v in adapter.values()) / 1024
+      full_kb = sum(v.numel() * 4 for v in model.state_dict().values()) / 1024
+
+      fresh = add_lora(base_model(), r=4, alpha=8)
+      fresh.load_state_dict(adapter, strict=False)
+      with torch.no_grad():
+          same_predictions = torch.equal(fresh(X_val).argmax(1), model(X_val).argmax(1))
+      print(f"adapter {adapter_kb:.0f} KB vs full model {full_kb:.0f} KB; same predictions: {same_predictions}")
+    tests: |
+      a = check_object("adapter")
+      assert set(a) == {"fc1.A", "fc1.B", "fc2.A", "fc2.B"}, f"`adapter` should hold exactly the four adapter tensors; it has {sorted(a)}."
+      check_equal("adapter_kb", tol=1e-9, msg="`adapter_kb` = total numel of the adapter tensors * 4 bytes / 1024.")
+      check_equal("full_kb", tol=1e-9, msg="`full_kb` = total numel of every tensor in `model.state_dict()` * 4 / 1024.")
+      assert bool(check_object("same_predictions")), "The fresh model with the loaded adapter should predict exactly like `model`. Load `adapter` into `fresh`."
+    success_msg: "40 KB instead of 3 MB, with identical predictions. At LLM scale that's megabytes instead of gigabytes per variant."
+
+  - id: choose-method
+    type: mc
+    title: Twelve stations, one GPU
+    question: |
+      The fleet has 12 stations. Each wants its own triage behaviour (local jargon and conventions), with
+      300 to 800 labelled tickets per station, retrained monthly. Serving must run on **one GPU** that
+      holds a single copy of the base model. Prompting with examples reaches 85% and you need 93%.
+      What do you do?
+    options:
+      - text: Fully fine-tune one model per station.
+        feedback: "12 full copies don't fit on one GPU, and a few hundred tickets per station is very little data for updating every weight, so the forgetting risk is high. Full fine-tuning buys capacity you don't need here."
+      - text: Train one LoRA adapter per station on the shared base, and hot-swap the adapter per request.
+        correct: true
+        feedback: "Right. Each adapter is a few MB, a single base stays in GPU memory, and monthly retraining is cheap. A few hundred examples suit a low-rank update, and each station gets its own behaviour."
+      - text: Use QLoRA so training uses less memory.
+        feedback: "QLoRA solves training memory: a base model too big to fine-tune on your hardware. The constraint here is serving 12 variants from one GPU, which adapters on a shared base solve with or without quantisation."
+      - text: Keep prompting, and add more examples until it reaches 93%.
+        feedback: "Worth a try first, but the scenario says prompting has plateaued at 85%, and 12 sets of long example prompts multiply cost on every call. Once you have the eval numbers, this is what adapters are for."
+    hint: Which option keeps a single base model in GPU memory while giving every station its own behaviour?
+
+  - id: boss-beat-baseline
+    type: sequential
+    title: "Mission: teach the base model Helios"
+    context: |
+      Adapt TicketNet to Helios tickets with LoRA. Success means beating the frozen baseline by a wide
+      margin, training under **2%** of the parameters, leaving the base weights untouched and keeping its
+      general skills. Loaded: `base_model`, `add_lora`, `count_params`, `accuracy(model, X, y)`, Helios
+      `X_train, y_train, X_val, y_val`, general `X_gen, y_gen`, `torch` and `F`
+      (`torch.nn.functional`).
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      from kits.fine_tuning_llms import base_model, add_lora, count_params, accuracy, featurize, labels_of, helios_split, general_eval
+      _tr, _va = helios_split()
+      X_train, y_train = featurize(_tr.text), labels_of(_tr.category)
+      X_val, y_val = featurize(_va.text), labels_of(_va.category)
+      X_gen, y_gen = general_eval()
+    steps:
+      - instructions:
+          - "**Baseline.** Store the frozen base model's accuracy on Helios validation in `base_acc` and on the general set in `general_before`."
+        hint: "`accuracy(base_model(), X_val, y_val)`."
+        sample_code: |
+          base_acc = ____
+          general_before = ____
+          print(f"frozen base: Helios {base_acc:.2f}, general {general_before:.2f}")
+        solution: |
+          base_acc = accuracy(base_model(), X_val, y_val)
+          general_before = accuracy(base_model(), X_gen, y_gen)
+          print(f"frozen base: Helios {base_acc:.2f}, general {general_before:.2f}")
+        tests: |
+          check_equal("base_acc", msg="`base_acc` is `accuracy(base_model(), X_val, y_val)`.")
+          check_equal("general_before", msg="`general_before` is the base model's accuracy on `X_gen, y_gen`.")
+      - instructions:
+          - "**Build.** Seed with `torch.manual_seed(0)`, then create `model = add_lora(base_model(), r=R, alpha=2 * R)` and store its trainable share in `share`. It must be below 0.02."
+        hint: "`trainable, total = count_params(model)`. Rank 4 gives about 1.3%; rank 8 is already over 2%."
+        sample_code: |
+          R = 4
+          torch.manual_seed(0)
+          model = ____
+          trainable, total = count_params(model)
+          share = ____
+          print(f"rank {R}: {trainable:,} trainable ({share:.2%})")
+        solution: |
+          R = 4
+          torch.manual_seed(0)
+          model = add_lora(base_model(), r=R, alpha=2 * R)
+          trainable, total = count_params(model)
+          share = trainable / total
+          print(f"rank {R}: {trainable:,} trainable ({share:.2%})")
+        tests: |
+          from kits.fine_tuning_llms import count_params
+          m = check_object("model")
+          t, n = count_params(m)
+          assert t > 0, "Nothing is trainable. Build the model with `add_lora(...)`."
+          assert t / n < 0.02, f"{t / n:.2%} of the parameters train; the budget is under 2%. Lower `R`."
+          assert abs(float(check_object("share")) - t / n) < 1e-9, "`share` = trainable / total, from `count_params(model)`."
+      - instructions:
+          - "**Train.** Write the loop: an `AdamW` optimizer over the trainable parameters only (`lr=LR`), then for `EPOCHS` epochs a full-batch step on `X_train, y_train` with `F.cross_entropy`."
+          - "Store the validation accuracy in `lora_acc`. Targets: at least **0.90**, and at least `base_acc + 0.25`."
+        hint: "`opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR)`; in the loop: `loss = F.cross_entropy(model(X_train), y_train)`, `opt.zero_grad()`, `loss.backward()`, `opt.step()`."
+        sample_code: |
+          LR, EPOCHS = 3e-3, 30
+          opt = torch.optim.AdamW(____, lr=LR)
+          for epoch in range(EPOCHS):
+              model.train()
+              loss = ____
+              opt.zero_grad()
+              ____
+              opt.step()
+          model.eval()
+          lora_acc = ____
+          print(f"Helios validation: {base_acc:.2f} -> {lora_acc:.2f}")
+        solution: |
+          LR, EPOCHS = 3e-3, 30
+          opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=LR)
+          for epoch in range(EPOCHS):
+              model.train()
+              loss = F.cross_entropy(model(X_train), y_train)
+              opt.zero_grad()
+              loss.backward()
+              opt.step()
+          model.eval()
+          lora_acc = accuracy(model, X_val, y_val)
+          print(f"Helios validation: {base_acc:.2f} -> {lora_acc:.2f}")
+        tests: |
+          from kits.fine_tuning_llms import accuracy
+          m = check_object("model")
+          acc = accuracy(m, user["X_val"], user["y_val"])
+          assert abs(float(check_object("lora_acc")) - acc) < 1e-9, "`lora_acc` should be `accuracy(model, X_val, y_val)` after training."
+          assert acc >= 0.9, f"Validation accuracy is {acc:.2f}; the target is 0.90. Check the loop calls `loss.backward()` and `opt.step()` and runs for enough epochs."
+          assert acc >= user["base_acc"] + 0.25, "Beat the frozen baseline by at least 25 points."
+      - instructions:
+          - "**Verify.** Store `True` in `base_unchanged` if `model.fc1.base.weight`, `model.fc2.base.weight` and `model.head.weight` all still equal the weights of a fresh `base_model()` (`torch.equal`)."
+          - "Store the general-set accuracy in `general_after`. It must stay at **0.95** or above, or the adapter has made the model forget."
+        hint: "`fresh = base_model()`, then `torch.equal(model.fc1.base.weight, fresh.fc1.weight)` and so on."
+        sample_code: |
+          fresh = base_model()
+          base_unchanged = ____
+          general_after = ____
+          print(f"base weights untouched: {base_unchanged}")
+          print(f"general skills: {general_before:.2f} -> {general_after:.2f}")
+        solution: |
+          fresh = base_model()
+          base_unchanged = (torch.equal(model.fc1.base.weight, fresh.fc1.weight)
+                            and torch.equal(model.fc2.base.weight, fresh.fc2.weight)
+                            and torch.equal(model.head.weight, fresh.head.weight))
+          general_after = accuracy(model, X_gen, y_gen)
+          print(f"base weights untouched: {base_unchanged}")
+          print(f"general skills: {general_before:.2f} -> {general_after:.2f}")
+        tests: |
+          from kits.fine_tuning_llms import accuracy
+          assert bool(check_object("base_unchanged")), "`base_unchanged` should be True: the frozen weights must not move during LoRA training."
+          g = accuracy(user["model"], user["X_gen"], user["y_gen"])
+          assert abs(float(check_object("general_after")) - g) < 1e-9, "`general_after` should be `accuracy(model, X_gen, y_gen)`."
+          assert g >= 0.95, f"General accuracy fell to {g:.2f}: the tune caused forgetting. Lower `LR` or `EPOCHS` in step 3 and re-run."
+    timeout: 60
+    success_msg: "From 0.57 to 1.00 on Helios while training 1.3% of the parameters, with the base weights bit-for-bit unchanged and general skills within a few points. Next: what happens when you push harder."

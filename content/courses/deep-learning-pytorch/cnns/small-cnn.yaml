@@ -1,0 +1,300 @@
+title: A small digit classifier
+description: Prepare image tensors, train a CNN on 8x8 digits, compare it with an MLP, and make it robust to shifted inputs.
+exercises:
+  - id: intro
+    type: video
+    title: Building and stress-testing a CNN
+    slides: |
+      # The data: 1,797 tiny digits
+
+      scikit-learn's `load_digits()` has 8 x 8 greyscale images of handwritten digits with
+      pixel values 0-16. To feed them to a CNN:
+
+      ```python
+      from sklearn.datasets import load_digits
+      from sklearn.model_selection import train_test_split
+
+      d = load_digits()
+      X = torch.tensor(d.images / 16.0, dtype=torch.float32).unsqueeze(1)   # (1797, 1, 8, 8) in [0, 1]
+      y = torch.tensor(d.target, dtype=torch.int64)                          # class indices for cross-entropy
+      X_train, X_test, y_train, y_test = train_test_split(
+          X, y, test_size=0.25, random_state=0, stratify=y)
+      ```
+
+      Three things to get right: **scale** (inputs near [0, 1]), **shape** (a channel dimension),
+      **dtype** (float32 images, int64 labels). `stratify=y` keeps the class mix equal in both splits.
+
+      ---
+
+      ## The model, shape by shape
+
+      ```python
+      cnn = nn.Sequential(
+          nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+          nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+          nn.Flatten(), nn.Linear(32 * 2 * 2, 10),
+      )
+      ```
+
+      | layer | output shape | parameters |
+      | --- | --- | --- |
+      | input | (N, 1, 8, 8) | |
+      | Conv 1→16, 3x3, pad 1 + ReLU | (N, 16, 8, 8) | 160 |
+      | MaxPool 2 | (N, 16, 4, 4) | 0 |
+      | Conv 16→32, 3x3, pad 1 + ReLU | (N, 32, 4, 4) | 4,640 |
+      | MaxPool 2 | (N, 32, 2, 2) | 0 |
+      | Flatten + Linear 128→10 | (N, 10) | 1,290 |
+
+      6,090 parameters in total. Train it with everything from chapter 3: a shuffled `DataLoader`,
+      Adam, the five-step loop, then `eval()` and `no_grad()` to measure.
+
+      ---
+
+      ## Trade-off: MLP or CNN for these digits?
+
+      Measured on this exact split (10 epochs, Adam, batch 64, CPU):
+
+      | model | parameters | train time | test accuracy | accuracy on digits shifted by 1 pixel |
+      | --- | --- | --- | --- | --- |
+      | MLP 64→64→10 | 4,810 | ~0.1 s | ~97% | **~46%** |
+      | CNN above | 6,090 | ~1 s | ~97-98% | ~61-66% |
+      | CNN + shift augmentation | 6,090 | ~1.5 s | ~93-97% | **~90-96%** |
+      | MLP + shift augmentation | 4,810 | ~0.1 s | ~83-89% | ~78-83% |
+
+      On perfectly centred 8 x 8 digits, the MLP is as accurate and 10x faster to train.
+      The CNN earns its cost when **position varies**, and on bigger images where a dense layer's
+      parameter count explodes. For real photos, start from a pretrained model instead.
+
+      ---
+
+      ## Playbook: great test accuracy, poor in production
+
+      **Symptom:** 97% on the test set, many complaints from users.
+
+      **Measure:** build a test set with the variation production has (here: every test digit
+      shifted one pixel up, down, left and right) and measure on it **as well as** the clean set.
+
+      **Diagnose:** the training images are always centred, so the model learned "a stroke at
+      column 3", not "a vertical stroke". The test set had the same bias, so it could not reveal it.
+
+      **Fix, in order of cost:**
+      1. **Augmentation:** randomly shift each training batch by -1, 0 or +1 pixel. A few lines, a little more training time; may cost a point on clean data.
+      2. **Architecture:** pooling (and global average pooling) makes features less position-bound.
+      3. **Data:** collect real, uncentred examples. Best, and the most expensive.
+
+      **Verify** on both sets: robustness bought by giving up a lot of clean accuracy is not a fix.
+
+  - id: prepare-digits
+    type: coding
+    title: Turn the digits into tensors
+    context: |
+      `load_digits()` returns `images` as a NumPy array of shape `(1797, 8, 8)` with values 0-16
+      and `target` with the digit labels. Prepare them for a CNN and split them.
+    instructions:
+      - "Store the images as a float32 tensor of shape `(1797, 1, 8, 8)` scaled to [0, 1] in `X`, and the labels as an int64 tensor in `y`."
+      - "Split with `train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)` into `X_train, X_test, y_train, y_test`."
+      - Print the four shapes and `X.max()`.
+    hint: "`torch.tensor(digits.images / 16.0, dtype=torch.float32).unsqueeze(1)`; `torch.tensor(digits.target, dtype=torch.int64)`."
+    pre_code: |
+      import torch
+      from sklearn.datasets import load_digits
+      from sklearn.model_selection import train_test_split
+      digits = load_digits()
+    sample_code: |
+      X = ____
+      y = ____
+      X_train, X_test, y_train, y_test = ____
+      print(X_train.shape, X_test.shape, y_train.shape, y_test.shape, X.max())
+    solution: |
+      X = torch.tensor(digits.images / 16.0, dtype=torch.float32).unsqueeze(1)
+      y = torch.tensor(digits.target, dtype=torch.int64)
+      X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, random_state=0, stratify=y)
+      print(X_train.shape, X_test.shape, y_train.shape, y_test.shape, X.max())
+    tests: |
+      import torch
+      from kits.deep_learning_pytorch import check_tensor
+      check_object("X")
+      assert isinstance(user["X"], torch.Tensor), "`X` should be a torch tensor."
+      assert tuple(user["X"].shape) == (1797, 1, 8, 8), f"`X` has shape {tuple(user['X'].shape)}; add a channel dimension to get `(1797, 1, 8, 8)`."
+      assert user["X"].dtype == torch.float32, f"`X` is {user['X'].dtype}; convolutions need float32."
+      assert float(user["X"].max()) <= 1.0, "Scale the pixels to [0, 1] by dividing by 16."
+      check_tensor(user, sol, "X")
+      assert isinstance(user["y"], torch.Tensor) and user["y"].dtype == torch.int64, "`y` should be an int64 tensor: `F.cross_entropy` needs class indices as int64."
+      check_tensor(user, sol, "X_train", msg="Split with `test_size=0.25, random_state=0, stratify=y`.")
+      check_tensor(user, sol, "y_test", msg="Split with `test_size=0.25, random_state=0, stratify=y`.")
+    success_msg: Scaled, shaped and typed. 1,347 training images and 450 test images.
+
+  - id: cnn-or-mlp
+    type: mc
+    title: Choose a model under constraints
+    question: |
+      A form-scanning service reads handwritten digits from 8 x 8 crops. The scanner's alignment
+      drifts by a pixel or so. Predictions run on a CPU with a budget of 50 ms per page of 30
+      digits. Your labelled training crops are all perfectly centred. Using the measurements on
+      the slides, what do you ship?
+    options:
+      - text: The MLP as it is; it scores 97% on the test set
+        feedback: "The test set is centred like the training set, so 97% hides the problem. On shifted digits the MLP drops to about 46%."
+      - text: The MLP with shift augmentation, because it is the fastest
+        feedback: "Faster to train, but it only reaches about 80% on shifted digits and loses clean accuracy too. Both models are far inside a 50 ms budget, so speed does not decide this."
+      - text: The CNN with pooling, trained with random 1-pixel shift augmentation
+        correct: true
+        feedback: "Right. It keeps about 93-97% on clean digits and gets about 90-96% on shifted ones, and a 6,000-parameter CNN runs 30 crops in well under a millisecond on CPU."
+      - text: A large pretrained ImageNet model, fine-tuned on the digits
+        feedback: "Overkill: millions of parameters for 8 x 8 greyscale crops, much higher latency and cost, and its pretraining on 224 x 224 colour photos does not transfer well to this input."
+    hint: Which constraint actually binds here, latency or robustness to shifts?
+
+  - id: digit-classifier
+    type: sequential
+    title: "Course boss: a digit classifier that survives shifted input"
+    timeout: 120
+    context: |
+      `X_train`, `X_test`, `y_train`, `y_test` are the digits prepared as in the first exercise.
+      `X_shift`, `y_shift` hold every test digit moved one pixel left, right, up and down
+      (1,800 images). `shift(images, dx, dy)` moves a batch by `dx`, `dy` pixels (each -1, 0 or 1),
+      filling with zeros. `accuracy(model, X, y)` measures in eval mode without gradients.
+      Build and train a CNN, stress-test it, then fix what you find.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch.utils.data import TensorDataset, DataLoader
+      from kits.deep_learning_pytorch import digits_split, shift, shifted_copies
+      torch.manual_seed(0)
+      X_train, X_test, y_train, y_test = digits_split()
+      X_shift, y_shift = shifted_copies(X_test, y_test)
+
+      def accuracy(model, X, y):
+          model.eval()
+          with torch.no_grad():
+              acc = (model(X).argmax(dim=1) == y).float().mean().item()
+          model.train()
+          return acc
+    steps:
+      - instructions:
+          - "Write `make_cnn()` that returns a **new** CNN mapping `(N, 1, 8, 8)` images to `(N, 10)` logits, with at least one `nn.Conv2d` and fewer than 20,000 parameters."
+          - "Store `make_cnn()` in `cnn` and its parameter count in `n_params`. Print it."
+        hint: "The model from the slides: two blocks of `Conv2d(..., 3, padding=1)`, `ReLU`, `MaxPool2d(2)`, then `Flatten()` and `Linear(32 * 2 * 2, 10)`."
+        sample_code: |
+          def make_cnn():
+              return nn.Sequential(
+                  ____
+              )
+
+          cnn = make_cnn()
+          n_params = ____
+          print(n_params)
+        solution: |
+          def make_cnn():
+              return nn.Sequential(
+                  nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                  nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                  nn.Flatten(), nn.Linear(32 * 2 * 2, 10),
+              )
+
+          cnn = make_cnn()
+          n_params = sum(p.numel() for p in cnn.parameters())
+          print(n_params)
+        tests: |
+          import torch, torch.nn as nn
+          check_object("make_cnn")
+          m = user["make_cnn"]()
+          assert m is not user["make_cnn"](), "`make_cnn()` should build a new model every time it is called."
+          out = m(torch.zeros(5, 1, 8, 8))
+          assert tuple(out.shape) == (5, 10), f"`make_cnn()` should map `(5, 1, 8, 8)` to `(5, 10)`, got {tuple(out.shape)}. Check `in_features` of the last layer."
+          assert any(isinstance(x, nn.Conv2d) for x in m.modules()), "Use at least one `nn.Conv2d`; this is a CNN."
+          n = sum(p.numel() for p in m.parameters())
+          assert n < 20000, f"The model has {n} parameters; keep it under 20,000."
+          check_equal("n_params", n, msg="`n_params` should be `sum(p.numel() for p in cnn.parameters())`.")
+      - instructions:
+          - "Run `torch.manual_seed(0)`, rebuild `cnn = make_cnn()`, and train it for 10 epochs: a `DataLoader` over `X_train`, `y_train` with `batch_size=64, shuffle=True`, Adam with `lr=0.01`, and the five steps per batch."
+          - "Store `accuracy(cnn, X_test, y_test)` in `test_acc` and print it. It must reach at least `0.95`."
+        hint: "`loader = DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=True)`, then `for epoch in range(10): for xb, yb in loader: ...`."
+        sample_code: |
+          torch.manual_seed(0)
+          cnn = make_cnn()
+          opt = torch.optim.Adam(cnn.parameters(), lr=0.01)
+          loader = ____
+          for epoch in range(10):
+              for xb, yb in loader:
+                  ____
+
+          test_acc = accuracy(cnn, X_test, y_test)
+          print(test_acc)
+        solution: |
+          torch.manual_seed(0)
+          cnn = make_cnn()
+          opt = torch.optim.Adam(cnn.parameters(), lr=0.01)
+          loader = DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=True)
+          for epoch in range(10):
+              for xb, yb in loader:
+                  opt.zero_grad()
+                  F.cross_entropy(cnn(xb), yb).backward()
+                  opt.step()
+
+          test_acc = accuracy(cnn, X_test, y_test)
+          print(test_acc)
+        tests: |
+          check_object("cnn")
+          acc = sol["accuracy"](user["cnn"], sol["X_test"], sol["y_test"])
+          assert acc >= 0.95, f"`cnn` reaches {acc:.3f} test accuracy; it needs 0.95. Check the five steps inside the batch loop and that the loader shuffles."
+          check_equal("test_acc", acc, tol=1e-4, msg="`test_acc` should be `accuracy(cnn, X_test, y_test)`.")
+      - instructions:
+          - "Stress-test: store `accuracy(cnn, X_shift, y_shift)` in `shifted_acc`. Print it next to `test_acc`."
+        hint: "Same function, different data: `accuracy(cnn, X_shift, y_shift)`."
+        sample_code: |
+          shifted_acc = ____
+          print(test_acc, shifted_acc)
+        solution: |
+          shifted_acc = accuracy(cnn, X_shift, y_shift)
+          print(test_acc, shifted_acc)
+        tests: |
+          check_equal("shifted_acc", tol=1e-4, msg="`shifted_acc` should be `accuracy(cnn, X_shift, y_shift)`.")
+          assert user["shifted_acc"] < user["test_acc"] - 0.2, "The shifted accuracy should be far below the clean one: that gap is the problem you will fix next."
+      - instructions:
+          - "Fix with augmentation: run `torch.manual_seed(0)`, build `robust = make_cnn()`, and train it like `cnn`, but shift every batch by a random `dx, dy` in {-1, 0, 1} before the forward pass. Train for 15 epochs."
+          - "Verify on both sets: store `robust_test_acc` (clean) and `robust_shifted_acc` and print them. You need at least `0.85` on shifted digits **and** at least `0.92` on clean ones."
+        hint: "Inside the batch loop: `dx, dy = torch.randint(-1, 2, (2,)).tolist()`, then `xb = shift(xb, dx, dy)` before `robust(xb)`."
+        sample_code: |
+          torch.manual_seed(0)
+          robust = make_cnn()
+          opt = torch.optim.Adam(robust.parameters(), lr=0.01)
+          loader = DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=True)
+          for epoch in range(15):
+              for xb, yb in loader:
+                  ____
+                  opt.zero_grad()
+                  F.cross_entropy(robust(xb), yb).backward()
+                  opt.step()
+
+          robust_test_acc = accuracy(robust, X_test, y_test)
+          robust_shifted_acc = accuracy(robust, X_shift, y_shift)
+          print(robust_test_acc, robust_shifted_acc)
+        solution: |
+          torch.manual_seed(0)
+          robust = make_cnn()
+          opt = torch.optim.Adam(robust.parameters(), lr=0.01)
+          loader = DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=True)
+          for epoch in range(15):
+              for xb, yb in loader:
+                  dx, dy = torch.randint(-1, 2, (2,)).tolist()
+                  xb = shift(xb, dx, dy)
+                  opt.zero_grad()
+                  F.cross_entropy(robust(xb), yb).backward()
+                  opt.step()
+
+          robust_test_acc = accuracy(robust, X_test, y_test)
+          robust_shifted_acc = accuracy(robust, X_shift, y_shift)
+          print(robust_test_acc, robust_shifted_acc)
+        tests: |
+          check_object("robust")
+          acc_shift = sol["accuracy"](user["robust"], sol["X_shift"], sol["y_shift"])
+          acc_clean = sol["accuracy"](user["robust"], sol["X_test"], sol["y_test"])
+          assert acc_shift >= 0.85, f"`robust` gets {acc_shift:.3f} on shifted digits; it needs 0.85. Shift every training batch with `shift(xb, dx, dy)` using a new random `dx, dy` each time."
+          assert acc_clean >= 0.92, f"`robust` gets {acc_clean:.3f} on clean digits; it needs 0.92. Shift by at most one pixel and train for 15 epochs."
+          check_equal("robust_shifted_acc", acc_shift, tol=1e-4, msg="`robust_shifted_acc` should be `accuracy(robust, X_shift, y_shift)`.")
+          check_equal("robust_test_acc", acc_clean, tol=1e-4, msg="`robust_test_acc` should be `accuracy(robust, X_test, y_test)`.")
+    success_msg: |
+      Shifted accuracy went from about 65% to about 95% while clean accuracy stayed above 95%: one line of
+      augmentation, verified on both sets. That loop of measuring what production looks like,
+      finding the gap and proving the fix is the habit to keep for every model you ship.

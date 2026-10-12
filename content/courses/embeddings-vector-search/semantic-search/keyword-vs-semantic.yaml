@@ -1,0 +1,251 @@
+title: Keyword vs semantic search
+description: How keyword search works, why semantic search is only as good as what its model learned, where each one fails, and why you should measure per query type.
+exercises:
+  - id: keyword-vs-semantic-slides
+    type: video
+    title: Two ways to match a query
+    slides: |
+      # Keyword search: match the words
+
+      An **inverted index** maps each term to the chunks that contain it, like the index at the back of a book.
+      A query scores the chunks that share its terms, and **rare terms count more** (TF-IDF, or BM25 in production):
+
+      $$\text{score}(q, c) = \sum_{t \in q \cap c} \text{tf}(t, c) \cdot \log\frac{N}{\text{df}(t)}$$
+
+      - Exact: `P-2` matches `P-2` and nothing else.
+      - Explainable: you can show which words matched.
+      - Cheap: no model, and the index updates instantly.
+      - Blind to meaning: *"evening meal"* never matches *"dinner"*.
+
+      ---
+
+      ## Semantic search is only as smart as its model
+
+      An embedding model places texts by what it learned in training.
+
+      - `aikit.embed` learned only from the handbook. It knows *spacewalk* is close to *EVA*, because they appear
+        together there, but it has never seen *"evening meal"*.
+      - `embed_general` (from this course's kit) uses the same recipe, also trained on everyday text, so it knows
+        *evening meal* is close to *dinner*. Real models are trained on billions of sentences, so they know far more.
+      - **No** model knows your station's part numbers, crew slang or ticket ids. Those never appeared in its training data.
+
+      ---
+
+      ## Where codes go to die
+
+      Tokenizers break codes apart or drop them. `aikit.embed` (like scikit-learn's default tokenizer) ignores one-character
+      tokens, so `"P-2"` becomes **nothing**:
+
+      ```python
+      np.linalg.norm(aikit.embed("P-2 is silent"))     # 0.0: the query vector is all zeros
+      ```
+
+      A zero vector scores 0 against everything, so "results" come back in **index order**. That's a telltale sign.
+      Subword models do keep pieces of the code, but `F-1` and `F-2` end up almost identical, and the surrounding
+      words dominate. Keyword search with a tokenizer that keeps `f-2` whole matches it exactly.
+
+      ---
+
+      ## Trade-offs
+
+      | | keyword (TF-IDF / BM25) | semantic (embeddings) | hybrid (both, fused) |
+      | --- | --- | --- | --- |
+      | paraphrases, synonyms | fails | **wins** | wins |
+      | codes, ids, names, rare terms | **wins** | weak | wins |
+      | typos | fails (unless fuzzy) | often ok | ok |
+      | explainable | yes | no | partly |
+      | index cost | small, instant updates | $N \times d$ floats, an embedding call per chunk | both |
+      | query latency | ~ms | embed the query (local ms, API 50-300 ms) + search | both, in parallel |
+      | failure mode | silent on rewording | silent on exact matches; zero vectors | two systems to run and tune |
+
+      ---
+
+      ## Measure per query type, not just overall
+
+      One average hides which **kind** of query fails. Split your labelled queries by type and score each retriever:
+
+      ```python
+      for name, search in retrievers.items():
+          for kind in ["exact", "paraphrase"]:
+              qs = [q for q in queries if q["kind"] == kind]
+              table[name][kind] = np.mean([hit_at_k(search(q["query"]), q["doc_ids"], 3) for q in qs])
+      ```
+
+      If keyword wins one column and semantic wins the other, neither alone is the answer. That's the next lesson.
+
+  - id: which-retriever
+    type: classify
+    title: Keyword or semantic?
+    prompt: For each crew query, which retriever on its own is more likely to find the right handbook page? The handbook uses words like "dinner", "depressurisation", "wilting" and "radiation storm".
+    hint: Exact codes, ids and names favour keyword search. Different words for the same idea favour semantic search.
+    zones: [Keyword search, Semantic search]
+    items:
+      - { text: "Is pump P-2 running?", zone: Keyword search }
+      - { text: "Show incident report INC-2026-0217", zone: Keyword search }
+      - { text: "Rules for BSL-2 samples", zone: Keyword search }
+      - { text: "What does panel E-4 log?", zone: Keyword search }
+      - { text: "Messages from Noor Haddad", zone: Keyword search }
+      - { text: "When is the evening meal?", zone: Semantic search }
+      - { text: "We are losing cabin air, what now?", zone: Semantic search }
+      - { text: "My plants look droopy", zone: Semantic search }
+      - { text: "Where do we hide from a solar flare?", zone: Semantic search }
+      - { text: "How do I phone my family?", zone: Semantic search }
+
+  - id: keyword-search-by-hand
+    type: coding
+    title: A keyword search that keeps codes
+    context: |
+      `chunk_texts` and `chunk_ids` hold the 171 handbook chunks. `TfidfVectorizer`, `np` and `aikit` are imported. The
+      vectorizer lowercases text before it tokenizes, so `P-2` arrives as `p-2`. Build a keyword search that treats codes as
+      single tokens.
+    instructions:
+      - "Complete `PATTERN` so that letters, a dash and digits (`p-2`, `scr-1`, `al-2`) form one token. The second part, already written, matches other runs of 2 or more letters or digits."
+      - "Fit `vec = TfidfVectorizer(token_pattern=PATTERN, stop_words=\"english\", sublinear_tf=True)` on `chunk_texts`, storing the matrix in `K`."
+      - "Write `keyword_search(query, k=3)`: score with `(K @ vec.transform([query]).T).toarray().ravel()` and return the top-`k` chunk ids, best first."
+      - "Store `keyword_search(\"P-2 is silent\")` in `kw_hits`, and the norm of `aikit.embed(\"P-2 is silent\")` in `semantic_norm`."
+    hint: |
+      A regex for "letters, dash, digits" is `[a-z]+-\d+`, so `PATTERN = r"[a-z]+-\d+|[a-z0-9]{2,}"`. Alternatives are tried
+      left to right, so the code pattern must come first. Use `np.argsort(-scores, kind="stable")[:k]` for the top k.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from sklearn.feature_extraction.text import TfidfVectorizer
+      from kits.embeddings_vector_search import handbook_chunks
+      _chunks = handbook_chunks()
+      chunk_texts = [c["text"] for c in _chunks]
+      chunk_ids = [c["id"] for c in _chunks]
+    sample_code: |
+      PATTERN = r"____|[a-z0-9]{2,}"
+
+      vec = TfidfVectorizer(token_pattern=PATTERN, stop_words="english", sublinear_tf=True)
+      K = ____
+
+      def keyword_search(query, k=3):
+          scores = ____
+          best = np.argsort(-scores, kind="stable")[:k]
+          return [chunk_ids[i] for i in best]
+
+      kw_hits = keyword_search("P-2 is silent")
+      semantic_norm = ____
+      print(kw_hits)
+      print(semantic_norm)
+    solution: |
+      PATTERN = r"[a-z]+-\d+|[a-z0-9]{2,}"
+
+      vec = TfidfVectorizer(token_pattern=PATTERN, stop_words="english", sublinear_tf=True)
+      K = vec.fit_transform(chunk_texts)
+
+      def keyword_search(query, k=3):
+          scores = (K @ vec.transform([query]).T).toarray().ravel()
+          best = np.argsort(-scores, kind="stable")[:k]
+          return [chunk_ids[i] for i in best]
+
+      kw_hits = keyword_search("P-2 is silent")
+      semantic_norm = float(np.linalg.norm(aikit.embed("P-2 is silent")))
+      print(kw_hits)
+      print(semantic_norm)
+    tests: |
+      import re
+      p = check_object("PATTERN")
+      toks = re.findall(p, "check p-2, scr-1 and al-2 at 06 now")
+      assert "p-2" in toks and "scr-1" in toks and "al-2" in toks, f"`PATTERN` should keep codes whole; on 'check p-2, scr-1 and al-2' it gave {toks}. Put a pattern like `[a-z]+-\\d+` before the `|`."
+      assert "check" in toks and "now" in toks, f"`PATTERN` should still match ordinary words; it gave {toks}."
+      f = check_object("keyword_search")
+      for q in ["What does F-1 display?", "Why did SCR-2 fail?", "Is DF-1 cold enough?"]:
+          assert list(f(q, 3)) == sol["keyword_search"](q, 3), f"`keyword_search({q!r}, 3)` should return the 3 best chunk ids by TF-IDF score."
+      check_equal("kw_hits", msg="`kw_hits` should be `keyword_search(\"P-2 is silent\")`.")
+      check_equal("semantic_norm", 0.0, msg="`semantic_norm` should be `np.linalg.norm(aikit.embed(\"P-2 is silent\"))`, which is 0.0.")
+    success_msg: Keyword search finds both chunks that mention P-2. The embedding of the same query is all zeros, so semantic search can only return chunks in index order. Codes need an exact-match path.
+
+  - id: compare-per-kind
+    type: coding
+    title: Who wins which kind of query?
+    context: |
+      `queries` holds 24 labelled crew queries, each a dict with `query`, `doc_ids` and `kind` (`"exact"` uses a part
+      or panel code, `"paraphrase"` uses everyday words). `retrievers` maps a name to a function that returns ranked doc
+      ids for a query: `"keyword"`, `"small model"` (`aikit.embed`) and `"general model"` (`embed_general`).
+      `hit_at_k(ranked, relevant, k)` is imported.
+    instructions:
+      - "For every retriever and each kind, compute the mean hit@3 over the queries of that kind."
+      - "Store the results in a pandas DataFrame `table` with one **row per retriever** (index: the names) and one **column per kind** (`exact`, `paraphrase`)."
+      - "Store the name of the retriever with the best `paraphrase` score in `best_paraphrase`, and the best `exact` one in `best_exact`, then print `table`."
+    hint: |
+      Build a nested dict, `results[name][kind] = np.mean([...])`, then `pd.DataFrame(results).T`.
+      `table["paraphrase"].idxmax()` gives the best row's name.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      import aikit
+      from kits.embeddings_vector_search import HybridSearch, crew_queries, hit_at_k
+      queries = crew_queries(["exact", "paraphrase"])
+      _kw, _small, _general = HybridSearch(alpha=0.0), HybridSearch(alpha=1.0, embed=aikit.embed), HybridSearch(alpha=1.0)
+      retrievers = {
+          "keyword": lambda q: _kw.search(q, k=10),
+          "small model": lambda q: _small.search(q, k=10),
+          "general model": lambda q: _general.search(q, k=10),
+      }
+    sample_code: |
+      results = {}
+      for name, search in retrievers.items():
+          results[name] = {}
+          for kind in ["exact", "paraphrase"]:
+              qs = [q for q in queries if q["kind"] == kind]
+              results[name][kind] = ____
+
+      table = ____
+      best_paraphrase = ____
+      best_exact = ____
+      print(table.round(2))
+    solution: |
+      results = {}
+      for name, search in retrievers.items():
+          results[name] = {}
+          for kind in ["exact", "paraphrase"]:
+              qs = [q for q in queries if q["kind"] == kind]
+              results[name][kind] = np.mean([hit_at_k(search(q["query"]), q["doc_ids"], 3) for q in qs])
+
+      table = pd.DataFrame(results).T
+      best_paraphrase = table["paraphrase"].idxmax()
+      best_exact = table["exact"].idxmax()
+      print(table.round(2))
+    tests: |
+      import numpy as np
+      t = check_object("table")
+      s = sol["table"]
+      assert set(t.index) == set(s.index), f"`table` should have one row per retriever ({list(s.index)}); its index is {list(t.index)}. Did you transpose with `.T`?"
+      assert set(t.columns) >= {"exact", "paraphrase"}, f"`table` should have columns 'exact' and 'paraphrase'; got {list(t.columns)}."
+      for r in s.index:
+          for c in ["exact", "paraphrase"]:
+              assert abs(float(t.loc[r, c]) - float(s.loc[r, c])) < 1e-9, f"table[{c!r}] for {r!r} should be {s.loc[r, c]:.3f}, got {float(t.loc[r, c]):.3f}. Use hit@3: `hit_at_k(search(q['query']), q['doc_ids'], 3)`."
+      check_equal("best_paraphrase", msg="`best_paraphrase` should be the row with the highest 'paraphrase' score.")
+      check_equal("best_exact", msg="`best_exact` should be the row with the highest 'exact' score.")
+    success_msg: Keyword search wins on codes, and the general model wins on paraphrases. The small model is no better than keyword search on paraphrases, because it never learned everyday words. An overall average would have hidden both facts.
+
+  - id: predict-evening-meal
+    type: mc
+    title: Predict, then run
+    question: |
+      The handbook says *"dinner at 19:00"*. A crew member asks *"When is the evening meal?"*. Which retrievers put
+      `galley-and-meals` in their top 3?
+    context: The console has `retrievers` from the previous exercise. Predict, then run `retrievers[name]("When is the evening meal?")[:3]` for each name.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import HybridSearch
+      _kw, _small, _general = HybridSearch(alpha=0.0), HybridSearch(alpha=1.0, embed=aikit.embed), HybridSearch(alpha=1.0)
+      retrievers = {
+          "keyword": lambda q: _kw.search(q, k=10),
+          "small model": lambda q: _small.search(q, k=10),
+          "general model": lambda q: _general.search(q, k=10),
+      }
+    options:
+      - text: All three, because "meal" appears in the page title.
+        feedback: "The chunks are sentences without the title, and no sentence says 'meal'. Keyword search instead latches onto 'evening' in the EVA checklist ('starts the evening before')."
+      - text: Only keyword search.
+        feedback: "Keyword search needs shared words. 'Evening' matches the EVA checklist, and nothing on the galley page says 'evening' or 'meal'."
+      - text: Only the general model.
+        correct: true
+        feedback: "Right. Only a model that learned everyday language links 'evening meal' to 'dinner'. The small model learned only from the handbook, so it has no idea, and neither does keyword search."
+      - text: Both embedding models, since semantic search understands meaning.
+        feedback: "Semantic search understands only what its model learned. `aikit.embed` never saw 'evening meal', so for it the phrase carries almost no signal."
+    hint: Which of the three has seen everyday English, not just the handbook?

@@ -1,0 +1,295 @@
+title: Retrieval or generation? Diagnosing failures
+description: Sort every failure by the stage that caused it, route each bucket to the right fix, and watch failures move between buckets as you fix them.
+exercises:
+  - id: diagnosis-slides
+    type: video
+    title: Find the stage that failed
+    slides: |
+      # The first question: did the model see the evidence?
+
+      A wrong answer has many possible causes, and most RAG debugging time is lost fixing the wrong stage: rewriting
+      prompts when the document was never retrieved, or swapping embedding models when the chunk was retrieved and
+      misread.
+
+      For every failed question, check two things you already have in the eval rows:
+
+      1. **`hit`**: were all the gold documents among the retrieved chunks?
+      2. **The answer**: wrong, a refusal, or an answer to an unanswerable question?
+
+      That's enough to put each failure in exactly one bucket, with no LLM judge and no guessing.
+
+      ---
+
+      ## Four buckets
+
+      | bucket | test | what it means |
+      | --- | --- | --- |
+      | **retrieval miss** | answerable, `hit` is False | the model never saw the fact |
+      | **generation error** | answerable, `hit` is True, wrong answer | the fact was there and the reader got it wrong |
+      | **over-refused** | answerable, `hit` is True, a refusal | the fact was there and ORBIT said "I don't know" |
+      | **should have refused** | unanswerable, an answer | nothing to find, and ORBIT answered anyway |
+
+      **Sanity-check the labels too.** When you read failures, you'll sometimes find that ORBIT was right and the gold
+      label is wrong, or the question is ambiguous. Fix the test set, not the system. A bad label costs you twice: a
+      false failure now, and a "fix" that makes things worse.
+
+      ---
+
+      ## Route each bucket to its fixes
+
+      | bucket | check first | fixes, cheapest first |
+      | --- | --- | --- |
+      | retrieval miss | the rank of the gold doc; the query's words vs the doc's words | raise k; hybrid search; query rewriting; chunking and titles; a better embedding model |
+      | generation error | read the retrieved chunks next to the answer | chunk boundaries (split facts); titles; rerank so the best chunk comes first; clearer prompt; a stronger model |
+      | over-refused | the confidence score of these questions | lower the threshold for this topic; better evidence (rerank, chunking) to raise their scores |
+      | should have refused | the score and the chunk it quoted | add or raise the refusal threshold; a support check; watch for rewrite drift |
+
+      Fix the **biggest bucket** first, then **re-bucket**: fixes move failures around.
+
+      ---
+
+      ## Failures move between buckets
+
+      The weak ORBIT prototype (whole docs, dense, k=1) on 77 questions:
+
+      | | retrieval miss | generation error | over-refused | should have refused | cost (5 × wrong + refusals) |
+      | --- | --- | --- | --- | --- | --- |
+      | prototype | **12** | 0 | 3 | 5 | 64 |
+      | + chapter 3 retrieval | 1 | 2 | 0 | **9** | 60 |
+      | + refusal gate | 3 | 0 | 19 | 2 | 36 |
+
+      Better retrieval fixed 11 misses and *created* "should have refused" failures: with good chunks in hand, ORBIT
+      quotes near-misses confidently, and rewriting broadened a few queries. The gate then traded those for
+      over-refusals, which cost less. Each step was chosen by **the current biggest bucket**, and each was verified by
+      **re-bucketing**, not by eyeballing a few answers.
+
+  - id: label-failures
+    type: classify
+    title: "Trace detective: which stage failed?"
+    prompt: |
+      Each line is a failed ORBIT trace: the question, the documents retrieved and the answer. Put each one in the bucket of the stage that failed.
+    hint: First ask whether the question is answerable from the handbook. If it is, ask whether the right document was retrieved. If it was, ask whether ORBIT answered wrongly or refused.
+    zones: [Retrieval miss, Generation error, Over-refused, Should have refused]
+    items:
+      - { text: "Leak-check hold? Retrieved: docking-procedures, galley-and-meals. Answer: \"after a 2-hour leak check\"", zone: Retrieval miss }
+      - { text: "What is kept in DF-1? Retrieved: orbit-assistant-policy, crew-quarters. Answer: \"I don't know\"", zone: Retrieval miss }
+      - { text: "When do the plant lamps turn on? Retrieved: daily-schedule, galley-and-meals. Answer: \"I don't know\"", zone: Retrieval miss }
+      - { text: "Who owns the hydroponics schedule, and what is their role? Retrieved: hydroponics-schedule, crew-roster. Answer names Kenji Watanabe, but no role", zone: Generation error }
+      - { text: "Who can open the medicines cabinet? Retrieved: med-bay-access. Answer: \"The cabinet needs a code.\"", zone: Generation error }
+      - { text: "What caused the 2025 flood? Retrieved: incident-2025-hydro-flood. Answer: \"I don't know\"", zone: Over-refused }
+      - { text: "What time is dinner? Retrieved: galley-and-meals (top score below the gate). Answer: \"I don't know\"", zone: Over-refused }
+      - { text: "What is the Wi-Fi password? Retrieved: it-network. Answer: \"ORBIT never asks for a password.\"", zone: Should have refused }
+      - { text: "How many litres does the nutrient tank hold? Retrieved: water-recycling. Answer: \"2,400 litres\"", zone: Should have refused }
+      - { text: "How much does a Heron arm cost? Retrieved: robotic-arm. Answer: \"The Heron robotic arm is 17 metres long.\"", zone: Should have refused }
+
+  - id: bucket-failures
+    type: coding
+    title: Bucket the failures in code
+    context: |
+      `rows` is the `evaluate(...)["rows"]` DataFrame for ORBIT's prototype on 77 questions. Each row has `correct`,
+      `gold` (the gold doc ids; empty for unanswerables), `hit` (all gold docs retrieved) and `answer`.
+      `is_refusal(answer)` tells you whether an answer is a refusal.
+    instructions:
+      - "Write `bucket(row)`: return `None` for a correct row; otherwise `\"should have refused\"` if `gold` is empty, `\"retrieval miss\"` if `hit` is False, `\"over-refused\"` if the answer is a refusal, and `\"generation error\"` otherwise."
+      - "Store a dict of counts per bucket in `counts`, with all four bucket names as keys (include zeros)."
+      - "Store the bucket with the most failures in `top_cause`, and print `counts` and `top_cause`."
+    hint: |
+      Check the rules in order: correct first, then `not row["gold"]`, then `not row["hit"]`, then `is_refusal(row["answer"])`.
+      Build `labels = [bucket(r) for _, r in rows.iterrows()]` and count each name with `labels.count(name)`.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import (DenseIndex, make_chunks, evaluate, questions, SLANG_QUESTIONS, EXTRA_UNANSWERABLE,
+                                    is_refusal)
+      prototype = DenseIndex(make_chunks(aikit.helios.handbook(), title=False)).search
+      rows = evaluate(prototype, questions() + SLANG_QUESTIONS + EXTRA_UNANSWERABLE, k=1)["rows"]
+      NAMES = ["retrieval miss", "generation error", "over-refused", "should have refused"]
+      print(rows[["id", "hit", "correct", "answer"]].head())
+    sample_code: |
+      def bucket(row):
+          if row["correct"]:
+              return None
+          if ____:
+              return "should have refused"
+          if ____:
+              return "retrieval miss"
+          return ____
+
+      labels = [bucket(r) for _, r in rows.iterrows()]
+      counts = {name: ____ for name in NAMES}
+      top_cause = ____
+      print(counts, top_cause)
+    solution: |
+      def bucket(row):
+          if row["correct"]:
+              return None
+          if not row["gold"]:
+              return "should have refused"
+          if not row["hit"]:
+              return "retrieval miss"
+          return "over-refused" if is_refusal(row["answer"]) else "generation error"
+
+      labels = [bucket(r) for _, r in rows.iterrows()]
+      counts = {name: labels.count(name) for name in NAMES}
+      top_cause = max(counts, key=counts.get)
+      print(counts, top_cause)
+    tests: |
+      check_object("bucket")
+      from kits.rag_systems import failure_bucket
+      for _, r in user["rows"].iterrows():
+          got, want = user["bucket"](r), failure_bucket(r)
+          assert got == want, f"Question {r['id']} should be {want!r}, got {got!r}. Check the rules in order: correct, unanswerable, retrieval miss, refusal."
+      check_equal("counts")
+      check_equal("top_cause", msg="`top_cause` should be the bucket name with the highest count.")
+    success_msg: |
+      12 of the 20 failures are retrieval misses, so the prototype's main problem is that it doesn't show the model the
+      facts. A better prompt or a bigger model would have fixed none of them. The next mission routes the fix accordingly.
+
+  - id: diagnosis-mission
+    type: sequential
+    title: "Mission: fix ORBIT, one bucket at a time"
+    context: |
+      ORBIT's prototype (whole docs, dense, **k=1**) runs on all 77 questions: handbook, identifier, slang and near-miss
+      unanswerable. Safety review set the cost of mistakes: **a wrong answer costs 5, a refusal of an answerable question costs 1**.
+
+      Ready to use: `prototype`, `QS`, `failure_buckets(rows)` (counts per bucket), `mistake_cost(rows)` (the 5:1 cost),
+      `evaluate`, `evaluate_pipeline`, and the chapter 3 parts `hybrid`, `reranker`, `rewrite(question)`, `gen` and `generate`.
+    pre_code: |
+      import aikit
+      import pandas as pd
+      from kits.rag_systems import (DenseIndex, HybridIndex, CrossEncoder, make_chunks, orbit_chunks, make_client, rewriter,
+                                    generate, evaluate, evaluate_pipeline, questions, SLANG_QUESTIONS, EXTRA_UNANSWERABLE,
+                                    failure_buckets, mistake_cost, REFUSAL, MODEL)
+      QS = questions() + SLANG_QUESTIONS + EXTRA_UNANSWERABLE
+      prototype = DenseIndex(make_chunks(aikit.helios.handbook(), title=False)).search
+      hybrid = HybridIndex(orbit_chunks()).search
+      reranker, gen, rw_client = CrossEncoder(), make_client(), make_client(rewriter())
+
+      def rewrite(question):
+          r = rw_client.messages.create(model=MODEL, max_tokens=100, system="Rewrite the crew member's question as a standalone search query that uses the handbook's terms. Reply with the query only.",
+                                        messages=[{"role": "user", "content": f"<query>{question}</query>"}])
+          return r.content[0].text.strip()
+    steps:
+      - instructions:
+          - "**Measure.** Evaluate `prototype` on `QS` with `k=1` into `before`."
+          - "Store `failure_buckets(before[\"rows\"])` in `before_buckets` and `mistake_cost(before[\"rows\"])` in `before_cost`. Print both with the accuracy."
+        hint: "`before = evaluate(prototype, QS, k=1)`"
+        sample_code: |
+          before = ____
+          before_buckets = ____
+          before_cost = ____
+          print(before["accuracy"], before_buckets, before_cost)
+        solution: |
+          before = evaluate(prototype, QS, k=1)
+          before_buckets = failure_buckets(before["rows"])
+          before_cost = mistake_cost(before["rows"])
+          print(before["accuracy"], before_buckets, before_cost)
+        tests: |
+          check_equal("before_buckets", msg="`before_buckets` should be `failure_buckets(before['rows'])` for `evaluate(prototype, QS, k=1)`.")
+          check_equal("before_cost")
+      - instructions:
+          - "**Fix the biggest bucket.** Retrieval misses dominate. Write `rag(question)` that returns `(answer, chunks)` using better retrieval: any mix of hybrid search, reranking (`reranker.rerank(query, candidates, k)`), rewriting and k up to 5."
+          - "Store `evaluate_pipeline(rag, QS)` in `mid` and `failure_buckets(mid[\"rows\"])` in `mid_buckets`. Print them."
+          - "Pass when retrieval misses are at most 4 and accuracy is at least 0.8."
+        hint: |
+          The chapter 3 pipeline works: `q2 = rewrite(question)`, `chunks = reranker.rerank(q2, hybrid(q2, 20), 3)`,
+          `return generate(gen, q2, chunks), chunks`.
+        sample_code: |
+          def rag(question):
+              q2 = ____
+              chunks = ____
+              return generate(gen, q2, chunks), chunks
+
+          mid = evaluate_pipeline(rag, QS)
+          mid_buckets = failure_buckets(mid["rows"])
+          print(mid["accuracy"], mid_buckets, mistake_cost(mid["rows"]))
+        solution: |
+          def rag(question):
+              q2 = rewrite(question)
+              chunks = reranker.rerank(q2, hybrid(q2, 20), 3)
+              return generate(gen, q2, chunks), chunks
+
+          mid = evaluate_pipeline(rag, QS)
+          mid_buckets = failure_buckets(mid["rows"])
+          print(mid["accuracy"], mid_buckets, mistake_cost(mid["rows"]))
+        tests: |
+          from kits.rag_systems import failure_buckets
+          m = check_object("mid")
+          b = check_object("mid_buckets")
+          assert b == failure_buckets(m["rows"]), "`mid_buckets` should be `failure_buckets(mid['rows'])`."
+          assert max(len(c) for c in m["rows"]["retrieved"]) <= 5, "Use at most 5 chunks per question."
+          assert b["retrieval miss"] <= 4, f"Retrieval misses are {b['retrieval miss']}; get them to 4 or fewer with hybrid search, reranking and rewriting."
+          assert m["accuracy"] >= 0.8, f"Accuracy is {m['accuracy']}; it should reach at least 0.8."
+      - instructions:
+          - "**Re-bucket and fix the new biggest bucket.** \"Should have refused\" now leads. Write `gated_rag(question)`: like `rag`, but return `(REFUSAL, chunks)` without calling the model when the top chunk's `rerank_score` is below a threshold you choose."
+          - "Store `evaluate_pipeline(gated_rag, QS)` in `after`, then `failure_buckets` and `mistake_cost` of its rows in `after_buckets` and `after_cost`."
+          - "Pass when \"should have refused\" is at most 3 and the cost is at most 60% of `before_cost`."
+        hint: |
+          After reranking, `if chunks[0]["rerank_score"] < 0.9: return REFUSAL, chunks`. Try a few thresholds and watch
+          the cost: too low leaves wrong answers, too high refuses everything.
+        sample_code: |
+          TAU = ____
+
+          def gated_rag(question):
+              q2 = rewrite(question)
+              chunks = reranker.rerank(q2, hybrid(q2, 20), 3)
+              if ____:
+                  return REFUSAL, chunks
+              return generate(gen, q2, chunks), chunks
+
+          after = evaluate_pipeline(gated_rag, QS)
+          after_buckets = ____
+          after_cost = ____
+          print(after["accuracy"], after_buckets, after_cost, "vs", before_cost)
+        solution: |
+          TAU = 0.9
+
+          def gated_rag(question):
+              q2 = rewrite(question)
+              chunks = reranker.rerank(q2, hybrid(q2, 20), 3)
+              if chunks[0]["rerank_score"] < TAU:
+                  return REFUSAL, chunks
+              return generate(gen, q2, chunks), chunks
+
+          after = evaluate_pipeline(gated_rag, QS)
+          after_buckets = failure_buckets(after["rows"])
+          after_cost = mistake_cost(after["rows"])
+          print(after["accuracy"], after_buckets, after_cost, "vs", before_cost)
+        tests: |
+          from kits.rag_systems import failure_buckets, mistake_cost
+          a = check_object("after")
+          b = check_object("after_buckets")
+          assert b == failure_buckets(a["rows"]), "`after_buckets` should be `failure_buckets(after['rows'])`."
+          c = check_object("after_cost")
+          assert c == mistake_cost(a["rows"]), "`after_cost` should be `mistake_cost(after['rows'])`."
+          assert b["should have refused"] <= 3, f"ORBIT still answers {b['should have refused']} unanswerable questions; raise the threshold."
+          limit = 0.6 * user["before_cost"]
+          assert c <= limit, f"Cost is {c}; it must be at most {limit:.1f} (60% of the prototype's {user['before_cost']}). If over-refusals exploded, lower the threshold; if wrong answers remain, raise it."
+      - instructions:
+          - "**Verify and report.** Build `report`, a DataFrame indexed `\"prototype\"`, `\"better retrieval\"` and `\"+ refusal gate\"`, with the four bucket counts as columns plus `accuracy` and `cost`."
+          - Print `report`.
+        hint: |
+          For each of `before`, `mid` and `after`, build `{**failure_buckets(r["rows"]), "accuracy": r["accuracy"], "cost": mistake_cost(r["rows"])}`.
+        sample_code: |
+          stages = {"prototype": before, "better retrieval": mid, "+ refusal gate": after}
+          report = pd.DataFrame.from_dict(
+              {name: {**failure_buckets(r["rows"]), "accuracy": ____, "cost": ____} for name, r in stages.items()},
+              orient="index")
+          print(report)
+        solution: |
+          stages = {"prototype": before, "better retrieval": mid, "+ refusal gate": after}
+          report = pd.DataFrame.from_dict(
+              {name: {**failure_buckets(r["rows"]), "accuracy": r["accuracy"], "cost": mistake_cost(r["rows"])} for name, r in stages.items()},
+              orient="index")
+          print(report)
+        tests: |
+          r = check_object("report")
+          assert list(r.index) == ["prototype", "better retrieval", "+ refusal gate"], "Index the report by 'prototype', 'better retrieval' and '+ refusal gate'."
+          for col in ["retrieval miss", "generation error", "over-refused", "should have refused", "accuracy", "cost"]:
+              assert col in r.columns, f"`report` needs a `{col}` column."
+          check_equal("report")
+    success_msg: |
+      You fixed ORBIT the way it's done in production: measure, bucket, fix the biggest bucket, re-bucket. Retrieval fixes
+      turned 12 misses into 1, the new leading bucket (answering the unanswerable) was handled by a gate, and the cost of
+      mistakes fell by almost half. Accuracy went down at the last step, and that was the right call: at a 5:1 cost ratio,
+      19 cheap refusals are better than a dozen confident wrong answers. That trade-off, measured and written down, is what you
+      bring to the capstone.

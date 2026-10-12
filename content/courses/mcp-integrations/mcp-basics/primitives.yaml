@@ -1,0 +1,321 @@
+title: Tools, resources and prompts
+description: MCP's three server primitives, who controls each one, and what goes wrong when you pick the wrong one.
+exercises:
+  - id: primitives-slides
+    type: video
+    title: Three primitives, three controllers
+    slides: |
+      # Who decides?
+
+      A server can offer three kinds of things. The difference is **who decides when they're used**.
+
+      | primitive | controlled by | the question it answers | Helios example |
+      | --- | --- | --- | --- |
+      | **Tools** | the **model** | "should I call something now?" | `get_sensor`, `book_module` |
+      | **Resources** | the **application** (host) | "what context should I attach?" | `handbook://airlock-procedure` |
+      | **Prompts** | the **user** | "which template do I want?" | an `/incident-report` slash command |
+
+      Tools are like POST endpoints the model can hit. Resources are like GET-able files the host reads
+      and puts in context. Prompts are templates the user picks from a menu.
+
+      ---
+
+      ## What each one looks like when listed
+
+      ```python
+      # one entry of tools/list
+      {"name": "get_sensor", "title": "Read a sensor",
+       "description": "Read one environment sensor in a station module.",
+       "inputSchema": {"type": "object",
+                       "properties": {"module": {"type": "string", "enum": ["A","B","C","D","E","F"]}},
+                       "required": ["module"]},
+       "annotations": {"readOnlyHint": True}}
+
+      # one entry of resources/list
+      {"uri": "handbook://airlock-procedure", "name": "airlock-procedure",
+       "title": "Airlock procedure (AL-1)", "mimeType": "text/markdown"}
+
+      # one entry of prompts/list
+      {"name": "incident-report", "description": "Draft an incident report",
+       "arguments": [{"name": "module", "description": "Module letter", "required": True}]}
+      ```
+
+      Note the spelling: MCP uses **`inputSchema`** (camelCase), while the Anthropic API calls the same
+      thing `input_schema`. The host translates between them. Annotations such as `readOnlyHint` and
+      `destructiveHint` are **hints** from the server, and only as trustworthy as the server.
+
+      ---
+
+      ## Servers can ask the client too
+
+      Some features run the other way. The client declares them in the handshake, and a server can use
+      them only if the client said yes:
+
+      - **Sampling**: the server asks the host's model for a completion, so the server needs no API key of its own.
+      - **Roots**: the host tells the server which folders or URIs it may work in.
+      - **Elicitation** (newer revisions): the server asks the *user* a question through the host.
+
+      Plus **notifications**, e.g. `notifications/tools/list_changed` ("my tool list changed, list again").
+
+      ---
+
+      ## Same data, three ways to expose it
+
+      The handbook could be a resource, a search tool, or a prompt that embeds a document.
+
+      | | resource (host attaches) | `search_handbook` tool (model calls) | prompt (user picks) |
+      | --- | --- | --- | --- |
+      | who chooses the doc | host code: deterministic | the model, per question | the user |
+      | extra model round trips | 0 | 1 or more per question | 0 |
+      | token cost | what you attach | tool definition + results | the template |
+      | typical failure | host attaches the wrong doc, or none | model doesn't call it, or calls it 5 times | only works when the user remembers it |
+      | wins when | the context is predictable | the question decides what's needed | a repeatable workflow |
+
+      ---
+
+      ## Playbook: "the model can't see the server's data"
+
+      **Symptom:** the handbook server is connected, yet ORBIT invents answers.
+
+      **Check first:** what the server *declared* in the handshake, and which primitive holds the data.
+      Tools reach the model automatically; **resources reach it only if the host attaches them**.
+
+      Usual causes, most common first:
+      1. The data is a **resource** and the host never attaches resources (many hosts wait for the user to pick them).
+      2. The host attaches resources, but picks the **wrong ones** because titles and descriptions are vague.
+      3. It's a tool, but its **description** doesn't say when to use it, so the model never calls it.
+
+      Fixes, cheapest first: attach the few relevant resources from host code; or add a search
+      tool (one more round trip per question); or attach everything (simple, but many times the tokens).
+      **Verify** on a fixed set of questions: accuracy *and* tokens per question.
+
+  - id: sort-primitives
+    type: classify
+    title: Tool, resource or prompt?
+    prompt: Each item is something a Helios server could offer. Sort it by the primitive that fits best, based on who should decide when it's used.
+    hint: If the model decides mid-conversation, it's a tool. If the app picks context to attach, it's a resource. If a person chooses it from a menu, it's a prompt.
+    zones: [Tool, Resource, Prompt]
+    items:
+      - { text: "Read the CO2 level in Module E right now", zone: Tool }
+      - { text: "Book the lab for Kenji tomorrow at 09:00", zone: Tool }
+      - { text: "Send a message to the commander", zone: Tool }
+      - { text: "The airlock procedure, attached by the app whenever an EVA is being planned", zone: Resource }
+      - { text: "Today's crew schedule, listed in the app's sidebar so the user can attach it", zone: Resource }
+      - { text: "A maintenance log at logs://2026-08-12 that the host can fetch", zone: Resource }
+      - { text: "A /incident-report slash command the crew picks from a menu", zone: Prompt }
+      - { text: "A 'Summarise my shift' template with a crew_member argument", zone: Prompt }
+      - { text: "A 'Plan an EVA' starter the commander chooses, which pre-fills the checklist questions", zone: Prompt }
+
+  - id: write-definitions
+    type: coding
+    title: Write the three definitions by hand
+    context: |
+      Before using any SDK, write what a Helios server would return in `tools/list`, `resources/list` and
+      `prompts/list`. `definition_problems(kind, d)` checks a definition's shape and explains what's wrong.
+    instructions:
+      - "`sensor_tool`: name `get_sensor`, a description of at least 20 characters, and an `inputSchema` of type `object` with string properties `module` (enum `A`-`F`) and `metric` (enum `temperature`, `humidity`, `co2`, `o2`, `pressure`), both required."
+      - "`airlock_resource`: uri `handbook://airlock-procedure`, name `airlock-procedure`, a `title`, and mimeType `text/markdown`."
+      - "`incident_prompt`: name `incident-report`, a description, and `arguments`: `module` (required) and `severity` (`\"required\": False`)."
+      - "Print `definition_problems(kind, d)` for all three; each should be an empty list."
+    hint: |
+      The schema is `{"type": "object", "properties": {"module": {"type": "string", "enum": [...]}, ...}, "required": ["module", "metric"]}`.
+      Prompt arguments are a list of dicts: `[{"name": "module", "description": "...", "required": True}, ...]`.
+    pre_code: |
+      from kits.mcp_integrations import definition_problems
+    sample_code: |
+      sensor_tool = {
+          "name": "get_sensor",
+          "description": ____,
+          "inputSchema": ____,
+      }
+
+      airlock_resource = {
+          "uri": ____,
+          "name": "airlock-procedure",
+          "title": "Airlock procedure (AL-1)",
+          "mimeType": ____,
+      }
+
+      incident_prompt = {
+          "name": "incident-report",
+          "description": "Draft an incident report for a station module.",
+          "arguments": ____,
+      }
+
+      for kind, d in [("tool", sensor_tool), ("resource", airlock_resource), ("prompt", incident_prompt)]:
+          print(kind, definition_problems(kind, d))
+    solution: |
+      sensor_tool = {
+          "name": "get_sensor",
+          "description": "Read one environment sensor in a Helios-7 station module.",
+          "inputSchema": {
+              "type": "object",
+              "properties": {
+                  "module": {"type": "string", "enum": ["A", "B", "C", "D", "E", "F"]},
+                  "metric": {"type": "string", "enum": ["temperature", "humidity", "co2", "o2", "pressure"]},
+              },
+              "required": ["module", "metric"],
+          },
+      }
+
+      airlock_resource = {
+          "uri": "handbook://airlock-procedure",
+          "name": "airlock-procedure",
+          "title": "Airlock procedure (AL-1)",
+          "mimeType": "text/markdown",
+      }
+
+      incident_prompt = {
+          "name": "incident-report",
+          "description": "Draft an incident report for a station module.",
+          "arguments": [
+              {"name": "module", "description": "Module letter, A to F", "required": True},
+              {"name": "severity", "description": "low, normal or high", "required": False},
+          ],
+      }
+
+      for kind, d in [("tool", sensor_tool), ("resource", airlock_resource), ("prompt", incident_prompt)]:
+          print(kind, definition_problems(kind, d))
+    tests: |
+      dp = user["definition_problems"]
+      for kind, name in [("tool", "sensor_tool"), ("resource", "airlock_resource"), ("prompt", "incident_prompt")]:
+          check_object(name)
+          probs = dp(kind, user[name])
+          assert not probs, f"`{name}`: {probs[0]}."
+      t = user["sensor_tool"]
+      assert t["name"] == "get_sensor", "The tool's name should be `get_sensor`."
+      props = t["inputSchema"]["properties"]
+      assert set(props) == {"module", "metric"}, "`inputSchema.properties` should have exactly `module` and `metric`."
+      assert list(props["module"].get("enum", [])) == list("ABCDEF"), "`module` needs `\"enum\": [\"A\", \"B\", \"C\", \"D\", \"E\", \"F\"]`."
+      assert sorted(props["metric"].get("enum", [])) == sorted(["temperature", "humidity", "co2", "o2", "pressure"]), "`metric` needs an enum of the five metrics."
+      assert sorted(t["inputSchema"].get("required", [])) == ["metric", "module"], "Both `module` and `metric` should be in `required`."
+      r = user["airlock_resource"]
+      assert r["uri"] == "handbook://airlock-procedure" and r["mimeType"] == "text/markdown", "Use uri `handbook://airlock-procedure` and mimeType `text/markdown`."
+      p = user["incident_prompt"]
+      args = {a["name"]: a.get("required", False) for a in p["arguments"]}
+      assert args == {"module": True, "severity": False}, "The prompt's arguments should be `module` (required: True) and `severity` (required: False)."
+    success_msg: |
+      These dicts are exactly what goes over the wire. FastMCP builds the same `inputSchema` from your type
+      hints and the description from your docstring, which is why docstrings in MCP servers matter so much.
+
+  - id: handbook-mission
+    type: sequential
+    title: "Mission: ORBIT can't see the handbook"
+    context: |
+      The crew connected the `helios-handbook` server to ORBIT, yet ORBIT still makes up answers about
+      station procedures. Measure the problem, find which primitive the server uses, fix the host, and
+      prove the fix on eight crew questions. `llm` is ORBIT's model (it answers only from `<document>`
+      tags in the prompt), `ask_model(prompt)` returns `(answer_text, input_tokens)`, `QUESTIONS` holds
+      the eight questions and `score_answers(answers)` returns the share answered correctly.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.mcp_integrations import MCPClient, handbook_server, HANDBOOK_QUESTIONS, score_answers, MODEL
+      llm = aikit.FakeClaude(aikit.grounded(), clock=aikit.VirtualClock())
+      handbook = handbook_server()
+      QUESTIONS = [q for q, _ in HANDBOOK_QUESTIONS]
+
+      def ask_model(prompt):
+          m = llm.messages.create(model=MODEL, max_tokens=300, messages=[{"role": "user", "content": prompt}])
+          return m.text, m.usage.input_tokens
+    steps:
+      - instructions:
+          - "**Measure the symptom.** Ask the model every question in `QUESTIONS` as-is and keep the answer texts in `baseline_answers`."
+          - "Store `baseline = score_answers(baseline_answers)` and print it with the first answer."
+        hint: "`baseline_answers = [ask_model(q)[0] for q in QUESTIONS]`"
+        sample_code: |
+          baseline_answers = ____
+          baseline = ____
+          print(baseline, baseline_answers[0])
+        solution: |
+          baseline_answers = [ask_model(q)[0] for q in QUESTIONS]
+          baseline = score_answers(baseline_answers)
+          print(baseline, baseline_answers[0])
+        tests: |
+          check_equal("baseline_answers", msg="Ask each question in `QUESTIONS` with `ask_model(q)` and keep element `[0]`, the text.")
+          check_equal("baseline", 0.0, msg="`baseline` should be `score_answers(baseline_answers)`.")
+      - instructions:
+          - "**Diagnose.** Connect: `client = MCPClient(handbook)`, then `info = client.initialize()`."
+          - "Store `declared`: the sorted list of capability names in `info[\"capabilities\"]`."
+          - "Store `resources = client.list_resources()` and print `declared`, `len(resources)` and `resources[0]`."
+        hint: "`declared = sorted(info[\"capabilities\"])`"
+        sample_code: |
+          client = ____
+          info = client.initialize()
+          declared = ____
+          resources = ____
+          print(declared, len(resources), resources[0])
+        solution: |
+          client = MCPClient(handbook)
+          info = client.initialize()
+          declared = sorted(info["capabilities"])
+          resources = client.list_resources()
+          print(declared, len(resources), resources[0])
+        tests: |
+          check_equal("declared", ["resources"], msg="`declared` should be `sorted(info['capabilities'])`. It shows the server offers only resources: no tools.")
+          check_equal("resources", msg="Store the result of `client.list_resources()` in `resources`.")
+      - instructions:
+          - "**Fix the host.** Resources are application-controlled, so ORBIT's host must attach them. Finish `answer(question, k=2)`: it ranks resources by similarity between the question and each resource's title + description, reads the top `k` through the client, and wraps each in `<document id=\"...\">` tags."
+          - "Read a resource's text with `client.read_resource(uri)[\"contents\"][0][\"text\"]`."
+        hint: |
+          `text = client.read_resource(r["uri"])["contents"][0]["text"]`. The similarity line is already
+          written: `card_vecs @ aikit.embed(question)` gives one cosine score per resource.
+        sample_code: |
+          cards = [r["title"] + ". " + r.get("description", "") for r in resources]
+          card_vecs = aikit.embed(cards)
+
+          def answer(question, k=2):
+              sims = card_vecs @ aikit.embed(question)
+              top = np.argsort(-sims)[:k]
+              docs = ""
+              for i in top:
+                  r = resources[i]
+                  text = ____
+                  docs += f'<document id="{r["name"]}">\n{text}\n</document>\n'
+              return ask_model(docs + "\nQuestion: " + question)
+
+          print(answer("How often is lettuce harvested?"))
+        solution: |
+          cards = [r["title"] + ". " + r.get("description", "") for r in resources]
+          card_vecs = aikit.embed(cards)
+
+          def answer(question, k=2):
+              sims = card_vecs @ aikit.embed(question)
+              top = np.argsort(-sims)[:k]
+              docs = ""
+              for i in top:
+                  r = resources[i]
+                  text = client.read_resource(r["uri"])["contents"][0]["text"]
+                  docs += f'<document id="{r["name"]}">\n{text}\n</document>\n'
+              return ask_model(docs + "\nQuestion: " + question)
+
+          print(answer("How often is lettuce harvested?"))
+        tests: |
+          check_object("answer")
+          text, tokens = user["answer"]("How often is lettuce harvested?")
+          assert "28 days" in text, "`answer` should attach the relevant handbook resources; for the lettuce question the answer should mention 28 days. Did you read each resource's text through `client.read_resource`?"
+          assert any(m.get("method") == "resources/read" for d, m in user["client"].wire if d == "->"), "Read the resources through the MCP client (`client.read_resource(uri)`), not some other way."
+      - instructions:
+          - "**Verify.** Run `answer` on every question. Store `fixed = score_answers(...)` and `avg_tokens`, the mean input tokens per question."
+          - "The fix must reach `fixed >= 0.75` while keeping `avg_tokens <= 1500`. Attaching all 34 documents would also answer correctly, at about 3,600 tokens a question. Print both numbers."
+        hint: "`results = [answer(q) for q in QUESTIONS]`, then `score_answers([t for t, _ in results])` and `sum(n for _, n in results) / len(results)`."
+        sample_code: |
+          results = ____
+          fixed = ____
+          avg_tokens = ____
+          print(f"accuracy {baseline:.2f} -> {fixed:.2f}, {avg_tokens:.0f} input tokens per question")
+        solution: |
+          results = [answer(q) for q in QUESTIONS]
+          fixed = score_answers([t for t, _ in results])
+          avg_tokens = sum(n for _, n in results) / len(results)
+          print(f"accuracy {baseline:.2f} -> {fixed:.2f}, {avg_tokens:.0f} input tokens per question")
+        tests: |
+          check_object("fixed")
+          check_object("avg_tokens")
+          assert user["fixed"] >= 0.75, f"Accuracy is {user['fixed']:.2f}; it needs to reach 0.75. Check that `answer` attaches the top resources for each question."
+          assert user["avg_tokens"] <= 1500, f"{user['avg_tokens']:.0f} input tokens per question is too many: attach only the few most relevant resources, not all of them."
+    success_msg: |
+      Accuracy went from 0 to about 0.9 for roughly 230 tokens a question. The one miss is the airlock
+      question: that resource's description says only "This procedure replaces the 2024 version", so
+      the host never picks it. Vague resource descriptions are cause 2 in the playbook. Try `k=3`, or a
+      better description, and watch the trade-off between accuracy and tokens.

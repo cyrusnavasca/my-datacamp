@@ -1,0 +1,253 @@
+title: The transformer block and its families
+description: Assemble the transformer block, follow data through a decoder, choose between encoder and decoder models, and rebuild PyTorch's multi-head attention by hand.
+exercises:
+  - id: intro
+    type: video
+    title: From attention to a full model
+    slides: |
+      # The transformer block
+
+      A block is attention plus a small MLP, each wrapped in a **residual connection** with
+      **LayerNorm** in front (the "pre-norm" layout used by GPT-2 and most LLMs):
+
+      ```python
+      def forward(self, x):                       # x: (B, n, d), the residual stream
+          x = x + self.attn(self.ln1(x))          # tokens exchange information
+          x = x + self.mlp(self.ln2(x))           # each token processed on its own
+          return x
+      ```
+
+      - **Residuals** let each block add a small update instead of rewriting $x$, so gradients flow
+        through dozens of layers.
+      - **LayerNorm** keeps activations at a stable scale.
+      - The **MLP** expands to $4d$, applies GELU and projects back. It holds about two thirds of a block's parameters.
+
+      ---
+
+      ## A whole decoder-only language model
+
+      ```
+      ids → token embedding + position embedding
+          → N × [LN → masked multi-head attention → +residual → LN → MLP → +residual]
+          → final LN → linear "LM head" to V logits per position
+      ```
+
+      Parameters per block $\approx 12 d^2$ ($4d^2$ attention + $8d^2$ MLP). DistilGPT2: $d = 768$, 6 blocks,
+      so about 42M in blocks plus 39M in the $50{,}257 \times 768$ token embedding: **82M** in total.
+      In small models the vocabulary table is a large share of the size.
+
+      ---
+
+      ## Three families
+
+      | | encoder-only | decoder-only | encoder-decoder |
+      | --- | --- | --- | --- |
+      | attention | bidirectional (sees all tokens) | causal (sees the past) | encoder: bidirectional; decoder: causal plus **cross-attention** to the encoder |
+      | trained to | fill in masked tokens | predict the next token | map an input sequence to an output sequence |
+      | examples | BERT, DistilBERT | GPT-2, DistilGPT2, most chat LLMs | T5, BART, Whisper |
+      | best at | classification, tagging, embeddings for search | generation, chat, in-context learning | translation, summarisation, speech-to-text |
+
+      Large decoder-only models can do all three with prompting, at a much higher cost per call.
+
+      ---
+
+      ## Trade-offs: size, depth and context
+
+      | knob | more of it gives | and costs |
+      | --- | --- | --- |
+      | width $d$ | richer token representations | parameters and compute grow as $d^2$ |
+      | layers $L$ | more steps of reasoning and composition | latency grows linearly; harder to train |
+      | heads $h$ | more distinct attention patterns | almost nothing (same $d$), but tiny heads lose capacity |
+      | context $n$ | more text per call | attention compute grows as $n^2$; KV cache memory grows as $n$ |
+      | vocabulary $V$ | shorter sequences | bigger embedding and output layers |
+
+      For a fixed budget, a small encoder fine-tuned on your task often beats a large generative model
+      used zero-shot, at a fraction of the latency. That is the subject of the next chapter.
+
+  - id: gpt-forward
+    type: parsons
+    title: Arrange a GPT forward pass
+    prompt: |
+      Arrange the lines of a decoder-only model's `forward`. The blocks use pre-norm residuals, and the
+      model returns logits for every position. Indent the block's two lines inside the loop.
+    hint: You need `n` before you can build positions. Each block normalises, transforms and adds back, attention first. The final LayerNorm comes after all blocks and before the LM head.
+    lines:
+      - "def forward(self, ids):"
+      - "    n = ids.shape[1]"
+      - "    x = self.tok_emb(ids) + self.pos_emb(torch.arange(n))"
+      - "    for block in self.blocks:"
+      - "        x = x + block.attn(block.ln1(x))"
+      - "        x = x + block.mlp(block.ln2(x))"
+      - "    x = self.ln_f(x)"
+      - "    return self.lm_head(x)"
+
+  - id: decoder-flow
+    type: order
+    title: One step of text generation
+    prompt: Put the steps a decoder-only model takes to produce the next token of a reply in order.
+    hint: Text becomes ids, ids become vectors, vectors go through the blocks, and only at the very end are they turned into a choice of token.
+    items:
+      - Tokenise the prompt into ids
+      - Look up token embeddings and add position embeddings
+      - LayerNorm, then masked multi-head self-attention, added to the residual stream
+      - LayerNorm, then the MLP, added to the residual stream
+      - Apply the final LayerNorm
+      - Project the last position to vocabulary logits with the LM head
+      - Turn the logits into a next token (softmax and sampling)
+      - Append the token to the input and repeat
+
+  - id: architecture-choice
+    type: classify
+    title: Which family fits the job?
+    prompt: Sort each Helios-7 task by the model family you would start with.
+    hint: Understanding a whole input in one pass points to an encoder. Producing open-ended text points to a decoder. Turning one sequence into a different one, with tight input-output alignment, is the classic encoder-decoder job.
+    zones: [Encoder-only, Decoder-only, Encoder-decoder]
+    items:
+      - { text: "Route crew tickets into five queues, under 20 ms on a CPU", zone: Encoder-only }
+      - { text: "Tag equipment names and module codes inside incident reports", zone: Encoder-only }
+      - { text: "Embed handbook paragraphs for semantic search", zone: Encoder-only }
+      - { text: "Autocomplete a message as a crew member types", zone: Decoder-only }
+      - { text: "Chat with the crew and answer open-ended questions", zone: Decoder-only }
+      - { text: "Translate the Russian segment's maintenance manual into English", zone: Encoder-decoder }
+      - { text: "Transcribe voice logs from the comms system into text", zone: Encoder-decoder }
+
+  - id: rebuild-mha
+    type: sequential
+    title: "Mission: rebuild multi-head attention by hand"
+    xp: 200
+    context: |
+      **Mission.** ORBIT's on-board autocomplete uses `nn.MultiheadAttention`, and the safety team
+      wants proof that its causal attention never leaks the future. Rebuild the layer by hand from its
+      own weights, show it matches, then run the leak test on your version.
+
+      Loaded: `mha = nn.MultiheadAttention(16, 4, batch_first=True)`, an input `x` of shape `(2, 6, 16)`,
+      `split_heads(x, h)` and `merge_heads(y)` from the last lesson, `torch`, `nn`, `F` and `math`.
+    pre_code: |
+      import math
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      mha = nn.MultiheadAttention(16, 4, batch_first=True)
+      x = torch.randn(2, 6, 16)
+      def split_heads(t, h):
+          B, n, d = t.shape
+          return t.view(B, n, h, d // h).transpose(1, 2)
+      def merge_heads(y):
+          B, h, n, dh = y.shape
+          return y.transpose(1, 2).contiguous().view(B, n, h * dh)
+    steps:
+      - instructions:
+          - "**Project.** `mha.in_proj_weight` stacks $W_Q, W_K, W_V$ (each `(16, 16)`) and `mha.in_proj_bias` stacks their biases. Split both into three with `.chunk(3)`."
+          - "Store `x @ W_q.T + b_q` in `q`, and likewise `k` and `v`."
+        hint: "`W_q, W_k, W_v = mha.in_proj_weight.chunk(3)` and `b_q, b_k, b_v = mha.in_proj_bias.chunk(3)`. PyTorch stores weights as (out, in), hence the `.T`."
+        sample_code: |
+          W_q, W_k, W_v = ____
+          b_q, b_k, b_v = ____
+          q = ____
+          k = ____
+          v = ____
+          print(q.shape)
+        solution: |
+          W_q, W_k, W_v = mha.in_proj_weight.chunk(3)
+          b_q, b_k, b_v = mha.in_proj_bias.chunk(3)
+          q = x @ W_q.T + b_q
+          k = x @ W_k.T + b_k
+          v = x @ W_v.T + b_v
+          print(q.shape)
+        tests: |
+          import torch
+          for name in ["q", "k", "v"]:
+              t = check_object(name)
+              assert tuple(t.shape) == (2, 6, 16), f"`{name}` should have shape (2, 6, 16)."
+              assert torch.allclose(t, sol[name], atol=1e-6), f"`{name}` is off. Use x @ W.T + b with the matching chunk of in_proj_weight and in_proj_bias (order: q, k, v)."
+      - instructions:
+          - "**Attend per head.** Split `q`, `k`, `v` into 4 heads. Compute scaled scores, mask the future with `-inf`, softmax over keys, and store `weights @ v_heads` in `ctx` (shape `(2, 4, 6, 4)`)."
+        hint: "`qh, kh, vh = (split_heads(t, 4) for t in (q, k, v))`, scores `qh @ kh.transpose(-2, -1) / math.sqrt(4)`, mask `torch.triu(torch.ones(6, 6, dtype=torch.bool), 1)`."
+        sample_code: |
+          qh, kh, vh = (split_heads(t, 4) for t in (q, k, v))
+          scores = ____
+          future = torch.triu(torch.ones(6, 6, dtype=torch.bool), diagonal=1)
+          weights = torch.softmax(scores.masked_fill(future, float("-inf")), dim=-1)
+          ctx = ____
+          print(ctx.shape)
+        solution: |
+          qh, kh, vh = (split_heads(t, 4) for t in (q, k, v))
+          scores = qh @ kh.transpose(-2, -1) / math.sqrt(4)
+          future = torch.triu(torch.ones(6, 6, dtype=torch.bool), diagonal=1)
+          weights = torch.softmax(scores.masked_fill(future, float("-inf")), dim=-1)
+          ctx = weights @ vh
+          print(ctx.shape)
+        tests: |
+          import torch, torch.nn.functional as F
+          c = check_object("ctx")
+          assert tuple(c.shape) == (2, 4, 6, 4), f"`ctx` should have shape (2, 4, 6, 4); got {tuple(c.shape)}."
+          sh = sol["split_heads"]
+          ref = F.scaled_dot_product_attention(sh(sol["q"], 4), sh(sol["k"], 4), sh(sol["v"], 4), is_causal=True)
+          assert torch.allclose(c, ref, atol=1e-5), "`ctx` is off. Scale by sqrt(head width) = sqrt(4), not sqrt(16), and mask before the softmax."
+      - instructions:
+          - "**Merge and compare.** Store `mha.out_proj(merge_heads(ctx))` in `out`."
+          - "Run the library layer with the same causal mask: `mha(x, x, x, attn_mask=future, need_weights=False)[0]`, and store the largest absolute difference from `out` in `max_diff`."
+        hint: "`(out - ref).abs().max().item()`. For a boolean `attn_mask`, True means 'not allowed', the same convention as your `future` mask."
+        sample_code: |
+          out = ____
+          ref = mha(x, x, x, attn_mask=future, need_weights=False)[0]
+          max_diff = ____
+          print(f"max difference from nn.MultiheadAttention: {max_diff:.1e}")
+        solution: |
+          out = mha.out_proj(merge_heads(ctx))
+          ref = mha(x, x, x, attn_mask=future, need_weights=False)[0]
+          max_diff = (out - ref).abs().max().item()
+          print(f"max difference from nn.MultiheadAttention: {max_diff:.1e}")
+        tests: |
+          import torch
+          o = check_object("out")
+          assert tuple(o.shape) == (2, 6, 16), f"`out` should have shape (2, 6, 16); got {tuple(o.shape)}."
+          m = check_object("max_diff")
+          assert float(m) < 1e-5, f"Your layer differs from nn.MultiheadAttention by {m}. Check the head split, the sqrt(4) scaling and that you applied `mha.out_proj`."
+      - instructions:
+          - "**Verify.** Wrap steps 1-3 in `my_mha(inp)` that returns the output for any input of shape `(B, 6, 16)`."
+          - "Store the leak test result in `leak`: the largest change in `my_mha` outputs at positions 0-2 when positions 3-5 of the input are replaced with random values."
+          - "Store the layer's parameter count `sum(p.numel() for p in mha.parameters())` in `n_params`."
+        hint: "Inside `my_mha`, repeat the projections, `split_heads`, masked softmax, `merge_heads` and `mha.out_proj` using `inp` instead of `x`."
+        sample_code: |
+          def my_mha(inp):
+              q = inp @ W_q.T + b_q
+              k = inp @ W_k.T + b_k
+              v = inp @ W_v.T + b_v
+              qh, kh, vh = (split_heads(t, 4) for t in (q, k, v))
+              w = torch.softmax((qh @ kh.transpose(-2, -1) / math.sqrt(4)).masked_fill(future, float("-inf")), dim=-1)
+              return ____
+
+          x2 = x.clone()
+          x2[:, 3:] = torch.randn(2, 3, 16)
+          leak = ____
+          n_params = ____
+          print(f"leak {leak:.1e}; parameters {n_params} (4*d*d + 4*d = {4 * 16 * 16 + 4 * 16})")
+        solution: |
+          def my_mha(inp):
+              q = inp @ W_q.T + b_q
+              k = inp @ W_k.T + b_k
+              v = inp @ W_v.T + b_v
+              qh, kh, vh = (split_heads(t, 4) for t in (q, k, v))
+              w = torch.softmax((qh @ kh.transpose(-2, -1) / math.sqrt(4)).masked_fill(future, float("-inf")), dim=-1)
+              return mha.out_proj(merge_heads(w @ vh))
+
+          x2 = x.clone()
+          x2[:, 3:] = torch.randn(2, 3, 16)
+          leak = (my_mha(x)[:, :3] - my_mha(x2)[:, :3]).abs().max().item()
+          n_params = sum(p.numel() for p in mha.parameters())
+          print(f"leak {leak:.1e}; parameters {n_params} (4*d*d + 4*d = {4 * 16 * 16 + 4 * 16})")
+        tests: |
+          import torch
+          f = check_object("my_mha")
+          torch.manual_seed(9)
+          a = torch.randn(3, 6, 16)
+          ref = user["mha"](a, a, a, attn_mask=user["future"], need_weights=False)[0]
+          assert torch.allclose(f(a), ref, atol=1e-5), "`my_mha` should match `nn.MultiheadAttention` with the causal mask for any input of shape (B, 6, 16)."
+          b = a.clone()
+          b[:, 4:] = torch.randn(3, 2, 16)
+          assert (f(a)[:, :4] - f(b)[:, :4]).abs().max().item() < 1e-6, "`my_mha` leaks: changing positions 4-5 changed earlier outputs."
+          assert float(check_object("leak")) < 1e-6, "`leak` should be essentially 0: compare `my_mha(x)[:, :3]` with `my_mha(x2)[:, :3]`."
+          check_equal("n_params", 1088, msg="`n_params` should be the total number of parameters in `mha` (4*16*16 weights + 4*16 biases).")
+    success_msg: Mission complete. Your hand-built layer matches PyTorch exactly, provably cannot see the future, and has the 4d² + 4d parameters the formula predicts.

@@ -1,0 +1,264 @@
+title: What brute force really costs
+description: Count the work in an exact search, measure it, batch it, size its memory, and decide when brute force is the right answer.
+exercises:
+  - id: brute-force-cost-slides
+    type: video
+    title: The cost of scanning everything
+    slides: |
+      # Brute force: exact, simple, linear
+
+      Exact search scores every stored vector:
+
+      - **Compute per query:** $N \times d$ multiply-adds.
+      - **Memory:** $N \times d \times 4$ bytes in float32, all of it in RAM for fast search.
+
+      | $N$ (d = 768) | multiply-adds per query | float32 memory | single query at ~20 G multiply-adds/s |
+      | --- | --- | --- | --- |
+      | 100k | 77 M | 0.3 GB | ~4 ms |
+      | 1M | 768 M | 3.1 GB | ~40 ms |
+      | 10M | 7.7 G | 31 GB | ~400 ms |
+      | 100M | 77 G | 307 GB | seconds, and no longer fits on one machine |
+
+      Cost grows **linearly** with $N$: 10x the documents means 10x the latency.
+
+      ---
+
+      ## Measure it properly
+
+      ```python
+      def time_ms(fn, repeats=5):
+          times = []
+          for _ in range(repeats):
+              t0 = time.perf_counter(); fn(); times.append(time.perf_counter() - t0)
+          return 1000 * np.median(times)           # the median ignores one-off hiccups
+      ```
+
+      - Time the real operation (score **and** select top-k) at several sizes, then **extrapolate**: per-vector cost × $N$.
+      - Small sizes are dominated by fixed overhead, so extrapolate from the largest size you can measure.
+      - Use **float32**, not float64: half the memory and roughly twice the speed. `aikit.embed` returns float64; convert with `.astype(np.float32)`.
+
+      ---
+
+      ## Batch your queries
+
+      One query at a time is a matrix-**vector** product, which is limited by memory bandwidth: every stored vector is
+      read from RAM for just one query. A batch of queries is a matrix-**matrix** product: each stored vector is
+      read once and reused for every query in the batch.
+
+      ```python
+      S = Q @ X.T                                        # (n_queries, N) in one call
+      part = np.argpartition(-S, 10, axis=1)[:, :10]     # top 10 per row
+      ```
+
+      Offline jobs (evaluation runs, deduplication, re-ranking a backlog) should always batch.
+      Online traffic can batch requests that arrive within a few milliseconds of each other.
+
+      ---
+
+      ## When brute force is the right answer
+
+      - Up to roughly a million vectors with a latency budget of tens of milliseconds.
+      - You need **exact** results (evaluation ground truth, legal or medical search).
+      - **Heavy filtering**: "only docs this crew member may see". Filtering an exact scan is trivial; filtering an ANN index is hard.
+      - **Frequent updates and deletes**: appending a row is free, while graph indexes need rebuilds or tombstones.
+
+      Many production systems with under 1M chunks never need anything else. Reach for an approximate index when the
+      **measured** p95 latency or memory breaks your budget, not before.
+
+  - id: time-brute-force
+    type: coding
+    title: Time it and extrapolate
+    context: |
+      `X` holds 100,000 unit vectors of 64 dims (float32) and `q` one query. `np` and `time` are imported. Measure how
+      brute-force cost grows with $N$, then project it to production size.
+    instructions:
+      - "Write `time_search(n, repeats=5)`: the **median** time in milliseconds over `repeats` runs of a top-10 search on the first `n` rows (`np.argpartition(-(X[:n] @ q), 10)[:10]`)."
+      - "Store the times for `n` = 1,000, 10,000 and 100,000 in `t_1k`, `t_10k` and `t_100k`."
+      - "Store the cost per stored vector in nanoseconds, from the largest size, in `ns_per_vector` (`t_100k` ms is `t_100k * 1e6` ns)."
+      - "Project to 10 million vectors of the same size in `est_10m_ms`, and to 10 million vectors of 768 dims in `est_10m_768_ms` (cost scales with d)."
+    hint: |
+      Inside the loop: `t0 = time.perf_counter()`, run the search, then append `time.perf_counter() - t0`.
+      Return `1000 * np.median(times)`. Then `ns_per_vector = t_100k * 1e6 / 100_000`,
+      `est_10m_ms = ns_per_vector * 10_000_000 / 1e6` and `est_10m_768_ms = est_10m_ms * 768 / 64`.
+    pre_code: |
+      import time
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries
+      X = make_vectors(100_000)
+      q = make_queries(X, 1)[0]
+    sample_code: |
+      def time_search(n, repeats=5):
+          times = []
+          for _ in range(repeats):
+              t0 = time.perf_counter()
+              np.argpartition(-(X[:n] @ q), 10)[:10]
+              times.append(____)
+          return ____
+
+      t_1k, t_10k, t_100k = time_search(1_000), time_search(10_000), time_search(100_000)
+      ns_per_vector = ____
+      est_10m_ms = ____
+      est_10m_768_ms = ____
+      print(f"{t_1k:.3f} / {t_10k:.3f} / {t_100k:.3f} ms; {ns_per_vector:.1f} ns per vector")
+      print(f"10M x 64: {est_10m_ms:.0f} ms, 10M x 768: {est_10m_768_ms:.0f} ms per query")
+    solution: |
+      def time_search(n, repeats=5):
+          times = []
+          for _ in range(repeats):
+              t0 = time.perf_counter()
+              np.argpartition(-(X[:n] @ q), 10)[:10]
+              times.append(time.perf_counter() - t0)
+          return 1000 * float(np.median(times))
+
+      t_1k, t_10k, t_100k = time_search(1_000), time_search(10_000), time_search(100_000)
+      ns_per_vector = t_100k * 1e6 / 100_000
+      est_10m_ms = ns_per_vector * 10_000_000 / 1e6
+      est_10m_768_ms = est_10m_ms * 768 / 64
+      print(f"{t_1k:.3f} / {t_10k:.3f} / {t_100k:.3f} ms; {ns_per_vector:.1f} ns per vector")
+      print(f"10M x 64: {est_10m_ms:.0f} ms, 10M x 768: {est_10m_768_ms:.0f} ms per query")
+    tests: |
+      f = check_object("time_search")
+      t = f(20_000, 3)
+      assert isinstance(t, float) or hasattr(t, "__float__"), "`time_search` should return a number of milliseconds."
+      assert 0 < float(t) < 1000, f"`time_search(20_000)` returned {t}; it should be a few milliseconds at most. Return the median in ms: `1000 * np.median(times)`."
+      for name in ["t_1k", "t_10k", "t_100k"]:
+          assert float(check_object(name)) > 0, f"`{name}` should be a positive time in ms."
+      assert user["t_100k"] > user["t_1k"], "Searching 100,000 vectors should take longer than 1,000. Use `X[:n]` inside `time_search`."
+      n = float(check_object("ns_per_vector"))
+      assert abs(n - user["t_100k"] * 1e6 / 100_000) < 1e-6 * max(1, n), "`ns_per_vector` should be `t_100k * 1e6 / 100_000`."
+      e = float(check_object("est_10m_ms"))
+      assert abs(e - n * 10_000_000 / 1e6) < 1e-6 * max(1, e), "`est_10m_ms` should be `ns_per_vector * 10_000_000 / 1e6`."
+      e2 = float(check_object("est_10m_768_ms"))
+      assert abs(e2 - e * 768 / 64) < 1e-6 * max(1, e2), "`est_10m_768_ms` should be `est_10m_ms * 768 / 64`: the cost scales with the number of dimensions."
+    success_msg: Your numbers depend on your machine, but the shape doesn't. Cost per vector is constant, so 10M production vectors of 768 dims take hundreds of milliseconds per query. That's where an approximate index starts to pay off.
+
+  - id: batch-queries
+    type: coding
+    title: Batch the queries
+    context: |
+      `X` holds 50,000 unit vectors and `Q` 200 queries. An offline evaluation job needs the exact top 10 for every query.
+      `top_k(scores, k)` (argpartition, then sort) is defined, and `np` and `time` are imported.
+    instructions:
+      - "Store `np.array([top_k(X @ q, 10) for q in Q])` in `loop_top` (one query at a time)."
+      - "Compute all scores at once with `S = Q @ X.T`, then the top 10 of every row with `np.argpartition(-S, 10, axis=1)[:, :10]`, sorted best first within each row. Store the result in `batch_top`."
+      - "Store whether the two arrays are equal in `same` (use `np.array_equal`), and print the time each approach took."
+    hint: |
+      After `part = np.argpartition(-S, 10, axis=1)[:, :10]`, sort each row by its scores:
+      `rows = np.arange(len(Q))[:, None]`, `order = np.argsort(-S[rows, part], axis=1)`, `batch_top = part[rows, order]`.
+    pre_code: |
+      import time
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries
+      X = make_vectors(50_000)
+      Q = make_queries(X, 200)
+
+      def top_k(scores, k):
+          part = np.argpartition(-scores, k)[:k]
+          return part[np.argsort(-scores[part])]
+    sample_code: |
+      t0 = time.perf_counter()
+      loop_top = ____
+      t1 = time.perf_counter()
+
+      S = ____
+      part = np.argpartition(-S, 10, axis=1)[:, :10]
+      rows = np.arange(len(Q))[:, None]
+      order = ____
+      batch_top = ____
+      t2 = time.perf_counter()
+
+      same = ____
+      print(f"loop {1000 * (t1 - t0):.0f} ms, batch {1000 * (t2 - t1):.0f} ms, same: {same}")
+    solution: |
+      t0 = time.perf_counter()
+      loop_top = np.array([top_k(X @ q, 10) for q in Q])
+      t1 = time.perf_counter()
+
+      S = Q @ X.T
+      part = np.argpartition(-S, 10, axis=1)[:, :10]
+      rows = np.arange(len(Q))[:, None]
+      order = np.argsort(-S[rows, part], axis=1)
+      batch_top = part[rows, order]
+      t2 = time.perf_counter()
+
+      same = np.array_equal(loop_top, batch_top)
+      print(f"loop {1000 * (t1 - t0):.0f} ms, batch {1000 * (t2 - t1):.0f} ms, same: {same}")
+    tests: |
+      import numpy as np
+      lt = check_object("loop_top")
+      assert np.shape(lt) == (200, 10), f"`loop_top` should have shape (200, 10); got {np.shape(lt)}."
+      check_equal("loop_top", msg="`loop_top` should be the top 10 of `X @ q` for each query, best first.")
+      bt = check_object("batch_top")
+      assert np.shape(bt) == (200, 10), f"`batch_top` should have shape (200, 10); got {np.shape(bt)}."
+      check_equal("batch_top", msg="`batch_top` rows should be the top 10 of each row of `S`, sorted best first. Sort each row of `part` by `-S[rows, part]`.")
+      check_equal("same", True, msg="`same` should be `np.array_equal(loop_top, batch_top)`, which is True.")
+    success_msg: Identical results, and the batch is typically several times faster, because each stored vector is read from memory once instead of 200 times. Evaluation and reindexing jobs should always batch.
+
+  - id: memory-budget
+    type: coding
+    title: Will it fit in memory?
+    context: |
+      ORBIT's server has 16 GB of RAM; after the OS, the index structures and some headroom, 12 GB is left for vectors.
+      `configs` maps a name to `(n_vectors, dims, bytes_per_value)` for options the team is considering (float32 uses
+      4 bytes per value, int8 uses 1).
+    instructions:
+      - "Write `index_gb(n, d, bytes_per_value=4)` that returns the size in GB (1 GB = 1e9 bytes) of `n` vectors of `d` values."
+      - "Store a dict mapping each config name to its size in GB in `sizes`."
+      - "Store the **sorted** list of names whose size is at most 12 GB in `fits`."
+    hint: "`n * d * bytes_per_value / 1e9`. Build `sizes` with a dict comprehension over `configs.items()`, unpacking `(n, d, b)`."
+    pre_code: |
+      configs = {
+          "5M x 768 float32": (5_000_000, 768, 4),
+          "5M x 768 int8": (5_000_000, 768, 1),
+          "5M x 256 float32": (5_000_000, 256, 4),
+          "20M x 768 float32": (20_000_000, 768, 4),
+          "20M x 1024 int8": (20_000_000, 1024, 1),
+          "50M x 384 int8": (50_000_000, 384, 1),
+      }
+    sample_code: |
+      def index_gb(n, d, bytes_per_value=4):
+          return ____
+
+      sizes = {name: ____ for name, (n, d, b) in configs.items()}
+      fits = ____
+      for name, gb in sizes.items():
+          print(f"{name:20s} {gb:6.2f} GB")
+      print(fits)
+    solution: |
+      def index_gb(n, d, bytes_per_value=4):
+          return n * d * bytes_per_value / 1e9
+
+      sizes = {name: index_gb(n, d, b) for name, (n, d, b) in configs.items()}
+      fits = sorted(name for name, gb in sizes.items() if gb <= 12)
+      for name, gb in sizes.items():
+          print(f"{name:20s} {gb:6.2f} GB")
+      print(fits)
+    tests: |
+      f = check_object("index_gb")
+      assert abs(f(1_000_000, 1000) - 4.0) < 1e-9, "`index_gb(1_000_000, 1000)` should be 4.0: a million float32 vectors of 1000 values is 4 GB."
+      assert abs(f(2_000_000, 500, 1) - 1.0) < 1e-9, "`index_gb(n, d, bytes_per_value)` should multiply by `bytes_per_value` (1 for int8)."
+      sz = check_object("sizes")
+      for k, v in sol["sizes"].items():
+          assert k in sz and abs(sz[k] - v) < 1e-9, f"`sizes[{k!r}]` should be {v:.2f} GB."
+      check_equal("fits", msg="`fits` should be the sorted list of config names with at most 12 GB.")
+    success_msg: "At 15.4 GB, 5M float32 vectors of 768 dims don't fit in 12 GB. Two levers fix that: fewer dimensions (if quality holds, as you measured in chapter 1) or fewer bytes per value (int8, coming up in the IVF lesson). At 20M and beyond, even int8 isn't enough, and you need product quantisation or more machines."
+
+  - id: does-it-fit
+    type: mc
+    title: Do you even need an index?
+    question: |
+      The station's medical knowledge base will hold 300,000 chunks of 1,024 dims. Queries arrive at about 20 per second,
+      and the p95 latency budget is 100 ms. Each crew member may only see the records they're cleared for, so every query has
+      a permission filter, and records are added or corrected every few minutes. The server does about 20 billion
+      multiply-adds per second. What do you build?
+    options:
+      - text: An HNSW graph index, because approximate search is always faster.
+        feedback: "It would be faster, but it isn't needed. A full scan is about 15 ms against a 100 ms budget. HNSW adds graph memory, tricky deletes for corrected records, and filtered search, where a strict filter can cut the graph into unreachable islands."
+      - text: An IVF-PQ index to save memory.
+        feedback: "300,000 x 1,024 float32 is about 1.2 GB, which is small. Compression would lower recall to fix a problem you don't have."
+      - text: Exact brute-force search in float32, filtering by permission before scoring.
+        correct: true
+        feedback: "Right. 300,000 x 1,024 = 307M multiply-adds, about 15 ms per query, well inside 100 ms even at 20 queries per second (about 30% of one core). It's exact, filters are trivial, and updates are just row writes. Revisit when measured p95 gets close to the budget."
+      - text: A GPU cluster, because medical search must be fast.
+        feedback: "That would add a lot of cost and operational work to save about 15 ms nobody asked for. Size the system from the budget and the measured cost."
+    hint: Compute N x d, divide by 20 billion per second, and compare with the 100 ms budget. Then think about the filter and the updates.

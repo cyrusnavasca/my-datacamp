@@ -1,0 +1,272 @@
+title: Exact match and token F1
+description: Compare an answer with a reference by hand. Exact match, normalisation, containment and token F1, what each rewards, and the traps that make a wrong answer score higher than a right one.
+exercises:
+  - id: reference-metrics-slides
+    type: video
+    title: Comparing answers to a reference
+    slides: |
+      # Reference-based metrics
+
+      When a golden case has a gold answer, the simplest metric compares the output with it in code: no model, no
+      cost, the same result every time.
+
+      **Exact match (EM)**: 1 if the strings are equal, else 0. It works for closed outputs: a label, yes/no, a module
+      letter, a document id.
+
+      It fails as soon as the model writes a sentence:
+
+      | gold | ORBIT's answer | EM |
+      | --- | --- | --- |
+      | `Every 90 days.` | `The scrubber beds are swapped every 90 days. [co2-scrubbers]` | 0 |
+
+      The answer is right, and EM gives it 0. On ORBIT's 82 answerable outputs, EM is 0 for every one.
+
+      ---
+
+      ## Normalise first
+
+      Most "mismatches" are formatting. Normalise both sides the same way before comparing:
+
+      ```python
+      import re, string
+
+      def normalize(text):
+          text = text.lower()
+          text = "".join(ch for ch in text if ch not in string.punctuation)
+          text = re.sub(r"\b(a|an|the)\b", " ", text)
+          return " ".join(text.split())
+
+      normalize("The Module-D hatch!")   # 'moduled hatch'
+      ```
+
+      **Containment** is a looser check: is the normalised gold answer inside the normalised output? It handles
+      "answer plus context", but misses the gold if it is phrased differently ("every 90 days" vs "each 90 days").
+
+      ---
+
+      ## Token F1, by hand
+
+      Treat each side as a bag of tokens and measure the overlap:
+
+      ```python
+      from collections import Counter
+
+      def token_f1(pred, gold):
+          p, g = normalize(pred).split(), normalize(gold).split()
+          same = sum((Counter(p) & Counter(g)).values())   # tokens in both, with multiplicity
+          if same == 0:
+              return 0.0
+          precision, recall = same / len(p), same / len(g)
+          return 2 * precision * recall / (precision + recall)
+      ```
+
+      **Precision** is the share of the answer's tokens that are in the gold answer. **Recall** is the share of the
+      gold answer's tokens that appear in the output. F1 is their harmonic mean, so it gives partial credit.
+
+      ---
+
+      ## Where F1 goes wrong
+
+      F1 counts shared words. It has no idea which words matter.
+
+      | gold `8 minutes at 0.7 bar.` | correct? | F1 |
+      | --- | --- | --- |
+      | `Lower the airlock pressure to 0.7 bar and hold for 8 minutes as a leak check.` | yes | 0.42 |
+      | `5 minutes at 0.7 bar.` | **no** | 0.80 |
+
+      - **Length penalty**: a complete, correct sentence has low precision against a terse gold answer.
+      - **Wrong fact, high overlap**: change the one number that matters and F1 hardly moves.
+      - **Citations and boilerplate** (`[airlock-procedure]`) add tokens that lower precision.
+
+      ---
+
+      ## Which reference metric?
+
+      | metric | cost | strictness | fails when | use it for |
+      | --- | --- | --- | --- | --- |
+      | exact match | free | very strict | any rewording | labels, ids, yes/no, JSON fields |
+      | normalised EM | free | strict | answer has context around it | short extractive answers |
+      | containment | free | medium | gold is paraphrased | short gold, long answers |
+      | token F1 | free | lenient | key fact changed, answer is long | extractive QA leaderboards |
+      | token recall / key facts | free, needs curated facts | targeted | facts phrased differently | long answers with a few facts that matter |
+
+      They're all free and fast, so run them on everything. Whether you can **trust** one is a separate question:
+      check how often it agrees with human labels before it goes on a dashboard (end of this chapter).
+
+  - id: normalise-em
+    type: coding
+    title: Exact match, normalised
+    context: |
+      `answerable` holds 82 ORBIT outputs (v1 and v2) for questions that have a gold answer, with columns `answer`
+      and `gold`. Score them with exact match, then with containment.
+    instructions:
+      - "Write `normalize(text)`: lowercase, remove every character in `string.punctuation`, replace the words `a`, `an`, `the` with a space, then collapse whitespace with `' '.join(text.split())`."
+      - Write `exact_match(pred, gold)` that returns 1 if the normalised strings are equal, else 0.
+      - Store the mean exact match over `answerable` in `em_rate`.
+      - Store the share of rows where `normalize(gold)` appears inside `normalize(answer)` in `contains_rate`.
+    hint: |
+      `re.sub(r"\b(a|an|the)\b", " ", text)` removes the articles. For the rates, loop with
+      `zip(answerable["answer"], answerable["gold"])` and take the mean of the 0/1 results.
+    pre_code: |
+      import re
+      import string
+      import numpy as np
+      from kits.llm_evaluation import orbit_log
+      log = orbit_log()
+      answerable = log[log["type"] != "unanswerable"].reset_index(drop=True)
+    sample_code: |
+      def normalize(text):
+          text = text.lower()
+          text = "".join(ch for ch in text if ch not in ____)
+          text = re.sub(r"\b(a|an|the)\b", " ", text)
+          return ____
+
+      def exact_match(pred, gold):
+          return ____
+
+      pairs = list(zip(answerable["answer"], answerable["gold"]))
+      em_rate = np.mean([exact_match(a, g) for a, g in pairs])
+      contains_rate = ____
+      print(em_rate, round(contains_rate, 3))
+    solution: |
+      def normalize(text):
+          text = text.lower()
+          text = "".join(ch for ch in text if ch not in string.punctuation)
+          text = re.sub(r"\b(a|an|the)\b", " ", text)
+          return " ".join(text.split())
+
+      def exact_match(pred, gold):
+          return int(normalize(pred) == normalize(gold))
+
+      pairs = list(zip(answerable["answer"], answerable["gold"]))
+      em_rate = np.mean([exact_match(a, g) for a, g in pairs])
+      contains_rate = np.mean([normalize(g) in normalize(a) for a, g in pairs])
+      print(em_rate, round(contains_rate, 3))
+    tests: |
+      check_object("normalize")
+      n = user["normalize"]
+      assert n("The Module-D  hatch!") == "moduled hatch", f"normalize('The Module-D  hatch!') should be 'moduled hatch', got {n('The Module-D  hatch!')!r}. Remove punctuation, drop articles, collapse spaces."
+      assert n("An answer, the END.") == "answer end", "Articles (a, an, the) should be removed and whitespace collapsed."
+      check_object("exact_match")
+      assert user["exact_match"]("Every 90 days.", "every 90 days") == 1, "`exact_match` should compare normalised strings: 'Every 90 days.' matches 'every 90 days'."
+      assert user["exact_match"]("Every 60 days.", "every 90 days") == 0, "`exact_match` should return 0 when the normalised strings differ."
+      check_equal("em_rate", msg="`em_rate` should be the mean of `exact_match` over all rows of `answerable`.")
+      check_equal("contains_rate", msg="`contains_rate` should be the share of rows where `normalize(gold) in normalize(answer)`.")
+    success_msg: |
+      Exact match is 0 across the board even though humans accept about 75% of these answers. Containment gets about
+      half: it rescues "answer plus context" but still misses correct answers phrased differently from the gold answer.
+
+  - id: token-f1
+    type: coding
+    title: Token F1 from scratch
+    context: |
+      Partial credit next. `normalize` from the last exercise is already defined, and `answerable` has a `version`
+      column (`v1` or `v2`).
+    instructions:
+      - "Write `token_f1(pred, gold)`: split both normalised strings into tokens, count the shared tokens with `Counter(p) & Counter(g)`, and return the F1 of precision and recall (0.0 when nothing is shared)."
+      - Add a column `f1` to `answerable` with `token_f1(answer, gold)` for every row.
+      - Store the mean `f1` per `version` in `f1_by_version` (a Series indexed by version).
+    hint: |
+      `same = sum((Counter(p) & Counter(g)).values())`, then `precision = same / len(p)` and `recall = same / len(g)`,
+      and `2 * precision * recall / (precision + recall)`.
+    pre_code: |
+      import re
+      import string
+      from collections import Counter
+      from kits.llm_evaluation import orbit_log
+      log = orbit_log()
+      answerable = log[log["type"] != "unanswerable"].reset_index(drop=True)
+
+      def normalize(text):
+          text = text.lower()
+          text = "".join(ch for ch in text if ch not in string.punctuation)
+          text = re.sub(r"\b(a|an|the)\b", " ", text)
+          return " ".join(text.split())
+    sample_code: |
+      def token_f1(pred, gold):
+          p, g = normalize(pred).split(), normalize(gold).split()
+          same = ____
+          if same == 0:
+              return 0.0
+          precision = ____
+          recall = ____
+          return ____
+
+      answerable["f1"] = [token_f1(a, g) for a, g in zip(answerable["answer"], answerable["gold"])]
+      f1_by_version = ____
+      print(f1_by_version)
+    solution: |
+      def token_f1(pred, gold):
+          p, g = normalize(pred).split(), normalize(gold).split()
+          same = sum((Counter(p) & Counter(g)).values())
+          if same == 0:
+              return 0.0
+          precision = same / len(p)
+          recall = same / len(g)
+          return 2 * precision * recall / (precision + recall)
+
+      answerable["f1"] = [token_f1(a, g) for a, g in zip(answerable["answer"], answerable["gold"])]
+      f1_by_version = answerable.groupby("version")["f1"].mean()
+      print(f1_by_version)
+    tests: |
+      check_object("token_f1")
+      f = user["token_f1"]
+      assert abs(f("5 minutes at 0.7 bar.", "8 minutes at 0.7 bar.") - 0.8) < 1e-9, "token_f1('5 minutes at 0.7 bar.', '8 minutes at 0.7 bar.') should be 0.8: 4 of 5 tokens shared on each side."
+      assert f("nothing shared", "every week") == 0.0, "Return 0.0 when no tokens are shared."
+      assert abs(f("week week week", "week") - 0.5) < 1e-9, "Count shared tokens with multiplicity using `Counter(p) & Counter(g)`."
+      check_object("f1_by_version")
+      assert dict(user["f1_by_version"].round(6)) == dict(sol["f1_by_version"].round(6)), "`f1_by_version` should be `answerable.groupby('version')['f1'].mean()`."
+    success_msg: |
+      v2 scores *lower* than v1 on F1. Hold that thought: humans rate v2 clearly higher. In the last lesson of this
+      chapter you'll find out which one to believe, and why.
+
+  - id: f1-trap
+    type: mc
+    title: Which answer scores higher?
+    question: |
+      The gold answer is `8 minutes at 0.7 bar.` Which ORBIT answer gets the **higher token F1**?
+
+      - **A**: `Lower the airlock pressure to 0.7 bar and hold for 8 minutes as a leak check.`
+      - **B**: `5 minutes at 0.7 bar.`
+    context: The console has `normalize` and `token_f1` loaded. Predict first, then check with `token_f1(A, gold)`.
+    pre_code: |
+      import re
+      import string
+      from collections import Counter
+
+      def normalize(text):
+          text = text.lower()
+          text = "".join(ch for ch in text if ch not in string.punctuation)
+          text = re.sub(r"\b(a|an|the)\b", " ", text)
+          return " ".join(text.split())
+
+      def token_f1(pred, gold):
+          p, g = normalize(pred).split(), normalize(gold).split()
+          same = sum((Counter(p) & Counter(g)).values())
+          if same == 0:
+              return 0.0
+          precision, recall = same / len(p), same / len(g)
+          return 2 * precision * recall / (precision + recall)
+
+      gold = "8 minutes at 0.7 bar."
+      A = "Lower the airlock pressure to 0.7 bar and hold for 8 minutes as a leak check."
+      B = "5 minutes at 0.7 bar."
+    options:
+      - text: "A, because it contains the correct number."
+        feedback: |
+          A is the correct answer, but F1 doesn't know which token matters. A has 14 tokens and only 4 are in the gold
+          answer, so precision is 0.29 and F1 is about 0.42. Run `token_f1(A, gold)`.
+      - text: "B, even though its number is wrong."
+        correct: true
+        feedback: |
+          Right: B shares 4 of its 5 tokens with the gold answer, so F1 = 0.8, nearly double A's 0.42. One wrong number
+          out of five tokens costs only 20%. This is why F1 alone can't grade factual answers where one token decides
+          right from wrong.
+      - text: "They tie, because both contain 0.7 bar."
+        feedback: |
+          Both share "07" and "bar", but F1 also divides by length. A is much longer, so its precision is far lower.
+          Compute both in the console.
+      - text: "Both score 0, because neither matches exactly."
+        feedback: |
+          That's exact match. F1 gives partial credit for overlapping tokens, so both score above 0.
+    hint: F1 rewards overlap and punishes length. Count the tokens on each side.

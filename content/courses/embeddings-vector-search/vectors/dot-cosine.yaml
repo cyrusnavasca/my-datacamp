@@ -1,0 +1,294 @@
+title: Dot product, cosine and why we normalise
+description: The one operation vector search repeats millions of times, what vector length does to it, and why every index normalises once.
+exercises:
+  - id: dot-cosine-slides
+    type: video
+    title: Comparing vectors
+    slides: |
+      # One operation, repeated millions of times
+
+      An embedding turns a piece of text into a point in $d$-dimensional space, placed so that texts
+      with similar meaning point in similar directions. Vector search then needs one thing:
+      a **score** between the query vector $q$ and every stored vector $x$.
+
+      The building block is the dot product:
+
+      $$q \cdot x = \sum_{i=1}^{d} q_i x_i$$
+
+      That is $d$ multiply-adds per stored vector. With 1 million vectors of 768 dimensions, one query
+      costs 768 million multiply-adds. Everything in the *indexes* chapter is about doing fewer of them.
+
+      ```python
+      scores = X @ q          # X: (N, d) matrix of stored vectors -> N scores
+      best = np.argmax(scores)
+      ```
+
+      ---
+
+      ## Length and direction
+
+      Every vector has a **length** (norm) $\lVert x \rVert = \sqrt{x \cdot x}$ and a **direction**. The dot product mixes both:
+
+      $$q \cdot x = \lVert q \rVert \, \lVert x \rVert \cos\theta$$
+
+      **Cosine similarity** keeps only the direction:
+
+      $$\cos(q, x) = \frac{q \cdot x}{\lVert q \rVert \, \lVert x \rVert}$$
+
+      | $\cos$ | angle | meaning for embeddings |
+      | --- | --- | --- |
+      | 1 | 0° | same direction (any length): same meaning |
+      | 0 | 90° | unrelated |
+      | −1 | 180° | opposite direction; rare for text embeddings, which mostly score between 0 and 1 |
+
+      `cos(v, 3v)` is exactly 1: scaling a vector changes its length, never its direction.
+
+      ---
+
+      ## Normalise once, then use the dot product
+
+      Divide every vector by its length **once, at index time**. For unit vectors ($\lVert x \rVert = 1$):
+
+      - the dot product **is** the cosine, with no division per query;
+      - Euclidean distance gives the same ranking, because $\lVert q - x \rVert^2 = 2 - 2\cos(q, x)$.
+
+      ```python
+      X_unit = X / np.linalg.norm(X, axis=1, keepdims=True)   # once, when you build the index
+      q_unit = q / np.linalg.norm(q)                          # once per query
+      scores = X_unit @ q_unit                                # cosine for every row
+      ```
+
+      Vector databases ask you to pick a metric (`cosine`, `dot`, `l2`). On normalised vectors all three rank
+      the same, so the choice only affects speed: the dot product is the cheapest.
+
+      ---
+
+      ## When length leaks into the score
+
+      With **un**normalised vectors and the dot product, a long vector scores high against *everything*.
+      It becomes a **hub** that shows up in every result list.
+
+      Where unwanted length comes from:
+      - summing chunk vectors to make a document vector (long documents get long vectors);
+      - a model or pipeline that skips normalisation, or a cached file written before normalising;
+      - raw term counts (a long text has bigger counts).
+
+      | metric | uses length | pick it when | failure mode |
+      | --- | --- | --- | --- |
+      | cosine | no | the default for text embeddings | undefined for an all-zero vector |
+      | dot product | yes | vectors are unit length (then it **is** cosine), or the model card says length carries meaning | hubs: long vectors win every query |
+      | Euclidean | yes | clustering, or the model was trained for it | dominated by length differences |
+
+      ---
+
+      ## Playbook: is my similarity right?
+
+      1. **Read the model card**: was it trained for cosine or for dot product? Most text models: cosine.
+      2. **Check the norms**: `n = np.linalg.norm(X, axis=1)`; print `n.min()`, `n.max()`. For cosine models they should all be 1.0.
+      3. **Count hubs**: run 50 different queries; if one document is top-1 for many of them, suspect length.
+      4. **Watch for zeros**: an all-zero vector (empty text, or no known words) makes cosine divide by zero. Guard with
+         `np.where(n == 0, 1, n)` and log these rows, because they can never be found.
+
+  - id: cosine-by-hand
+    type: coding
+    title: Cosine by hand, then for whole matrices
+    context: |
+      `A` (5 vectors) and `B` (3 vectors) are NumPy arrays of shape `(5, 8)` and `(3, 8)`. `np` and scikit-learn's
+      `cosine_similarity` are imported. Write cosine similarity yourself, then check it against the library.
+    instructions:
+      - "Write `cosine(a, b)` for two 1-D vectors: the dot product divided by the product of the norms."
+      - "Write `cosine_matrix(A, B)` that returns every pairwise cosine, shape `(len(A), len(B))`, with no Python loop: normalise the rows of both matrices, then take one matrix product."
+      - "Store `cosine_matrix(A, B)` in `C`, and whether it matches `cosine_similarity(A, B)` (use `np.allclose`) in `same`."
+    hint: |
+      `np.linalg.norm(A, axis=1, keepdims=True)` gives one norm per row with shape `(5, 1)`, so `A / norms` divides
+      each row by its own length. Then `A_unit @ B_unit.T`.
+    pre_code: |
+      import numpy as np
+      from sklearn.metrics.pairwise import cosine_similarity
+      rng = np.random.default_rng(3)
+      A = rng.normal(size=(5, 8))
+      B = rng.normal(size=(3, 8))
+    sample_code: |
+      def cosine(a, b):
+          return ____
+
+      def cosine_matrix(A, B):
+          A_unit = ____
+          B_unit = ____
+          return ____
+
+      C = cosine_matrix(A, B)
+      same = ____
+      print(C.round(3))
+      print(same)
+    solution: |
+      def cosine(a, b):
+          return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+
+      def cosine_matrix(A, B):
+          A_unit = A / np.linalg.norm(A, axis=1, keepdims=True)
+          B_unit = B / np.linalg.norm(B, axis=1, keepdims=True)
+          return A_unit @ B_unit.T
+
+      C = cosine_matrix(A, B)
+      same = np.allclose(C, cosine_similarity(A, B))
+      print(C.round(3))
+      print(same)
+    tests: |
+      import numpy as np
+      from sklearn.metrics.pairwise import cosine_similarity as _cs
+      f = check_object("cosine")
+      g = check_object("cosine_matrix")
+      rng = np.random.default_rng(99)
+      x, y = rng.normal(size=6), rng.normal(size=6)
+      want = x @ y / (np.linalg.norm(x) * np.linalg.norm(y))
+      assert abs(float(f(x, y)) - want) < 1e-9, "`cosine(a, b)` should be `a @ b / (np.linalg.norm(a) * np.linalg.norm(b))`."
+      assert abs(float(f(x, 3 * x)) - 1.0) < 1e-9, "`cosine(v, 3 * v)` should be 1: did you divide by both norms?"
+      P, R = rng.normal(size=(4, 6)), rng.normal(size=(7, 6))
+      out = np.asarray(g(P, R))
+      assert out.shape == (4, 7), f"`cosine_matrix(A, B)` should return shape (len(A), len(B)) = (4, 7), got {out.shape}. Use `A_unit @ B_unit.T`."
+      assert np.allclose(out, _cs(P, R)), "`cosine_matrix` values are off. Normalise each row of both matrices (axis=1, keepdims=True) before the matrix product."
+      check_equal("C")
+      check_equal("same", True, msg="`same` should be `np.allclose(C, cosine_similarity(A, B))`, which is True when your function is right.")
+    success_msg: Your cosine matches scikit-learn. Notice the matrix version never divides per pair. It normalises each row once, which is exactly what a vector index does at build time.
+
+  - id: opposite-vectors
+    type: mc
+    title: Predict the cosine
+    question: |
+      `v = np.array([0.2, -0.5, 0.8])`. What is `cosine(v, -2 * v)`?
+    context: The console has `v` and a `cosine(a, b)` function loaded. Predict first, then check.
+    pre_code: |
+      import numpy as np
+      def cosine(a, b):
+          return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+      v = np.array([0.2, -0.5, 0.8])
+    options:
+      - text: "`1.0`"
+        feedback: "Scaling by a **positive** number keeps the direction, so `cosine(v, 2 * v)` is 1. The minus sign flips the vector to point the other way. Try `cosine(v, -2 * v)` in the console."
+      - text: "`0.0`"
+        feedback: "Zero means perpendicular (unrelated). `-2 * v` lies on the same line as `v`, just pointing the other way."
+      - text: "`-1.0`"
+        correct: true
+        feedback: "Right. The length (factor 2) cancels out; only the direction counts, and it is exactly opposite. Note the dot product, `v @ (-2 * v)`, is -1.86: it depends on length, cosine doesn't."
+      - text: "`-2.0`"
+        feedback: "Cosine is always between -1 and 1, because the division by both norms removes length. The factor 2 cancels out."
+    hint: Cosine ignores length. What does a minus sign do to the direction?
+
+  - id: normalise-once
+    type: coding
+    title: Normalise once, and three metrics agree
+    context: |
+      `U` holds the embeddings of the 171 handbook sentences (unit length, from `aikit.embed`), `texts` their text,
+      and `q` the embedded query *"How long is the leak check before depressurising?"*. `R` holds the **same**
+      directions as `U` but with random lengths, as if a pipeline forgot to normalise.
+    instructions:
+      - "On `U`, rank all rows best first by dot product (`np.argsort(-(U @ q))`) into `rank_dot`, and by Euclidean distance (smallest first) into `rank_euclid`."
+      - "Store whether the top 10 of the two rankings are the same list in `agree_unit` (a bool)."
+      - "On `R`, rank by dot product into `rank_raw`. Then normalise the rows of `R` into `R_unit` and rank by dot product into `rank_fixed`."
+      - "Print the text of the best sentence for `rank_raw` and for `rank_fixed`."
+    hint: |
+      Euclidean distances: `np.linalg.norm(U - q, axis=1)`; sort ascending with `np.argsort(...)`.
+      Compare top 10s with `list(rank_dot[:10]) == list(rank_euclid[:10])`.
+      Normalise with `R / np.linalg.norm(R, axis=1, keepdims=True)`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_chunks
+      texts = [c["text"] for c in handbook_chunks()]
+      U = aikit.embed(texts)
+      q = aikit.embed("How long is the leak check before depressurising?")
+      _rng = np.random.default_rng(0)
+      R = U * _rng.uniform(0.5, 5.0, size=len(U))[:, None]
+    sample_code: |
+      rank_dot = ____
+      rank_euclid = ____
+      agree_unit = ____
+
+      rank_raw = ____
+      R_unit = ____
+      rank_fixed = ____
+
+      print("raw:  ", texts[rank_raw[0]])
+      print("fixed:", texts[rank_fixed[0]])
+    solution: |
+      rank_dot = np.argsort(-(U @ q))
+      rank_euclid = np.argsort(np.linalg.norm(U - q, axis=1))
+      agree_unit = list(rank_dot[:10]) == list(rank_euclid[:10])
+
+      rank_raw = np.argsort(-(R @ q))
+      R_unit = R / np.linalg.norm(R, axis=1, keepdims=True)
+      rank_fixed = np.argsort(-(R_unit @ q))
+
+      print("raw:  ", texts[rank_raw[0]])
+      print("fixed:", texts[rank_fixed[0]])
+    tests: |
+      import numpy as np
+      for name in ["rank_dot", "rank_euclid", "rank_raw", "rank_fixed"]:
+          v = check_object(name)
+          assert list(np.asarray(v)[:10]) == list(np.asarray(sol[name])[:10]), f"The top 10 of `{name}` is not right. Sort best first: `np.argsort(-scores)` for similarities, `np.argsort(distances)` for distances."
+      check_equal("agree_unit", True, msg="On unit vectors, dot product and Euclidean distance give the same ranking, so `agree_unit` should be True.")
+      Ru = check_object("R_unit")
+      assert np.allclose(np.linalg.norm(Ru, axis=1), 1.0), "Every row of `R_unit` should have length 1: divide by `np.linalg.norm(R, axis=1, keepdims=True)`."
+      assert list(np.asarray(user["rank_raw"])[:10]) != list(np.asarray(user["rank_fixed"])[:10]), "`rank_raw` should rank the unnormalised `R` by dot product, so it differs from `rank_fixed`."
+    success_msg: On unit vectors the metrics agree, and normalising `R` brings back the right answer. The unnormalised ranking was led by whichever sentences happened to have long vectors, not by meaning.
+
+  - id: hub-documents
+    type: coding
+    title: Find the hub
+    context: |
+      A "related documents" widget scores 40 documents with a dot product. Each doc vector in `V` was made by
+      **summing** its chunk vectors, so a doc with many chunks gets a long vector. `n_chunks` has the chunk count per doc.
+      `Q` holds 200 queries; `target[i]` is the doc that query `i` is about.
+    instructions:
+      - "Store the top-1 doc for every query by dot product (`Q @ V.T`, then `argmax` per row) in `top_dot`, and by cosine (normalise the rows of `V` first) in `top_cos`."
+      - "Store the share of queries whose top-1 equals `target` in `acc_dot` and `acc_cos`."
+      - "`longest = np.argmax(n_chunks)` is the biggest doc. Store how many queries return it as top-1 in `hub_dot` and `hub_cos`."
+    hint: |
+      `np.argmax(Q @ V.T, axis=1)` gives one doc index per query. Accuracy: `np.mean(top_dot == target)`.
+      Hub count: `np.sum(top_dot == longest)`.
+    pre_code: |
+      import numpy as np
+      _rng = np.random.default_rng(5)
+      _topics = _rng.normal(size=(40, 32))
+      _topics /= np.linalg.norm(_topics, axis=1, keepdims=True)
+      n_chunks = _rng.integers(1, 6, size=40)
+      n_chunks[17] = 40
+      V = np.array([sum(_topics[i] + 0.3 * _rng.normal(size=32) / np.sqrt(32) for _ in range(n)) for i, n in enumerate(n_chunks)])
+      target = _rng.integers(0, 40, size=200)
+      Q = _topics[target] + 0.9 * _rng.normal(size=(200, 32)) / np.sqrt(32)
+      Q /= np.linalg.norm(Q, axis=1, keepdims=True)
+      longest = int(np.argmax(n_chunks))
+    sample_code: |
+      top_dot = ____
+      V_unit = ____
+      top_cos = ____
+
+      acc_dot = ____
+      acc_cos = ____
+
+      hub_dot = ____
+      hub_cos = ____
+      print(f"dot:    accuracy {acc_dot:.2f}, longest doc is top-1 for {hub_dot} queries")
+      print(f"cosine: accuracy {acc_cos:.2f}, longest doc is top-1 for {hub_cos} queries")
+    solution: |
+      top_dot = np.argmax(Q @ V.T, axis=1)
+      V_unit = V / np.linalg.norm(V, axis=1, keepdims=True)
+      top_cos = np.argmax(Q @ V_unit.T, axis=1)
+
+      acc_dot = np.mean(top_dot == target)
+      acc_cos = np.mean(top_cos == target)
+
+      hub_dot = np.sum(top_dot == longest)
+      hub_cos = np.sum(top_cos == longest)
+      print(f"dot:    accuracy {acc_dot:.2f}, longest doc is top-1 for {hub_dot} queries")
+      print(f"cosine: accuracy {acc_cos:.2f}, longest doc is top-1 for {hub_cos} queries")
+    tests: |
+      check_equal("top_dot", msg="`top_dot` should be `np.argmax(Q @ V.T, axis=1)`.")
+      check_equal("top_cos", msg="`top_cos` should use the row-normalised `V`: `np.argmax(Q @ V_unit.T, axis=1)`.")
+      check_equal("acc_dot", msg="`acc_dot` should be the share of queries where `top_dot == target`.")
+      check_equal("acc_cos", msg="`acc_cos` should be the share of queries where `top_cos == target`.")
+      check_equal("hub_dot", msg="`hub_dot` should count the queries whose `top_dot` equals `longest`.")
+      check_equal("hub_cos", msg="`hub_cos` should count the queries whose `top_cos` equals `longest`.")
+      assert user["hub_dot"] > 3 * max(1, user["hub_cos"]), "With the dot product the longest doc should win far more often than with cosine. Check that `V_unit` is normalised per row."
+    success_msg: One long vector stole the top spot from many queries. The fix costs nothing at query time. Normalise (or average instead of summing) when you build the index.

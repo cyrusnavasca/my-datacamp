@@ -1,0 +1,365 @@
+title: Latency and cost dashboards
+description: Percentiles per span, cost per request, error rates and alerts, then a first on-call shift with ORBIT's real traces.
+exercises:
+  - id: dashboards-slides
+    type: video
+    title: Numbers that tell you what to fix
+    slides: |
+      # What an LLM dashboard shows
+
+      | panel | metric | why |
+      | --- | --- | --- |
+      | latency | p50, p95, p99 **per span** and per request; TTFT for LLM spans | which step is slow, for whom |
+      | traffic | requests per minute, by model and topic | load and mix changes |
+      | errors | error rate **by type** (429, 529, timeout, 400) | retry, wait or fix the request? |
+      | cost | $ per request, $ per day, tokens by span | budget, and where it goes |
+      | quality | thumbs, rephrases, eval score per release | chapter 4 |
+
+      Every panel is a `groupby` over the spans you recorded in the first lesson.
+
+      ---
+
+      ## Why percentiles, not the mean
+
+      ORBIT's request latency over two weeks: **mean 4.9 s, p50 3.9 s, p95 12.1 s**.
+
+      - The mean mixes everyone together. One crew member in twenty waits **more than 12 s**, and the mean hides it.
+      - p95 by hand: sort the values, take the one 95% of the way along. In pandas: `s.quantile(0.95)`; in NumPy:
+        `np.percentile(s, 95)`.
+      - Percentiles need data. With 20 requests, "p95" is the second-slowest request, so it jumps around. Report p99
+        only when you have hundreds of requests per window.
+
+      ```python
+      t.groupby("span")["duration_ms"].quantile([0.5, 0.95]).unstack()
+      ```
+
+      ---
+
+      ## Cost per request from tokens
+
+      $$\text{cost} = \frac{\text{input tokens} \times p_\text{in} + \text{output tokens} \times p_\text{out}}{10^6}$$
+
+      with prices per million tokens for the model's tier (here `aikit.PRICES`, illustrative; check the provider's
+      pricing page for real numbers). Sum the LLM spans of a request (an agent makes several calls), then average
+      over requests.
+
+      ```python
+      tier = llm["model"].map(aikit.tier_of)                  # "small", "medium", "large"
+      p_in = tier.map(lambda k: PRICES[k]["input"])
+      ```
+
+      ---
+
+      ## Playbook: "p95 went up. Which span?"
+
+      1. **p95 per span, per day.** Find the span whose p95 moved. Requests are usually as slow as their LLM span.
+      2. **Split the LLM span:** TTFT (prefill and queueing) vs decode (output tokens × ms per token).
+         Fit $\text{duration} \approx a + b \times \text{output tokens}$ per model with `np.polyfit`.
+         The slope $b$ is ms per output token; the intercept $a$ is roughly TTFT.
+      3. **Check the mix.** Did the share of a slower model, a longer prompt or a wordier topic go up?
+      4. Usual causes, in order: **longer outputs** (prompt change, new topic), **bigger prompts** (more retrieved
+         chunks, longer history), a **slower model** on more traffic, **provider queueing** (TTFT up for everyone),
+         **retries** hidden inside the span.
+
+      ---
+
+      ## Alerts: sensitive but not noisy
+
+      An alert is a rule over a window: *"error rate above 10% over a day with at least 15 requests"*.
+
+      | knob | lower / shorter | higher / longer |
+      | --- | --- | --- |
+      | threshold | catches small problems, more false alarms | misses slow burns |
+      | window | fast detection, noisy with little traffic | stable, but you hear about it hours later |
+      | minimum count | fires on 1 failure out of 2 | silent at night, when traffic is low |
+
+      Alert on what users feel (p95, error rate) and use the per-span dashboards to diagnose. A page should
+      always mean "a person needs to act now".
+
+  - id: span-percentiles
+    type: coding
+    title: p50 and p95 per span
+    context: |
+      `t` holds ORBIT's production spans from `traces()`: one row per span with `trace_id`, `day`, `model`, `span`,
+      `duration_ms`, tokens, `error`, and `ttft_ms` for LLM spans.
+    instructions:
+      - "Build `by_span`: a DataFrame indexed by span name with columns `p50` and `p95` of `duration_ms`."
+      - "Sum `duration_ms` per trace and store the mean and the 95th percentile of those totals in `request_mean` and `request_p95`."
+      - "Store the 95th percentile of `ttft_ms` over the `llm` spans in `ttft_p95`."
+    hint: |
+      `t.groupby("span")["duration_ms"].quantile([0.5, 0.95]).unstack()` gives columns `0.5` and `0.95`; rename them
+      with `.rename(columns={0.5: "p50", 0.95: "p95"})`. `quantile` skips the NaN values in `ttft_ms`.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      from kits.llmops_production import traces
+      t = traces()
+    sample_code: |
+      by_span = (t.groupby("span")["duration_ms"]
+                 .quantile([0.5, 0.95]).unstack()
+                 .rename(columns=____))
+
+      totals = t.groupby("trace_id")["duration_ms"].sum()
+      request_mean = ____
+      request_p95 = ____
+
+      ttft_p95 = ____
+      print(by_span.round(1))
+      print(f"mean {request_mean:.0f} ms, p95 {request_p95:.0f} ms, TTFT p95 {ttft_p95:.0f} ms")
+    solution: |
+      by_span = (t.groupby("span")["duration_ms"]
+                 .quantile([0.5, 0.95]).unstack()
+                 .rename(columns={0.5: "p50", 0.95: "p95"}))
+
+      totals = t.groupby("trace_id")["duration_ms"].sum()
+      request_mean = totals.mean()
+      request_p95 = totals.quantile(0.95)
+
+      ttft_p95 = t.loc[t["span"] == "llm", "ttft_ms"].quantile(0.95)
+      print(by_span.round(1))
+      print(f"mean {request_mean:.0f} ms, p95 {request_p95:.0f} ms, TTFT p95 {ttft_p95:.0f} ms")
+    tests: |
+      import numpy as np
+      check_object("by_span")
+      b = user["by_span"]
+      assert {"p50", "p95"} <= set(b.columns), f"`by_span` needs columns `p50` and `p95`; it has {list(b.columns)}."
+      e = sol["by_span"]
+      assert set(b.index) == set(e.index), f"`by_span` should have one row per span: {sorted(e.index)}."
+      for col in ("p50", "p95"):
+          assert np.allclose(b.loc[e.index, col].astype(float), e[col], atol=0.01), f"Column `{col}` is off. Use `quantile` on `duration_ms` grouped by `span`."
+      check_equal("request_mean", tol=1e-6, msg="`request_mean` is the mean of the per-trace sums of `duration_ms`.")
+      check_equal("request_p95", tol=1e-6, msg="`request_p95` is the 0.95 quantile of the per-trace sums.")
+      check_equal("ttft_p95", tol=1e-6, msg="`ttft_p95` is the 0.95 quantile of `ttft_ms` over rows where `span == 'llm'`.")
+    success_msg: |
+      The LLM span's p95 (11.8 s) is about 70 times retrieval's, and the request p95 is 12.1 s while the mean says
+      4.9 s. Yet TTFT p95 is only about 0.5 s: the model starts quickly and then takes a long time to finish.
+
+  - id: cost-per-request
+    type: coding
+    title: Cost per request and per day
+    context: |
+      `llm` holds only the LLM spans of `traces()`. Prices per million tokens are in `PRICES`, keyed by tier, and
+      `aikit.tier_of(model)` maps a model id to its tier.
+    instructions:
+      - "Add a `cost` column to `llm`: input tokens times the tier's input price plus output tokens times its output price, divided by 1,000,000."
+      - "Store `cost_per_request`: total cost divided by the number of distinct `trace_id`s."
+      - "Store `cost_by_model`: a dict mapping model id to its mean cost per call."
+      - "Store `daily_cost`: a Series of total cost per `day`."
+    hint: |
+      `tier = llm["model"].map(aikit.tier_of)`, then `tier.map(lambda k: PRICES[k]["input"])` gives the input price
+      per row. `llm.groupby("model")["cost"].mean().to_dict()`.
+    pre_code: |
+      import aikit
+      import pandas as pd
+      from kits.llmops_production import traces, PRICES
+      t = traces()
+      llm = t[t["span"] == "llm"].copy()
+    sample_code: |
+      tier = llm["model"].map(aikit.tier_of)
+      p_in = tier.map(lambda k: PRICES[k]["input"])
+      p_out = ____
+      llm["cost"] = ____
+
+      cost_per_request = ____
+      cost_by_model = ____
+      daily_cost = ____
+      print(f"${cost_per_request:.4f} per request")
+      print(cost_by_model)
+      print(daily_cost.round(3))
+    solution: |
+      tier = llm["model"].map(aikit.tier_of)
+      p_in = tier.map(lambda k: PRICES[k]["input"])
+      p_out = tier.map(lambda k: PRICES[k]["output"])
+      llm["cost"] = (llm["input_tokens"] * p_in + llm["output_tokens"] * p_out) / 1_000_000
+
+      cost_per_request = llm["cost"].sum() / llm["trace_id"].nunique()
+      cost_by_model = llm.groupby("model")["cost"].mean().to_dict()
+      daily_cost = llm.groupby("day")["cost"].sum()
+      print(f"${cost_per_request:.4f} per request")
+      print(cost_by_model)
+      print(daily_cost.round(3))
+    tests: |
+      import numpy as np
+      check_object("llm")
+      assert "cost" in user["llm"].columns, "Add a `cost` column to `llm`."
+      assert np.allclose(user["llm"]["cost"].values, sol["llm"]["cost"].values, atol=1e-9), "The `cost` column is off. It is (input_tokens * input price + output_tokens * output price) / 1,000,000, with the prices of the row's tier."
+      check_equal("cost_per_request", tol=1e-6, msg="`cost_per_request` is the sum of `cost` divided by the number of distinct traces.")
+      check_object("cost_by_model")
+      got, exp = user["cost_by_model"], sol["cost_by_model"]
+      assert set(got) == set(exp) and all(abs(got[k] - exp[k]) < 1e-9 for k in exp), f"`cost_by_model` should be {exp}."
+      check_object("daily_cost")
+      assert np.allclose(np.asarray(user["daily_cost"], dtype=float), sol["daily_cost"].values, atol=1e-9), "`daily_cost` should be the total `cost` per `day`, in day order."
+    success_msg: |
+      About $0.0087 per request, and a Sonnet call costs about three times a Haiku call. Notice that input tokens,
+      not output, are most of each bill: ORBIT sends thousands of tokens of context to get a hundred or two back.
+
+  - id: which-span
+    type: mc
+    title: "The p95 doubled: which span?"
+    question: |
+      After Tuesday's release, ORBIT's request p95 went from **4.1 s to 8.3 s**. Your dashboard shows, before → after:
+
+      | span | p95 duration | p95 input tokens | p95 output tokens | TTFT p95 |
+      | --- | --- | --- | --- | --- |
+      | retrieve | 160 → 170 ms | | | |
+      | rerank | 85 → 88 ms | | | |
+      | llm | 3.8 → 8.0 s | 3,900 → 4,000 | 230 → 520 | 540 → 560 ms |
+
+      What is the most likely cause, and where do you look next?
+    options:
+      - text: Retrieval got slower; profile the vector index.
+        feedback: Retrieval moved by 10 ms out of a 4.2 s increase. Always find the span whose numbers actually moved.
+      - text: The provider is queueing requests; open a support ticket.
+        feedback: Queueing shows up as higher TTFT for every request. TTFT barely moved (540 → 560 ms), so the model starts on time.
+      - text: "The answers got longer: the release changed the prompt or output limits. Diff the prompt and check output tokens per prompt version."
+        correct: true
+        feedback: "Right. Output tokens at p95 more than doubled, and at roughly 15 ms per token that adds about 4.3 s, which is the whole regression. Next: compare the old and new prompt (did someone remove 'answer briefly' or raise `max_tokens`?), and check per-topic output lengths."
+      - text: The prompt got longer, so prefill is slower.
+        feedback: Input tokens rose by only about 100, and TTFT (which is where prefill time shows up) rose 20 ms. Prefill is not the problem.
+    hint: Total LLM time is about TTFT + output tokens × ms per token. Which of those two terms changed?
+
+  - id: on-call-mission
+    type: sequential
+    title: "Mission: ORBIT's first on-call week"
+    context: |
+      You are on call for ORBIT. Two complaints came in: *"ORBIT is always slow"* and *"ORBIT kept saying it was busy
+      one day"*. Use the two weeks of spans in `t` to measure, find the incident, explain the latency and check that
+      a proposed fix would work, before you touch any code.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      from kits.llmops_production import traces
+      t = traces()
+    steps:
+      - instructions:
+          - "Build `requests`: one row per `trace_id` with `day` (first value), `total_ms` (sum of `duration_ms`) and `failed` (True if any span has an `error`)."
+          - "Build `daily`: indexed by `day`, with columns `n` (number of requests), `p95_ms` (0.95 quantile of `total_ms`) and `error_rate` (mean of `failed`)."
+        hint: |
+          `t.groupby("trace_id").agg(day=("day", "first"), total_ms=("duration_ms", "sum"), failed=("error", lambda s: s.notna().any()))`,
+          then `requests.groupby("day").agg(n=("total_ms", "size"), p95_ms=("total_ms", lambda s: s.quantile(0.95)), error_rate=("failed", "mean"))`.
+        sample_code: |
+          requests = t.groupby("trace_id").agg(
+              day=("day", "first"),
+              total_ms=____,
+              failed=("error", lambda s: s.notna().any()),
+          )
+          daily = requests.groupby("day").agg(
+              n=("total_ms", "size"),
+              p95_ms=____,
+              error_rate=____,
+          )
+          print(daily.round(3))
+        solution: |
+          requests = t.groupby("trace_id").agg(
+              day=("day", "first"),
+              total_ms=("duration_ms", "sum"),
+              failed=("error", lambda s: s.notna().any()),
+          )
+          daily = requests.groupby("day").agg(
+              n=("total_ms", "size"),
+              p95_ms=("total_ms", lambda s: s.quantile(0.95)),
+              error_rate=("failed", "mean"),
+          )
+          print(daily.round(3))
+        tests: |
+          import numpy as np
+          check_object("daily")
+          d, e = user["daily"], sol["daily"]
+          for col in ("n", "p95_ms", "error_rate"):
+              assert col in d.columns, f"`daily` needs a `{col}` column."
+              assert np.allclose(d.loc[e.index, col].astype(float), e[col].astype(float), atol=1e-6), f"`daily['{col}']` is off. Check the aggregation for `{col}`."
+      - instructions:
+          - "Write `alert(row)`: True when `row[\"error_rate\"] > 0.10` and `row[\"n\"] >= 15`."
+          - "Store `alert_days`: the list of days where `alert` fires."
+          - "Store `incident_errors`: a dict of error type to count over the spans of the first alert day."
+        hint: |
+          `[day for day, row in daily.iterrows() if alert(row)]`. Then filter `t` on that day and count
+          `t["error"].value_counts()`.
+        sample_code: |
+          def alert(row):
+              return ____
+
+          alert_days = [int(day) for day, row in daily.iterrows() if ____]
+          incident_errors = dict(t.loc[t["day"] == alert_days[0], "error"].____)
+          print(alert_days, incident_errors)
+        solution: |
+          def alert(row):
+              return row["error_rate"] > 0.10 and row["n"] >= 15
+
+          alert_days = [int(day) for day, row in daily.iterrows() if alert(row)]
+          incident_errors = dict(t.loc[t["day"] == alert_days[0], "error"].value_counts())
+          print(alert_days, incident_errors)
+        tests: |
+          check_object("alert_days")
+          assert list(user["alert_days"]) == sol["alert_days"], f"`alert_days` should be {sol['alert_days']}: only the day with the 429 burst. Got {list(user['alert_days'])}. Check the threshold (> 0.10) and the minimum count."
+          check_object("incident_errors")
+          got = {k: int(v) for k, v in dict(user["incident_errors"]).items()}
+          assert got == {k: int(v) for k, v in sol["incident_errors"].items()}, f"`incident_errors` should count error types on day {sol['alert_days'][0]}: {sol['incident_errors']}."
+      - instructions:
+          - "Using only successful `llm` spans, fit `duration_ms ≈ base + ms_per_token × output_tokens` separately for each model with `np.polyfit(x, y, 1)`."
+          - "Store `fits`: a dict mapping model id to a tuple `(ms_per_token, base_ms)`."
+          - "Store `corr_out` and `corr_in`: the correlation of `duration_ms` with `output_tokens` and with `input_tokens` over those spans."
+        hint: |
+          `ok = t[(t["span"] == "llm") & t["error"].isna()]`. `np.polyfit(g["output_tokens"], g["duration_ms"], 1)`
+          returns `[slope, intercept]`. `ok["duration_ms"].corr(ok["output_tokens"])`.
+        sample_code: |
+          ok = t[(t["span"] == "llm") & t["error"].isna()]
+          fits = {}
+          for model, g in ok.groupby("model"):
+              slope, intercept = ____
+              fits[model] = (slope, intercept)
+          corr_out = ____
+          corr_in = ____
+          print(fits)
+          print(round(corr_out, 2), round(corr_in, 2))
+        solution: |
+          ok = t[(t["span"] == "llm") & t["error"].isna()]
+          fits = {}
+          for model, g in ok.groupby("model"):
+              slope, intercept = np.polyfit(g["output_tokens"], g["duration_ms"], 1)
+              fits[model] = (slope, intercept)
+          corr_out = ok["duration_ms"].corr(ok["output_tokens"])
+          corr_in = ok["duration_ms"].corr(ok["input_tokens"])
+          print(fits)
+          print(round(corr_out, 2), round(corr_in, 2))
+        tests: |
+          check_object("fits")
+          f, e = user["fits"], sol["fits"]
+          assert set(f) == set(e), f"`fits` should have one entry per model: {sorted(e)}."
+          for m in e:
+              assert abs(f[m][0] - e[m][0]) < 0.01 and abs(f[m][1] - e[m][1]) < 0.5, f"Fit for {m} should be about ({e[m][0]:.2f} ms/token, {e[m][1]:.0f} ms), got {f[m]}. Use x = output_tokens, y = duration_ms, successful llm spans only."
+          check_equal("corr_out", tol=1e-6)
+          check_equal("corr_in", tol=1e-6)
+      - instructions:
+          - "A proposed fix asks ORBIT for brief answers, which would keep every reply to at most 150 output tokens. Predict each successful LLM span's new duration with its model's fit and `min(output_tokens, 150)`."
+          - "Add the request's other spans back to get each request's projected total, and store the 0.95 quantile in `projected_p95`. The target is under 5,000 ms."
+        hint: |
+          `ok.apply(lambda r: fits[r["model"]][1] + fits[r["model"]][0] * min(r["output_tokens"], 150), axis=1)` gives
+          the projected LLM time. Other spans: `t[t["span"] != "llm"].groupby("trace_id")["duration_ms"].sum()`.
+        sample_code: |
+          proj_llm = pd.Series(
+              [fits[m][1] + fits[m][0] * min(o, 150) for m, o in zip(ok["model"], ok["output_tokens"])],
+              index=ok["trace_id"],
+          )
+          other = t[t["span"] != "llm"].groupby("trace_id")["duration_ms"].sum()
+          projected_total = ____
+          projected_p95 = ____
+          print(f"p95 now {requests['total_ms'].quantile(0.95):.0f} ms, projected {projected_p95:.0f} ms")
+        solution: |
+          proj_llm = pd.Series(
+              [fits[m][1] + fits[m][0] * min(o, 150) for m, o in zip(ok["model"], ok["output_tokens"])],
+              index=ok["trace_id"],
+          )
+          other = t[t["span"] != "llm"].groupby("trace_id")["duration_ms"].sum()
+          projected_total = proj_llm + other.reindex(proj_llm.index)
+          projected_p95 = projected_total.quantile(0.95)
+          print(f"p95 now {requests['total_ms'].quantile(0.95):.0f} ms, projected {projected_p95:.0f} ms")
+        tests: |
+          check_object("projected_p95")
+          check_equal("projected_p95", tol=1e-3, msg=f"`projected_p95` should be about {sol['projected_p95']:.0f} ms: the 0.95 quantile of (projected llm time + the other spans of the same trace), over successful requests.")
+          assert user["projected_p95"] < 5000, "The projection should land under the 5,000 ms target."
+    success_msg: |
+      Two different problems. Day 11 was an **incident**: a burst of 429s that your alert catches, and only on that
+      day. The slowness is **chronic**: duration follows output tokens (correlation about 0.9; input tokens barely
+      matter), at about 28 ms per token on Sonnet. Brief answers would cut p95 from about 12 s to under 5 s. The next
+      chapter tests that fix for real, including whether brief answers are still correct.

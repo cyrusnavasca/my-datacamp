@@ -1,0 +1,241 @@
+title: Redact crew medical data
+description: Keep crew medical data away from the model and the logs. Measure a redactor's recall and over-redaction, fix the formats it misses, and pseudonymise names so answers stay useful.
+exercises:
+  - id: pii-slides
+    type: video
+    title: Minimise, redact, pseudonymise
+    slides: |
+      # Where medical data leaks
+
+      **LLM02, sensitive information disclosure**, is rarely one dramatic leak. It is data flowing to places nobody meant:
+
+      | flow | who ends up holding the data |
+      | --- | --- |
+      | the prompt | the model provider, its request logs, any prompt cache |
+      | your traces and logs | everyone with dashboard access, for the retention period (ORBIT keeps logs 90 days) |
+      | the answer | the person who asked, who may not be entitled to it |
+      | conversation history | every later turn, and anything summarised from it |
+
+      The first defence is **minimisation**: don't retrieve or send what the task doesn't need. A scheduling question
+      needs appointment times, not diagnoses. Redaction is the second line, for data you can't avoid touching.
+
+      ---
+
+      ## How a redactor works
+
+      Structured identifiers get patterns. Known names get a dictionary. Order matters: replace the most specific
+      patterns first.
+
+      ```python
+      def redact(text):
+          for name in ROSTER:                                   # dictionary: the six crew names
+              text = text.replace(name, "[NAME]")
+          text = re.sub(r"\bMR[-\s]?\d{4}\b", "[MRN]", text, flags=re.I)   # MR-1042, MR 1042, mr1042
+          text = re.sub(DOB_PATTERN, r"\1[DOB]", text, flags=re.I)        # only dates marked as birth dates
+          return text
+      ```
+
+      Real data comes in many formats: `MR-1042`, `MR 1077`, `mr1063`, `1991-02-17`, `03/11/1987`, `14 Mar 1985`. A
+      pattern written from one example misses the rest. A pattern that's too broad (any date) also destroys useful
+      data, such as appointment dates.
+
+      ---
+
+      ## Measure a redactor like a classifier
+
+      | metric | definition | target |
+      | --- | --- | --- |
+      | **recall** | share of labelled PII strings gone after redaction | 1.0 on the labelled set |
+      | **keep rate** | share of look-alike, non-PII strings still intact (`SCR-1`, `AL-2`, appointment dates) | ≥ 0.95 |
+
+      Low recall means data leaks. A low keep rate means answers lose the facts the crew needs (over-redaction is
+      over-blocking for data). Keep a labelled set of real formats, report both numbers, and add every miss you find.
+
+      ---
+
+      ## Pseudonymise when the answer needs the name
+
+      Masking every name with `[NAME]` makes "who needs a follow-up?" unanswerable. **Pseudonymisation** swaps each
+      name for a stable token, sends the tokens to the model, and swaps them back in **your** code afterwards:
+
+      ```python
+      masked, mapping = pseudonymise(note)       # "Priya Raman" -> "CREW_1"; mapping stays on the station
+      reply = client.messages.create(..., messages=[{"role": "user", "content": masked + question}])
+      answer = restore(reply.text, mapping)      # "CREW_1" -> "Priya Raman", only for authorised readers
+      ```
+
+      The provider and the logs see `CREW_1`. The medical officer sees the name. Run the redactor on the **output** too:
+      the model can repeat identifiers that slipped through.
+
+      ---
+
+      ## Trade-offs
+
+      | approach | recall | precision | latency / cost | failure mode | wins when |
+      | --- | --- | --- | --- | --- | --- |
+      | don't send it (minimise) | total | n/a | saves tokens | the task can't be done | the task doesn't need the field |
+      | regex + dictionary | high on known formats | high if patterns are anchored | microseconds | new formats slip through | identifiers have structure; names are a known list |
+      | NER model | good on free text, names | medium | ms-100s of ms, a model to host | misses rare names; tags look-alikes | open-ended names and places |
+      | LLM redaction | good | medium | a full extra call | sends the data to a model to redact it | rarely; the data has already left |
+      | pseudonymise + restore | as good as the detector | high | microseconds | a missed name stays real | the answer needs the identity |
+
+      **Playbook: "medical data in the traces."** Measure the share of logged prompts containing PII, by pattern.
+      Diagnose with the missed formats and the destroyed look-alikes. Fix the patterns, anchoring them to context
+      (`DOB`, `born`). Verify recall 1.0 and keep rate ≥ 0.95, then scan the logs again.
+
+  - id: fix-redactor
+    type: coding
+    title: "Symptom: medical data in the traces"
+    context: |
+      Crew medical record numbers and birth dates keep showing up in ORBIT's traces. The current `redact_v1` handles only
+      `MR-` numbers and ISO dates. `MEDICAL_NOTES` is a labelled set: each note's `pii` strings must disappear, and its
+      `keep` strings must survive. `redaction_scores(fn)` returns `recall`, `keep_rate`, and the `missed` and `destroyed` strings.
+    instructions:
+      - "**Measure:** store `redaction_scores(redact_v1)` in `v1`. Print its `missed` and `destroyed` lists to diagnose."
+      - "**Fix:** write `redact(text)`: replace every name in `ROSTER` with `[NAME]`; replace record numbers in any of the formats you saw (`MR-1042`, `MR 1077`, `mr1063`, `MR1099`) with `[MRN]`; replace a date with `[DOB]` only when it follows `DOB`, `born` or `date of birth`."
+      - "**Verify:** store `redaction_scores(redact)` in `v2`. It needs recall 1.0 and keep rate at least 0.95."
+    hint: |
+      Record numbers: `r"\bMR[-\s]?\d{4}\b"` with `flags=re.I`. Birth dates: capture the prefix and keep it,
+      `re.sub(rf"(\b(?:DOB:?|born|date of birth:?)\s*){DATE}", r"\1[DOB]", text, flags=re.I)`, where `DATE` (provided)
+      matches the three date formats.
+    pre_code: |
+      import re
+      from kits.ai_security_guardrails import MEDICAL_NOTES, ROSTER, redaction_scores
+      DATE = r"(?:\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}|\d{1,2} [A-Z][a-z]{2} \d{4})"
+
+      def redact_v1(text):
+          text = re.sub(r"MR-\d{4}", "[MRN]", text)
+          text = re.sub(r"\d{4}-\d{2}-\d{2}", "[DATE]", text)
+          return text
+    sample_code: |
+      v1 = ____
+      print(v1["recall"], v1["keep_rate"])
+      print("missed:", v1["missed"])
+      print("destroyed:", v1["destroyed"])
+
+      def redact(text):
+          for name in ROSTER:
+              text = ____
+          text = re.sub(____, "[MRN]", text, flags=re.I)
+          text = re.sub(____, r"\1[DOB]", text, flags=re.I)
+          return text
+
+      v2 = redaction_scores(redact)
+      print(v2)
+    solution: |
+      v1 = redaction_scores(redact_v1)
+      print(v1["recall"], v1["keep_rate"])
+      print("missed:", v1["missed"])
+      print("destroyed:", v1["destroyed"])
+
+      def redact(text):
+          for name in ROSTER:
+              text = text.replace(name, "[NAME]")
+          text = re.sub(r"\bMR[-\s]?\d{4}\b", "[MRN]", text, flags=re.I)
+          text = re.sub(rf"(\b(?:DOB:?|born|date of birth:?)\s*){DATE}", r"\1[DOB]", text, flags=re.I)
+          return text
+
+      v2 = redaction_scores(redact)
+      print(v2)
+    tests: |
+      check_equal("v1", msg="Store `redaction_scores(redact_v1)` in `v1`.")
+      v2 = check_object("v2")
+      assert v2["recall"] == 1.0, f"Recall is {v2['recall']}; still missed: {v2['missed']}. Cover every record-number format and every birth-date format."
+      assert v2["keep_rate"] >= 0.95, f"Keep rate is {v2['keep_rate']}; destroyed: {v2['destroyed']}. Only redact dates that follow DOB, born or date of birth."
+      out = user["redact"]("Priya Raman (Mr-1042, born 1 Jan 1990) has a check on 2026-12-24 near AL-1.")
+      assert "Priya Raman" not in out and "1042" not in out and "1990" not in out, f"A held-out note still leaks PII: {out!r}"
+      assert "2026-12-24" in out and "AL-1" in out, f"A held-out note lost non-PII facts: {out!r}"
+    success_msg: |
+      v1 missed 11 of 17 PII strings and destroyed three appointment dates. It was too narrow and too broad at once.
+      Anchoring dates to their context fixed both. Keep the labelled set and add every new format you find in the traces.
+
+  - id: pseudonymise
+    type: coding
+    title: Pseudonymise, ask, restore
+    context: |
+      The medical officer asks who needs a follow-up. Names must not reach the model. `client` records every prompt it
+      receives in `rec.prompts`. `NOTE` mentions two crew members, and `ROSTER` lists the crew.
+    instructions:
+      - "Write `pseudonymise(text)`: for each name in `ROSTER` that appears in `text`, replace it with `CREW_1`, `CREW_2`, ... (in roster order) and record `mapping[token] = name`. Return `(masked, mapping)`."
+      - "Write `restore(text, mapping)` that puts the names back."
+      - "Send `masked` inside `<document id=\"note\">...</document>` followed by `QUESTION`, and store `restore(reply.text, mapping)` in `answer`."
+    hint: |
+      Build the token as `f"CREW_{len(mapping) + 1}"` before adding to `mapping`. To restore, loop over
+      `mapping.items()` and `text = text.replace(token, name)`.
+    pre_code: |
+      import aikit
+      from kits.ai_security_guardrails import *
+      rec = recording(aikit.grounded())
+      client = FakeClaude(rec, clock=VirtualClock())
+      NOTE = MEDICAL_NOTES[0]["text"] + " Kenji Watanabe has no appointments this week."
+      QUESTION = "Who needs a follow-up appointment, and when?"
+    sample_code: |
+      def pseudonymise(text):
+          mapping = {}
+          for name in ROSTER:
+              if name in text:
+                  token = ____
+                  mapping[token] = name
+                  text = ____
+          return text, mapping
+
+      def restore(text, mapping):
+          for token, name in mapping.items():
+              text = ____
+          return text
+
+      masked, mapping = pseudonymise(NOTE)
+      reply = client.messages.create(model=MODEL, max_tokens=300, system="You help the medical officer.",
+                                     messages=[{"role": "user", "content": ____}])
+      answer = ____
+      print(masked)
+      print(answer)
+    solution: |
+      def pseudonymise(text):
+          mapping = {}
+          for name in ROSTER:
+              if name in text:
+                  token = f"CREW_{len(mapping) + 1}"
+                  mapping[token] = name
+                  text = text.replace(name, token)
+          return text, mapping
+
+      def restore(text, mapping):
+          for token, name in mapping.items():
+              text = text.replace(token, name)
+          return text
+
+      masked, mapping = pseudonymise(NOTE)
+      reply = client.messages.create(model=MODEL, max_tokens=300, system="You help the medical officer.",
+                                     messages=[{"role": "user", "content": f'<document id="note">{masked}</document>\n{QUESTION}'}])
+      answer = restore(reply.text, mapping)
+      print(masked)
+      print(answer)
+    tests: |
+      check_equal("mapping", {"CREW_1": "Priya Raman", "CREW_2": "Kenji Watanabe"}, msg="`mapping` should map CREW_1 and CREW_2 to the two names in roster order.")
+      prompts = user["rec"].prompts
+      assert prompts, "Call `client.messages.create(...)` so the model sees the masked note."
+      roster = ["Amara Okafor", "Tomas Lindqvist", "Priya Raman", "Kenji Watanabe", "Lucía Ferreira", "Noor Haddad"]
+      assert not any(n in p for p in prompts for n in roster), "A crew name reached the model. Send `masked`, not `NOTE`."
+      assert "Priya Raman" in user["answer"] and "CREW_" not in user["answer"], "`answer` should be the reply with every token swapped back to a name."
+      assert user["restore"]("CREW_2 and CREW_1", {"CREW_1": "A", "CREW_2": "B"}) == "B and A", "`restore` should replace every token with its name."
+    success_msg: |
+      The model only ever saw `CREW_1` and `CREW_2`, and the medical officer still got names. The record number in the
+      note went to the model, though. Run the redactor on the note as well, because the task never needs the number.
+      Pseudonymise what the answer needs, and drop the rest.
+
+  - id: data-handling
+    type: classify
+    title: Send, pseudonymise or never send?
+    prompt: ORBIT is building a prompt for a medical-officer request. Decide how each piece of data is handled.
+    hint: If the task doesn't need it, don't send it. If the answer needs to name someone, pseudonymise. Public, non-personal facts can go as they are.
+    zones: [Send as is, Pseudonymise first, Never send]
+    items:
+      - { text: The handbook page on medical emergencies, zone: Send as is }
+      - { text: "Today's appointment slots with no names attached", zone: Send as is }
+      - { text: Module A temperature reading, zone: Send as is }
+      - { text: Crew names in notes the medical officer wants summarised, zone: Pseudonymise first }
+      - { text: Names of crew members a reminder message must address, zone: Pseudonymise first }
+      - { text: Medical record numbers the task never uses, zone: Never send }
+      - { text: The airlock override code, zone: Never send }
+      - { text: Network passwords from the IT handbook appendix, zone: Never send }

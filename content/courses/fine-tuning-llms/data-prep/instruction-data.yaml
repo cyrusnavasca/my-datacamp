@@ -1,0 +1,242 @@
+title: Instruction data that is worth training on
+description: Chat-format training records, and a cleaning pipeline that reports why every line was dropped.
+exercises:
+  - id: intro
+    type: video
+    title: What a training example looks like
+    slides: |
+      # One example = one conversation
+
+      Supervised fine-tuning (SFT) data for a chat model is a list of conversations in the same shape as
+      the API's `messages`, stored one JSON object per line (**JSONL**):
+
+      ```json
+      {"messages": [
+        {"role": "system", "content": "You triage crew tickets on Helios-7. Reply with one category: ..."},
+        {"role": "user", "content": "Printer in Module C says offline."},
+        {"role": "assistant", "content": "it"}
+      ]}
+      ```
+
+      - The **assistant** turn is what the model learns to produce. Everything before it is the context it learns to respond to.
+      - Use the **same system prompt** you will use in production. Train with one prompt and serve with
+        another, and you are testing a different setup from the one you trained.
+
+      ---
+
+      ## The chat template turns messages into tokens
+
+      ```python
+      from transformers import AutoTokenizer
+      tok = AutoTokenizer.from_pretrained(BASE_MODEL)
+      text = tok.apply_chat_template(record["messages"], tokenize=False)
+      # '<|system|>You triage ...<|end|><|user|>Printer in Module C says offline.<|end|><|assistant|>it<|end|>'
+      ```
+
+      Each model family has its own special tokens. Training with the **wrong template** (or none) is a
+      silent quality killer: the model learns from text that looks nothing like what it sees at
+      inference. Always use the base model's own template, for training and for serving.
+
+      ---
+
+      ## Quality beats quantity
+
+      A few hundred clean, consistent, varied examples often beat tens of thousands of noisy ones.
+      What matters:
+
+      - **Consistent labels**: the same kind of ticket gets the same answer every time. Inconsistent labels teach noise.
+      - **Varied phrasing**: many ways of saying each thing, not 80 copies of one template.
+      - **Coverage**: every category and edge case you care about, including rare ones.
+      - **Nothing you can't afford to leak**: models can memorise rare strings such as codes, names and
+        medical details, and repeat them later.
+
+      ---
+
+      ## The cleaning pipeline
+
+      | step | check | if you skip it |
+      | --- | --- | --- |
+      | Parse | every line is valid JSON | the loader crashes, or silently skips lines |
+      | Schema | has a non-empty user and assistant turn | the model learns from empty or partial examples |
+      | Normalise labels | `" Maintenance"` becomes `"maintenance"` | the same class is split in two |
+      | Filter labels | the label is in the allowed set | the model learns labels you can't route |
+      | Filter content | no secrets or PII, not absurdly long | memorisation; long pastes dominate the loss |
+      | Deduplicate | on normalised text | over-weights repeats, and leaks across your split (next lesson) |
+
+      ---
+
+      ## Report why every line was dropped
+
+      ```python
+      drops = Counter()
+      for line in lines:
+          try:
+              rec = json.loads(line)
+          except json.JSONDecodeError:
+              drops["bad_json"] += 1
+              continue
+          ...
+      print(drops)   # Counter({'duplicate': 82, 'bad_json': 2, ...})
+      ```
+
+      The drop report is a diagnostic. If 40% of lines fall into one bucket, the **export** is probably
+      broken, and the fix belongs upstream, not in your filter.
+
+  - id: to-chat-records
+    type: coding
+    title: Tickets to chat records
+    context: |
+      `tickets` is a DataFrame of 5 labelled crew tickets with `text` and `category` columns. `SYSTEM`
+      holds ORBIT's production triage prompt. `json` is imported.
+    instructions:
+      - "Write `to_record(text, category)` that returns `{\"messages\": [...]}` with three turns: `system` (`SYSTEM`), `user` (the ticket text) and `assistant` (the category)."
+      - "Store a list of records, one per row of `tickets`, in `records`."
+      - "Store the JSONL text in `jsonl`: one `json.dumps(record)` per line, joined with `\"\\n\"`."
+    hint: "Each turn is a dict like `{\"role\": \"user\", \"content\": text}`. Build `jsonl` with `\"\\n\".join(json.dumps(r) for r in records)`."
+    pre_code: |
+      import json
+      import aikit
+      from kits.fine_tuning_llms import TRIAGE_SYSTEM as SYSTEM
+      tickets = aikit.helios.tickets()[["text", "category"]].head(5)
+    sample_code: |
+      def to_record(text, category):
+          return {"messages": [
+              {"role": "system", "content": SYSTEM},
+              ____,
+              ____,
+          ]}
+
+      records = [to_record(t, c) for t, c in zip(tickets.text, tickets.category)]
+      jsonl = ____
+      print(jsonl.splitlines()[0])
+    solution: |
+      def to_record(text, category):
+          return {"messages": [
+              {"role": "system", "content": SYSTEM},
+              {"role": "user", "content": text},
+              {"role": "assistant", "content": category},
+          ]}
+
+      records = [to_record(t, c) for t, c in zip(tickets.text, tickets.category)]
+      jsonl = "\n".join(json.dumps(r) for r in records)
+      print(jsonl.splitlines()[0])
+    tests: |
+      import json
+      check_equal("records", msg="Each record should be `{\"messages\": [system, user, assistant]}` with `role` and `content` keys, in that order.")
+      j = check_object("jsonl")
+      lines = j.strip().split("\n")
+      assert len(lines) == 5, f"`jsonl` should have one line per ticket (5); it has {len(lines)}."
+      assert [json.loads(l) for l in lines] == sol["records"], "Each line of `jsonl` should be `json.dumps` of one record."
+    success_msg: These lines are exactly what a fine-tuning API or a Hugging Face `datasets.load_dataset("json", ...)` call expects.
+
+  - id: clean-export
+    type: coding
+    title: Clean a messy export
+    context: |
+      `lines` holds the 213 raw lines of the crew portal's export. Most are valid records with a user
+      turn and an assistant label, but the export also contains the usual problems. `CATEGORIES` lists
+      the five allowed labels and `normalize(text)` lowercases and collapses whitespace. `json`, `re`
+      and `Counter` are imported.
+    instructions:
+      - "For each line, in order: parse it with `json.loads` (count `\"bad_json\"` and skip on `json.JSONDecodeError`), then take the user and assistant `content`. Skip with `\"missing_or_empty\"` if either is missing or the user text is blank."
+      - "Normalise the label with `.strip().lower()`; skip with `\"bad_label\"` if it is not in `CATEGORIES`. Skip with `\"secret\"` if the user text contains 4 digits in a row (`re.search(r\"\\d{4}\", text)`), and with `\"too_long\"` if it has more than 40 words."
+      - "Skip with `\"duplicate\"` if `normalize(user)` was already kept. Otherwise append `{\"text\": user.strip(), \"category\": label}` to `clean`."
+      - "Count the reasons in the Counter `drops` and print `len(clean)` and `drops`."
+    hint: "`next((m[\"content\"] for m in msgs if m[\"role\"] == \"user\"), None)` finds the user turn or gives `None`. Keep a `seen` set of normalised texts."
+    pre_code: |
+      import json
+      import re
+      from collections import Counter
+      from kits.fine_tuning_llms import messy_jsonl, CATEGORIES, normalize
+      lines = messy_jsonl()
+    sample_code: |
+      clean, drops, seen = [], Counter(), set()
+      for line in lines:
+          try:
+              rec = json.loads(line)
+          except json.JSONDecodeError:
+              drops["bad_json"] += 1
+              continue
+          msgs = rec.get("messages", [])
+          user = next((m["content"] for m in msgs if m["role"] == "user"), None)
+          asst = next((m["content"] for m in msgs if m["role"] == "assistant"), None)
+          if ____:
+              drops["missing_or_empty"] += 1
+              continue
+          label = ____
+          if label not in CATEGORIES:
+              drops["bad_label"] += 1
+              continue
+          if ____:
+              drops["secret"] += 1
+              continue
+          if ____:
+              drops["too_long"] += 1
+              continue
+          key = normalize(user)
+          if key in seen:
+              drops["duplicate"] += 1
+              continue
+          seen.add(key)
+          clean.append(____)
+
+      print(len(clean), drops)
+    solution: |
+      clean, drops, seen = [], Counter(), set()
+      for line in lines:
+          try:
+              rec = json.loads(line)
+          except json.JSONDecodeError:
+              drops["bad_json"] += 1
+              continue
+          msgs = rec.get("messages", [])
+          user = next((m["content"] for m in msgs if m["role"] == "user"), None)
+          asst = next((m["content"] for m in msgs if m["role"] == "assistant"), None)
+          if user is None or asst is None or not user.strip():
+              drops["missing_or_empty"] += 1
+              continue
+          label = asst.strip().lower()
+          if label not in CATEGORIES:
+              drops["bad_label"] += 1
+              continue
+          if re.search(r"\d{4}", user):
+              drops["secret"] += 1
+              continue
+          if len(user.split()) > 40:
+              drops["too_long"] += 1
+              continue
+          key = normalize(user)
+          if key in seen:
+              drops["duplicate"] += 1
+              continue
+          seen.add(key)
+          clean.append({"text": user.strip(), "category": label})
+
+      print(len(clean), drops)
+    tests: |
+      c = check_object("clean")
+      want = sol["clean"]
+      assert len(c) == len(want), f"`clean` should keep {len(want)} records; it has {len(c)}. Compare your `drops` counts with the instructions to see which check is off."
+      assert all(isinstance(r, dict) and set(r) == {"text", "category"} for r in c), "Each kept record should be a dict with exactly `text` and `category` keys."
+      assert sorted((r["text"], r["category"]) for r in c) == sorted((r["text"], r["category"]) for r in want), "`clean` has the right size but different records. Strip the user text and store the normalised (`.strip().lower()`) label."
+      d = dict(check_object("drops"))
+      assert d == dict(sol["drops"]), f"`drops` should be {dict(sol['drops'])}; got {d}. Run the checks in the order given."
+    success_msg: "213 lines in, 122 records out, and the report says why: 82 duplicates (the export repeats tickets), 2 broken lines, 2 unroutable labels, 2 tickets with access codes, 1 empty ticket, 1 missing answer and 1 pasted log. Two labels were rescued by normalising them rather than being dropped."
+
+  - id: keep-fix-drop
+    type: classify
+    title: Keep, fix or drop?
+    prompt: "A reviewer flagged these records in a fine-tuning set. Sort each one. **Fix** means a mechanical change you are certain of; anything that would need a guess is not a fix."
+    hint: Would the record teach the model something wrong or dangerous? Can you repair it without guessing?
+    zones: [Keep, Fix and keep, Drop]
+    items:
+      - { text: "Label is 'IT' where the label set uses 'it'", zone: Fix and keep }
+      - { text: "Assistant label has a trailing space", zone: Fix and keep }
+      - { text: "System prompt missing, while every other record has the production one", zone: Fix and keep }
+      - { text: "A correctly labelled ticket written in Portuguese (some crew write in Portuguese)", zone: Keep }
+      - { text: "A short but clear ticket: 'printer offline'", zone: Keep }
+      - { text: "One of only 6 examples of a rare category", zone: Keep }
+      - { text: "A copy of another record with extra spaces", zone: Drop }
+      - { text: "Label 'hardware', which is not one of the five categories", zone: Drop }
+      - { text: "A ticket that pastes a crew member's full medical history", zone: Drop }
+      - { text: "A line cut off in the middle of the JSON", zone: Drop }

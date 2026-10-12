@@ -1,0 +1,317 @@
+title: Measure before you tune
+description: Recall@k for retrieval, answer accuracy for the whole pipeline, the k trade-off, and your first Symptom-Measure-Diagnose-Fix-Verify loop.
+exercises:
+  - id: measure-slides
+    type: video
+    title: Two stages, two metrics
+    slides: |
+      # "We implemented RAG" is not a result
+
+      Hiring managers treat a RAG project with **no recall numbers** as a red flag. A demo that answers three questions
+      well tells you nothing about the fourth. You need a **labelled set**: questions with known answers and the ids
+      of the documents that contain them.
+
+      ```python
+      {"id": "q01", "question": "How long is the leak-check hold when depressurising AL-1?",
+       "answer": "8 minutes at 0.7 bar.", "doc_ids": ["airlock-procedure"], "type": "factual"}
+      ```
+
+      Helios has 45: factual, multi-hop (the answer needs two docs) and **unanswerable** (`doc_ids == []`, the right
+      reply is "I don't know"). Measure two stages separately:
+
+      | metric | stage | question it answers |
+      | --- | --- | --- |
+      | **recall@k** | retrieval | did the top k contain *all* the gold docs? (answerable questions only) |
+      | **answer accuracy** | whole pipeline | was the final answer right? (a refusal is right for unanswerables) |
+
+      ---
+
+      ## Computing both
+
+      ```python
+      def recall_at_k(qs, k):
+          answerable = [q for q in qs if q["doc_ids"]]
+          hits = 0
+          for q in answerable:
+              got = {c["doc_id"] for c in retrieve(q["question"], k)}
+              hits += all(g in got for g in q["doc_ids"])      # multi-hop needs every gold doc
+          return hits / len(answerable)
+      ```
+
+      For accuracy you need a **scorer**. Here `is_correct(q, answer)` checks that the answer contains the key facts
+      (e.g. `8 minutes`), doesn't contain stale ones (`5 minutes`), and refuses unanswerables. Exact string match is
+      too strict for free text; an LLM judge is flexible but costs a call per answer (see the evaluation course).
+      Fact patterns are cheap, deterministic and good enough for short factual answers.
+
+      ---
+
+      ## Reading the two numbers together
+
+      | | answer right | answer wrong |
+      | --- | --- | --- |
+      | **gold doc retrieved** | working | **generation** problem: the model had the fact and missed it (or the chunk was cut badly) |
+      | **gold doc missed** | lucky, or the labels are incomplete | **retrieval** problem: the model never saw the fact |
+
+      Recall is an **upper bound** on what the generator can do with facts it never saw. If recall is 0.78, no prompt
+      will push accuracy on those questions much past 0.78. Always look at *which* questions fail and in *which* cell.
+
+      ---
+
+      ## The k trade-off, measured
+
+      Whole handbook docs, dense retrieval, the 45 Helios questions:
+
+      | k | recall@k | accuracy | context tokens per question |
+      | --- | --- | --- | --- |
+      | 1 | 0.78 | 0.82 | 96 |
+      | 2 | 0.95 | 0.89 | 188 |
+      | 3 | **1.00** | **0.91** | 274 |
+      | 5 | 1.00 | 0.91 | 475 |
+
+      Raising k buys recall with tokens, and returns diminish: k=5 costs 73% more than k=3 for the same accuracy. More
+      chunks also mean more distractors for the generator. Pick **the smallest k that meets your accuracy target
+      within your token budget**, and re-measure when the corpus grows.
+
+      ---
+
+      ## The troubleshooting loop
+
+      Every RAG fix in this course follows the same five steps:
+
+      1. **Symptom**: "ORBIT keeps saying it doesn't know", "it gave the old airlock time".
+      2. **Measure** on the whole labelled set, not just the reported question: recall@k, accuracy, tokens.
+      3. **Diagnose**: put each failure in a cell of the table above. Read the retrieved chunks for a few of them.
+      4. **Fix** the stage that's failing. Retrieval misses: raise k, better chunking, hybrid search, query rewriting. Generation misses: prompt, chunk boundaries, reranking.
+      5. **Verify**: re-run the same measurement. A fix that helps one question can break three others.
+
+  - id: recall-at-k
+    type: coding
+    title: Recall@k by hand
+    context: |
+      `QS` is the list of 45 Helios questions; each has `question` and `doc_ids` (empty for unanswerables).
+      `retrieve(question, k)` returns the top `k` handbook docs as dicts with `doc_id`, `text` and `score`.
+    instructions:
+      - "Write `recall_at_k(qs, k)`: over the answerable questions only, return the share whose gold `doc_ids` are **all** among the `doc_id`s retrieved for them."
+      - "Store `recall_at_k(QS, 1)` in `recall_1` and `recall_at_k(QS, 3)` in `recall_3`, and print both."
+    hint: |
+      Filter with `[q for q in qs if q["doc_ids"]]`. For each question build `got = {c["doc_id"] for c in retrieve(q["question"], k)}`
+      and count it as a hit when `all(g in got for g in q["doc_ids"])`.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import DenseIndex, make_chunks, questions
+      QS = questions()
+      retrieve = DenseIndex(make_chunks(aikit.helios.handbook(), title=False)).search
+      print(retrieve("What time is dinner?", 2))
+    sample_code: |
+      def recall_at_k(qs, k):
+          answerable = ____
+          hits = 0
+          for q in answerable:
+              got = ____
+              hits += ____
+          return hits / len(answerable)
+
+      recall_1 = recall_at_k(QS, 1)
+      recall_3 = recall_at_k(QS, 3)
+      print(recall_1, recall_3)
+    solution: |
+      def recall_at_k(qs, k):
+          answerable = [q for q in qs if q["doc_ids"]]
+          hits = 0
+          for q in answerable:
+              got = {c["doc_id"] for c in retrieve(q["question"], k)}
+              hits += all(g in got for g in q["doc_ids"])
+          return hits / len(answerable)
+
+      recall_1 = recall_at_k(QS, 1)
+      recall_3 = recall_at_k(QS, 3)
+      print(recall_1, recall_3)
+    tests: |
+      check_object("recall_at_k")
+      check_equal("recall_1", msg="`recall_1` isn't right. Count only answerable questions (non-empty `doc_ids`), and for multi-hop questions require every gold doc.")
+      check_equal("recall_3")
+      f = user["recall_at_k"]
+      multi = [q for q in user["QS"] if q["type"] == "multi-hop"]
+      assert abs(f(multi, 1) - 0.0) < 1e-9, "Multi-hop questions need *all* their gold docs, so with k=1 none of them can be a hit. Use `all(...)`, not `any(...)`."
+    success_msg: |
+      Recall@1 is 0.78 and recall@3 is 1.0. With one document, 9 of 41 answerable questions never show ORBIT the doc
+      it needs, including every multi-hop question, which can't fit in one doc by definition.
+
+  - id: answer-accuracy
+    type: coding
+    title: Answer accuracy and the failure list
+    context: |
+      `rag_answer(question, k)` runs the full pipeline (retrieve `k` docs, prompt, grounded FakeClaude) and returns the
+      reply text. `is_correct(q, answer)` returns `True` when the answer has the gold facts, or refuses an unanswerable question.
+    instructions:
+      - "Write `accuracy(qs, k)`: answer every question with `rag_answer`, and return a tuple `(share_correct, failed_ids)` where `failed_ids` lists the `id` of each wrong answer in question order."
+      - "Store the result for `k=1` in `acc_1, failed_1` and for `k=3` in `acc_3, failed_3`. Print them."
+    hint: |
+      Loop over `qs`; `a = rag_answer(q["question"], k)`; if `is_correct(q, a)` count it, otherwise append `q["id"]`.
+      Return `right / len(qs), failed`.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import DenseIndex, make_chunks, questions, make_client, generate, is_correct
+      QS = questions()
+      retrieve = DenseIndex(make_chunks(aikit.helios.handbook(), title=False)).search
+      client = make_client()
+
+      def rag_answer(question, k=3):
+          return generate(client, question, retrieve(question, k))
+    sample_code: |
+      def accuracy(qs, k):
+          right, failed = 0, []
+          for q in qs:
+              a = ____
+              if ____:
+                  right += 1
+              else:
+                  failed.append(____)
+          return right / len(qs), failed
+
+      acc_1, failed_1 = accuracy(QS, 1)
+      acc_3, failed_3 = accuracy(QS, 3)
+      print(acc_1, failed_1)
+      print(acc_3, failed_3)
+    solution: |
+      def accuracy(qs, k):
+          right, failed = 0, []
+          for q in qs:
+              a = rag_answer(q["question"], k)
+              if is_correct(q, a):
+                  right += 1
+              else:
+                  failed.append(q["id"])
+          return right / len(qs), failed
+
+      acc_1, failed_1 = accuracy(QS, 1)
+      acc_3, failed_3 = accuracy(QS, 3)
+      print(acc_1, failed_1)
+      print(acc_3, failed_3)
+    tests: |
+      check_object("accuracy")
+      check_equal("acc_1", msg="`acc_1` should be the share of all 45 questions answered correctly with k=1 (unanswerables included).")
+      check_equal("failed_1", msg="`failed_1` should list the ids of the wrong answers with k=1, in question order.")
+      check_equal("acc_3")
+      check_equal("failed_3")
+    success_msg: |
+      Raising k from 1 to 3 fixed q05, q23, q30 and q38: their gold docs were ranked 2nd or 3rd. Four failures survive
+      any k: q01 (the superseded 2024 airlock doc gets quoted), q36 (the flood report's body never says "flood"), q39
+      (a two-part answer) and q44 (an unanswerable question that gets an answer). Raising k can't fix those. Chapters 2-4 can.
+
+  - id: choose-k
+    type: mc
+    title: Choose k under a budget
+    question: |
+      ORBIT's latency target allows at most **300 context tokens** per question, and the crew wants the highest accuracy
+      that fits. Using the measured table (k=1: recall 0.78, accuracy 0.82, 96 tokens; k=2: 0.95, 0.89, 188;
+      k=3: 1.00, 0.91, 274; k=5: 1.00, 0.91, 475), which k do you ship?
+    options:
+      - text: k=1, because it is the cheapest and fastest.
+        feedback: It fits the budget with room to spare, but recall@1 is 0.78, so ORBIT never sees the right document for about 1 question in 5. You'd be leaving 9 points of accuracy on the table for no reason.
+      - text: k=2, because it is the best accuracy per token.
+        feedback: k=2 is efficient, but the brief is the highest accuracy that fits in 300 tokens. k=3 fits too and is 2 points more accurate, with recall at 1.0.
+      - text: k=3
+        correct: true
+        feedback: Right. It is the smallest k that reaches the accuracy plateau (0.91) and recall 1.0, and at 274 tokens it fits the 300-token budget. Re-measure when the handbook grows, because the best k drifts with the corpus.
+      - text: k=5, so ORBIT is never missing a document.
+        feedback: k=5 costs 475 tokens, over the budget, and buys no accuracy over k=3. Recall was already 1.0. Extra chunks are pure cost plus extra distractors.
+    hint: First drop the options over the budget, then pick the most accurate of the rest. If two tie, take the cheaper one.
+
+  - id: crew-complaints
+    type: sequential
+    title: "Mission: ORBIT says \"I don't know\" too often"
+    context: |
+      **Symptom.** The first ORBIT prototype retrieves **one** handbook document per question. The crew reports wrong
+      answers and too many "I don't know"s. Work the loop: measure, diagnose, fix, verify.
+
+      `evaluate(retrieve, k=k)` runs the whole pipeline over the 45 questions and returns a dict with `recall`,
+      `accuracy`, `context_tokens` (mean per question) and `rows`, a DataFrame with one row per question: `id`, `hit`
+      (gold docs all retrieved; `None` for unanswerables), `correct`, `answer`, `retrieved` and more.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import DenseIndex, make_chunks, evaluate
+      retrieve = DenseIndex(make_chunks(aikit.helios.handbook(), title=False)).search
+    steps:
+      - instructions:
+          - "**Measure.** Run `evaluate(retrieve, k=1)` and store it in `before`."
+          - "Print `before[\"recall\"]`, `before[\"accuracy\"]` and `before[\"context_tokens\"]`."
+        hint: "`before = evaluate(retrieve, k=1)`"
+        sample_code: |
+          before = ____
+          print(____, ____, ____)
+        solution: |
+          before = evaluate(retrieve, k=1)
+          print(before["recall"], before["accuracy"], before["context_tokens"])
+        tests: |
+          b = check_object("before")
+          assert isinstance(b, dict) and "rows" in b, "`before` should be the dict returned by `evaluate(retrieve, k=1)`."
+          assert b["accuracy"] == sol["before"]["accuracy"], "Use `k=1`, the prototype's setting."
+      - instructions:
+          - "**Diagnose.** From `before[\"rows\"]`, take the wrong answers (`correct` is False)."
+          - "Store the ids of the wrong answers whose gold docs were **not** retrieved (`hit == False`) in `retrieval_misses` (a list), and the ids of the wrong answers whose gold docs **were** retrieved (`hit == True`) in `generation_misses`."
+          - Print both.
+        hint: |
+          `rows = before["rows"]`, `wrong = rows[~rows["correct"]]`, then `list(wrong[wrong["hit"] == False]["id"])`.
+          Unanswerable questions have `hit` set to None, so they land in neither list.
+        sample_code: |
+          rows = before["rows"]
+          wrong = rows[____]
+          retrieval_misses = list(wrong[____]["id"])
+          generation_misses = list(wrong[____]["id"])
+          print(retrieval_misses, generation_misses)
+        solution: |
+          rows = before["rows"]
+          wrong = rows[~rows["correct"]]
+          retrieval_misses = list(wrong[wrong["hit"] == False]["id"])
+          generation_misses = list(wrong[wrong["hit"] == True]["id"])
+          print(retrieval_misses, generation_misses)
+        tests: |
+          check_equal("retrieval_misses", msg="`retrieval_misses` should hold the ids of wrong answers with `hit == False`.")
+          check_equal("generation_misses", msg="`generation_misses` should hold the ids of wrong answers with `hit == True`.")
+      - instructions:
+          - "**Fix.** Most failures are retrieval misses, so raise k. For each k from 1 to 5, run `evaluate` and store `(accuracy, context_tokens)` in a dict `sweep` keyed by k."
+          - "Set `best_k` to the **smallest** k with accuracy at least 0.9 and `context_tokens` at most 300."
+        hint: |
+          `sweep = {k: (r["accuracy"], r["context_tokens"]) for k in range(1, 6) for r in [evaluate(retrieve, k=k)]}`, then
+          `best_k = min(k for k, (acc, tok) in sweep.items() if acc >= 0.9 and tok <= 300)`.
+        sample_code: |
+          sweep = {}
+          for k in range(1, 6):
+              r = evaluate(retrieve, k=k)
+              sweep[k] = ____
+          best_k = ____
+          print(sweep, best_k)
+        solution: |
+          sweep = {}
+          for k in range(1, 6):
+              r = evaluate(retrieve, k=k)
+              sweep[k] = (r["accuracy"], r["context_tokens"])
+          best_k = min(k for k, (acc, tok) in sweep.items() if acc >= 0.9 and tok <= 300)
+          print(sweep, best_k)
+        tests: |
+          s = check_object("sweep")
+          assert set(s) == {1, 2, 3, 4, 5}, "`sweep` needs one entry per k from 1 to 5."
+          assert all(len(v) == 2 for v in s.values()), "Each value in `sweep` should be a tuple `(accuracy, context_tokens)`."
+          check_equal("best_k", msg="`best_k` should be the smallest k whose accuracy is at least 0.9 with `context_tokens` at most 300.")
+      - instructions:
+          - "**Verify.** Run `evaluate(retrieve, k=best_k)` into `after`."
+          - "Store the ids of the questions still wrong in `still_wrong` and print `after[\"accuracy\"]` and `still_wrong`."
+        hint: "`rows = after[\"rows\"]` and `list(rows[~rows[\"correct\"]][\"id\"])`."
+        sample_code: |
+          after = ____
+          still_wrong = ____
+          print(after["accuracy"], still_wrong)
+        solution: |
+          after = evaluate(retrieve, k=best_k)
+          still_wrong = list(after["rows"][~after["rows"]["correct"]]["id"])
+          print(after["accuracy"], still_wrong)
+        tests: |
+          a = check_object("after")
+          assert a["accuracy"] >= 0.9, f"Accuracy after the fix should be at least 0.9; got {a['accuracy']}. Did you use `k=best_k`?"
+          assert a["context_tokens"] <= 300, "The fix must stay within 300 context tokens per question."
+          check_equal("still_wrong")
+    success_msg: |
+      Accuracy went from 0.82 to 0.91 within budget, and you can say *why*: the misses were retrieval misses, and more
+      depth fixed them. The four that remain are different problems. q01 is a stale document (chapter 2: metadata),
+      q36 is a missing title (chapter 2), q39 needs two facts joined (generation), and q44 should be a refusal (chapter 4).

@@ -1,0 +1,204 @@
+title: "Chunking lab: fix ORBIT's index"
+description: A playbook for poor chunking, then a mission to take a broken index from 0.47 to at least 0.9 accuracy inside a token budget.
+exercises:
+  - id: lab-slides
+    type: video
+    title: "Playbook: when chunking is poor"
+    slides: |
+      # Symptoms that point at chunking
+
+      - Answers that **stop mid-thought**: "dinner at 1", "lasts at most 6.5 h".
+      - "I don't know" although the document is clearly in the index.
+      - The **right document** is cited, but the wrong fact from it is quoted.
+      - Context tokens per question creep up after a re-index, while accuracy doesn't move.
+      - Stale facts from old versions of a document.
+
+      These have one thing in common: **retrieval found the right document but handed the model the wrong piece of it**,
+      or too much of it.
+
+      ---
+
+      ## Measure, then read
+
+      Check these first, in this order:
+
+      1. **Recall@k against evidence recall against accuracy.** High recall with low evidence means the right docs come
+         back in useless pieces. High evidence with low accuracy means the pieces are there but the model can't use them
+         (noise, missing context such as titles).
+      2. **Read the retrieved chunks for 5 failed questions.** Ten minutes of reading beats an afternoon of parameter
+         sweeps. You'll see cut sentences, orphaned "it"s, headings without bodies.
+      3. **Chunk statistics.** Count chunks and look at the length distribution. Look for tiny fragments, giant blobs and
+         near-duplicates.
+      4. **Versions.** Do two docs answer the same question differently?
+
+      ---
+
+      ## Usual causes and fixes, in the order to try them
+
+      | cause | sign in the chunks | fix | what it costs |
+      | --- | --- | --- | --- |
+      | fixed windows cut facts | sentences end mid-word | split on sentences or structure | a re-index; nothing per query |
+      | fact and subject in neighbouring units | "Only Dr. Raman has **it**." | overlap, or 2-sentence windows with stride 1 | ~2x chunks; near-duplicates in top-k |
+      | chunks don't say what they're about | "Cause: mineral build-up." | title / section headers | a few tokens per chunk |
+      | chunks too big | the right doc, wrong sentence quoted; high token cost | smaller chunks, or small-to-big (retrieve small, send the parent) | an extra lookup; parent tokens |
+      | stale versions | two answers, old one first | `status` metadata + pre-filter | an ingest rule |
+
+      Change **one thing at a time** and re-measure, so you know which fix did the work.
+
+      ---
+
+      ## Verify: accuracy and cost, together
+
+      Report every config you try on the same labelled set:
+
+      | config | recall@k | evidence | accuracy | context tokens |
+      | --- | --- | --- | --- | --- |
+      | fixed 80 chars, k=5 | 0.98 | 0.80 | 0.47 | 96 |
+      | whole docs, k=5 | 1.00 | 1.00 | 0.91 | 475 |
+      | *yours* | ? | ? | **≥ 0.90** | **≤ 200** |
+
+      Whole documents are accurate but blow the budget. The goal is the **cheapest config that clears the accuracy bar**.
+      With only 45 questions, a 2-point difference is one question, so don't over-tune: prefer the simpler config when
+      results are close, and keep some questions aside to check the winner (the evaluation course covers held-out sets).
+
+  - id: read-the-chunks
+    type: mc
+    title: Read the chunks
+    question: |
+      With ORBIT's current index (fixed 80-character chunks, k=5), "What time is dinner?" gets the answer
+      `Breakfast is at 07:00, lunch at 12:30 and dinner at 1 n 15:00 and 16:00 station time.` Run `show("What time is dinner?")`
+      in the console to see the retrieved chunks. What is the cause, and what do you try first?
+    context: '`show(question)` prints the answer, then each retrieved chunk with its doc id. Try other questions too, such as "What is the maximum length of a spacewalk?"'
+    pre_code: |
+      import aikit
+      from kits.rag_systems import DenseIndex, make_chunks, chunk_fixed, make_client, generate
+      search = DenseIndex(make_chunks(aikit.helios.handbook(), lambda t: chunk_fixed(t, 80), title=False)).search
+      client = make_client()
+
+      def show(question, k=5):
+          chunks = search(question, k)
+          print("ANSWER:", generate(client, question, chunks))
+          for c in chunks:
+              print(f"  [{c['doc_id']}] {c['text']!r}")
+    options:
+      - text: The embedding model is too weak to find the galley document. Switch to a better embedding model.
+        feedback: Look at the doc ids. The galley document is retrieved first and second. Retrieval found the right document, so a new embedding model would fix nothing here.
+      - text: "A chunk boundary cuts \"19:00\" in half (\"dinner at 1\" / \"9:00.\"). Re-chunk on sentence boundaries, or add overlap."
+        correct: true
+        feedback: "Right. The fact exists only across two chunks, and the reader quotes one of them. Splitting on sentences keeps \"dinner at 19:00\" whole at no per-query cost. Overlap also works, at the price of more chunks."
+      - text: Raise k to 10 so both halves of the time are retrieved.
+        feedback: Both halves are already in the top 5. Getting them back doesn't join them, because the model quotes a chunk as it is. More k just adds cost and more fragments.
+      - text: Tell the model in the system prompt to always give complete times.
+        feedback: The model can only quote what it was given, and no chunk contains "19:00". Prompting can't repair a fact that chunking destroyed.
+    hint: Look at which documents the chunks come from, then read where the first two chunks start and end.
+
+  - id: chunking-mission
+    type: sequential
+    title: "Mission: fix ORBIT's index"
+    context: |
+      **Symptom.** After a hurried migration, ORBIT's index uses fixed 80-character chunks with no overlap, no titles,
+      and the superseded 2024 airlock doc is still in it. The crew says answers "stop mid-sentence".
+
+      Your target: **accuracy ≥ 0.9** on the 45 Helios questions with **at most 200 context tokens** per question.
+
+      Available: `HANDBOOK` (all docs) and `CURRENT` (superseded docs removed), `make_chunks(docs, chunker, title=True/False)`,
+      the chunkers `chunk_fixed(text, size, overlap)`, `chunk_sentences(text, n, stride)` and `chunk_headings(text)`,
+      `DenseIndex(chunks).search`, and `evaluate(search, k=...)`, which returns `recall`, `evidence`, `accuracy`,
+      `context_tokens` and `rows`.
+    pre_code: |
+      import aikit
+      import pandas as pd
+      from kits.rag_systems import (DenseIndex, make_chunks, chunk_fixed, chunk_sentences, chunk_headings, evaluate)
+      HANDBOOK = aikit.helios.handbook()
+      CURRENT = aikit.helios.handbook(include_superseded=False)
+      broken_chunks = make_chunks(HANDBOOK, lambda t: chunk_fixed(t, 80), title=False)
+      broken_search = DenseIndex(broken_chunks).search
+    steps:
+      - instructions:
+          - "**Measure.** Evaluate `broken_search` with `k=5` into `baseline`."
+          - "Print its `recall`, `evidence`, `accuracy` and `context_tokens`."
+        hint: "`baseline = evaluate(broken_search, k=5)`"
+        sample_code: |
+          baseline = ____
+          print(baseline["recall"], ____, ____, ____)
+        solution: |
+          baseline = evaluate(broken_search, k=5)
+          print(baseline["recall"], baseline["evidence"], baseline["accuracy"], baseline["context_tokens"])
+        tests: |
+          b = check_object("baseline")
+          assert isinstance(b, dict) and b.get("accuracy") == sol["baseline"]["accuracy"], "`baseline` should be `evaluate(broken_search, k=5)`."
+      - instructions:
+          - "**Diagnose.** Among the wrong answers in `baseline[\"rows\"]`, count those whose gold docs **were** retrieved (`hit == True`). Store the count in `right_doc_wrong_piece`."
+          - "Store the texts of the 5 chunks `broken_search` returns for `\"What is the maximum length of a spacewalk?\"` in `spacewalk_chunks` and print them."
+        hint: |
+          `rows = baseline["rows"]`, `wrong = rows[~rows["correct"]]`, `right_doc_wrong_piece = int((wrong["hit"] == True).sum())`.
+          Then `[c["text"] for c in broken_search(question, 5)]`.
+        sample_code: |
+          rows = baseline["rows"]
+          wrong = ____
+          right_doc_wrong_piece = ____
+          spacewalk_chunks = ____
+          print(right_doc_wrong_piece, "of", len(wrong), "failures had the right document")
+          for t in spacewalk_chunks:
+              print(repr(t))
+        solution: |
+          rows = baseline["rows"]
+          wrong = rows[~rows["correct"]]
+          right_doc_wrong_piece = int((wrong["hit"] == True).sum())
+          spacewalk_chunks = [c["text"] for c in broken_search("What is the maximum length of a spacewalk?", 5)]
+          print(right_doc_wrong_piece, "of", len(wrong), "failures had the right document")
+          for t in spacewalk_chunks:
+              print(repr(t))
+        tests: |
+          check_equal("right_doc_wrong_piece", msg="Count the wrong answers (correct is False) whose `hit` is True.")
+          check_equal("spacewalk_chunks", msg="`spacewalk_chunks` should be the texts of the 5 chunks `broken_search` returns for the spacewalk question.")
+      - instructions:
+          - "**Fix.** Build a better index: choose the documents, a chunker, titles or not, and a `k`. Store the chunks in `my_chunks` and the k in `my_k`."
+          - "Store `evaluate(DenseIndex(my_chunks).search, k=my_k)` in `after` and print its accuracy and context tokens."
+          - "Pass when accuracy ≥ 0.9 and context tokens ≤ 200. Any approach that gets there counts."
+        hint: |
+          The diagnosis says chunks cut facts, and the chapter showed three more fixes: sentence-aware chunks, overlapping
+          windows, titles in chunks, and dropping superseded docs. For example
+          `make_chunks(CURRENT, lambda t: chunk_sentences(t, 2, 1), title=True)` with `my_k = 3`.
+        sample_code: |
+          my_chunks = make_chunks(____, ____, title=____)
+          my_k = ____
+          after = evaluate(DenseIndex(my_chunks).search, k=my_k)
+          print(after["accuracy"], after["context_tokens"])
+        solution: |
+          my_chunks = make_chunks(CURRENT, lambda t: chunk_sentences(t, 2, 1), title=True)
+          my_k = 3
+          after = evaluate(DenseIndex(my_chunks).search, k=my_k)
+          print(after["accuracy"], after["context_tokens"])
+        tests: |
+          ch = check_object("my_chunks")
+          assert isinstance(ch, list) and ch and all("doc_id" in c and "text" in c for c in ch), "`my_chunks` should be a list of chunk dicts with `doc_id` and `text` (for example from `make_chunks`)."
+          k = check_object("my_k")
+          assert isinstance(k, int) and 1 <= k <= 20, "`my_k` should be an int between 1 and 20."
+          from kits.rag_systems import DenseIndex as _D, evaluate as _ev
+          r = _ev(_D(ch).search, k=k)
+          assert r["context_tokens"] <= 200, f"Context is {r['context_tokens']} tokens per question; the budget is 200. Use smaller chunks or a smaller k."
+          assert r["accuracy"] >= 0.9, f"Accuracy is {r['accuracy']}; the target is 0.9. Look at `after['rows']` for the failures: cut facts (sentence chunks), split references (overlap), missing topics (titles), stale versions (CURRENT)."
+      - instructions:
+          - "**Verify.** Build `report`, a DataFrame with rows `\"baseline\"` and `\"after\"` (as the index) and columns `recall`, `evidence`, `accuracy` and `context_tokens`, taken from `baseline` and `after`."
+          - Print `report`.
+        hint: |
+          `pd.DataFrame([{m: r[m] for m in cols} for r in (baseline, after)], index=["baseline", "after"])` with
+          `cols = ["recall", "evidence", "accuracy", "context_tokens"]`.
+        sample_code: |
+          cols = ["recall", "evidence", "accuracy", "context_tokens"]
+          report = pd.DataFrame(____, index=____)
+          print(report)
+        solution: |
+          cols = ["recall", "evidence", "accuracy", "context_tokens"]
+          report = pd.DataFrame([{m: r[m] for m in cols} for r in (baseline, after)], index=["baseline", "after"])
+          print(report)
+        tests: |
+          r = check_object("report")
+          assert list(r.index) == ["baseline", "after"], "`report` should have the index ['baseline', 'after']."
+          assert list(r.columns) == ["recall", "evidence", "accuracy", "context_tokens"], "`report` columns should be recall, evidence, accuracy, context_tokens, in that order."
+          check_equal("report")
+    success_msg: |
+      You took ORBIT from 0.47 to at least 0.9 accuracy inside the budget, and the report shows why: recall barely moved,
+      while evidence and accuracy jumped. The broken index was finding the right documents and serving them in useless
+      pieces. That's the signature of poor chunking, and now you know how to spot it.

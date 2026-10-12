@@ -1,0 +1,251 @@
+title: Scaled dot-product attention by hand
+description: Build attention step by step in NumPy, then in PyTorch, and see why the scores are divided by the square root of d.
+exercises:
+  - id: intro
+    type: video
+    title: Every token asks every other token a question
+    slides: |
+      # Why attention?
+
+      > "The pump in Module E is leaking again; **it** needs a new seal."
+
+      To understand `it`, the model must pull information from `pump`, eight tokens back. Static
+      embeddings cannot do that: `it` has the same vector in every sentence.
+
+      **Self-attention** rebuilds each token's vector as a **weighted average of all tokens' vectors**,
+      with weights computed from the content itself. After one layer, `it` carries part of `pump`.
+
+      ---
+
+      ## Queries, keys and values
+
+      Each token vector $x_i$ (a row of $X$, shape $n \times d_{model}$) is projected three ways:
+
+      | | formula | role |
+      | --- | --- | --- |
+      | query | $Q = X W_Q$ | what this token is looking for |
+      | key | $K = X W_K$ | what this token offers to be matched on |
+      | value | $V = X W_V$ | what this token passes on if chosen |
+
+      $W_Q, W_K$ have shape $d_{model} \times d_k$ and $W_V$ has shape $d_{model} \times d_v$. They are learned.
+      The score between token $i$ and token $j$ is the dot product $q_i \cdot k_j$: high when the query
+      matches the key.
+
+      ---
+
+      ## The formula, one step at a time
+
+      $$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V$$
+
+      ```python
+      scores = Q @ K.T / np.sqrt(d_k)                 # (n, n): row i = token i's scores
+      scores = scores - scores.max(axis=1, keepdims=True)   # stable softmax
+      weights = np.exp(scores)
+      weights = weights / weights.sum(axis=1, keepdims=True)  # each row sums to 1
+      out = weights @ V                               # (n, d_v): mix of value vectors
+      ```
+
+      Subtracting the row maximum does not change the softmax but stops `exp` from overflowing.
+
+      ---
+
+      ## Why divide by $\sqrt{d_k}$?
+
+      If query and key components are roughly independent with variance 1, then $q \cdot k$ is a sum of
+      $d_k$ terms and has variance $d_k$. With $d_k = 512$ scores have a standard deviation around 23, so
+      the softmax becomes almost one-hot:
+
+      | $d_k$ | std of raw scores | top softmax weight, raw | top weight, scaled |
+      | --- | --- | --- | --- |
+      | 4 | ~2 | 0.77 | 0.44 |
+      | 64 | ~8 | 0.98 | 0.34 |
+      | 512 | ~25 | 1.00 | 0.42 |
+
+      A saturated softmax has gradients near zero, so training stalls. Dividing by $\sqrt{d_k}$ puts the
+      scores back at variance 1, whatever the width.
+
+      ---
+
+      ## In PyTorch, and what it costs
+
+      ```python
+      import torch.nn.functional as F
+      out = F.scaled_dot_product_attention(q, k, v)      # q, k, v: (batch, n, d)
+      ```
+
+      The fused function picks an efficient kernel (such as FlashAttention) that never stores the full
+      $n \times n$ weight matrix. Writing it by hand is for understanding and debugging; use the fused
+      version in models.
+
+      | context length $n$ | score matrix per head per layer | relative compute |
+      | --- | --- | --- |
+      | 1,000 | 1M entries | 1x |
+      | 4,000 | 16M | 16x |
+      | 32,000 | 1B | 1,024x |
+
+      Attention is $O(n^2)$ in time and, done naively, in memory. That is why long contexts are expensive
+      and why chunking, retrieval and efficient kernels exist.
+
+  - id: attention-numpy
+    type: sequential
+    title: Attention in three steps
+    context: |
+      `X` holds 4 token vectors of width 8 (shape `(4, 8)`) for the message "pump leaking again it".
+      `W_q`, `W_k` and `W_v` are `(8, 4)` projection matrices, so $d_k = 4$. `np` is imported.
+    pre_code: |
+      import numpy as np
+      rng = np.random.default_rng(1)
+      X = rng.normal(size=(4, 8))
+      W_q, W_k, W_v = (rng.normal(size=(8, 4)) for _ in range(3))
+    steps:
+      - instructions:
+          - "Store the projections `X @ W_q`, `X @ W_k` and `X @ W_v` in `Q`, `K` and `V`."
+          - "Store the scaled scores $QK^\\top / \\sqrt{d_k}$ in `scores` (shape `(4, 4)`), with `d_k = Q.shape[1]`."
+        hint: "`scores = Q @ K.T / np.sqrt(d_k)`."
+        sample_code: |
+          Q, K, V = ____, ____, ____
+          d_k = Q.shape[1]
+          scores = ____
+          print(scores.shape)
+        solution: |
+          Q, K, V = X @ W_q, X @ W_k, X @ W_v
+          d_k = Q.shape[1]
+          scores = Q @ K.T / np.sqrt(d_k)
+          print(scores.shape)
+        tests: |
+          check_equal("Q", msg="`Q` should be `X @ W_q`.")
+          check_equal("K", msg="`K` should be `X @ W_k`.")
+          check_equal("V", msg="`V` should be `X @ W_v`.")
+          check_equal("scores", msg="`scores` should be `Q @ K.T / np.sqrt(d_k)`. Check the transpose and the square root.")
+      - instructions:
+          - "Turn each **row** of `scores` into probabilities with a numerically stable softmax: subtract the row max, exponentiate, divide by the row sum. Store the result in `weights`."
+          - Print the row sums.
+        hint: "`e = np.exp(scores - scores.max(axis=1, keepdims=True))`, then `e / e.sum(axis=1, keepdims=True)`."
+        sample_code: |
+          e = np.exp(____)
+          weights = ____
+          print(weights.sum(axis=1))
+        solution: |
+          e = np.exp(scores - scores.max(axis=1, keepdims=True))
+          weights = e / e.sum(axis=1, keepdims=True)
+          print(weights.sum(axis=1))
+        tests: |
+          import numpy as np
+          w = check_object("weights")
+          assert np.allclose(np.asarray(w).sum(axis=1), 1), "Each **row** of `weights` should sum to 1. Use `axis=1, keepdims=True` for both the max and the sum."
+          check_equal("weights", msg="`weights` should be the row-wise softmax of `scores`.")
+      - instructions:
+          - "Store the attention output `weights @ V` in `out` (shape `(4, 4)`)."
+          - "Store the index of the token that token 3 (`it`) attends to most in `focus`."
+        hint: "`focus = int(weights[3].argmax())`."
+        sample_code: |
+          out = ____
+          focus = ____
+          print(out.shape, focus)
+        solution: |
+          out = weights @ V
+          focus = int(weights[3].argmax())
+          print(out.shape, focus)
+        tests: |
+          check_equal("out", msg="`out` should be `weights @ V`.")
+          check_equal("focus", msg="`focus` should be the argmax of row 3 of `weights`.")
+    success_msg: That is the whole mechanism. Each output row is a weighted mix of value vectors, and the weights came from query-key matches.
+
+  - id: attention-torch
+    type: coding
+    title: The same in PyTorch, batched
+    context: |
+      Real models run attention on batches: tensors of shape `(batch, n, d)`. `q`, `k` and `v` have shape
+      `(2, 5, 16)`. `torch`, `math` and `F` (`torch.nn.functional`) are imported.
+    instructions:
+      - "Write `attention(q, k, v)` that returns `(out, weights)`: scaled scores with `k.transpose(-2, -1)`, `torch.softmax(..., dim=-1)`, then `weights @ v`."
+      - "Store `attention(q, k, v)` in `out, weights`."
+      - "Store the largest absolute difference between `out` and `F.scaled_dot_product_attention(q, k, v)` in `max_diff`."
+    hint: "`scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])`. Use `(a - b).abs().max().item()` for `max_diff`."
+    pre_code: |
+      import math
+      import torch
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      q, k, v = torch.randn(3, 2, 5, 16).unbind(0)
+    sample_code: |
+      def attention(q, k, v):
+          scores = ____
+          weights = torch.softmax(scores, dim=____)
+          return ____, weights
+
+      out, weights = attention(q, k, v)
+      max_diff = ____
+      print(out.shape, weights.shape, max_diff)
+    solution: |
+      def attention(q, k, v):
+          scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+          weights = torch.softmax(scores, dim=-1)
+          return weights @ v, weights
+
+      out, weights = attention(q, k, v)
+      max_diff = (out - F.scaled_dot_product_attention(q, k, v)).abs().max().item()
+      print(out.shape, weights.shape, max_diff)
+    tests: |
+      import torch, torch.nn.functional as F
+      f = check_object("attention")
+      torch.manual_seed(5)
+      a, b, c = torch.randn(3, 3, 7, 8).unbind(0)
+      o, w = f(a, b, c)
+      assert tuple(w.shape) == (3, 7, 7), f"`weights` should have shape (batch, n, n) = (3, 7, 7); got {tuple(w.shape)}. Transpose only the last two dims of k."
+      assert torch.allclose(w.sum(-1), torch.ones(3, 7), atol=1e-5), "Each row of `weights` should sum to 1: softmax over the last dimension (`dim=-1`)."
+      assert torch.allclose(o, F.scaled_dot_product_attention(a, b, c), atol=1e-5), "`attention` does not match `F.scaled_dot_product_attention` on a new batch. Did you divide by sqrt(d)?"
+      m = check_object("max_diff")
+      assert float(m) < 1e-5, f"`max_diff` is {m}; it should be tiny (below 1e-5) when your function is right."
+    success_msg: Your hand-written version matches PyTorch's fused kernel to floating-point precision.
+
+  - id: why-sqrt-d
+    type: mc
+    title: Predict, then run - remove the scaling
+    question: |
+      A colleague removes the division by $\sqrt{d_k}$ "to save a step" in a model with $d_k = 512$. What
+      happens to the attention weights at the start of training?
+    context: "The console has random `q` and `k` of shape `(8, 512)` and a helper `top_weight(scale)` that returns the mean largest softmax weight per row. Try `top_weight(True)` and `top_weight(False)`."
+    pre_code: |
+      import math
+      import torch
+      torch.manual_seed(0)
+      q, k = torch.randn(8, 512), torch.randn(8, 512)
+      def top_weight(scale):
+          s = q @ k.T
+          if scale:
+              s = s / math.sqrt(q.shape[-1])
+          return torch.softmax(s, dim=-1).max(dim=-1).values.mean().item()
+    options:
+      - text: Nothing important; softmax is invariant to scaling
+        feedback: Softmax is invariant to **adding** a constant, not to multiplying. Multiplying the scores by about 23 makes it far sharper. Compare `top_weight(True)` and `top_weight(False)`.
+      - text: Each row becomes nearly one-hot, so gradients through the softmax almost vanish and training stalls
+        correct: true
+        feedback: |
+          Right. Raw scores have a standard deviation of about $\sqrt{512} \approx 23$, so one key wins
+          each row with weight close to 1. In that flat region of the softmax the gradient is close to zero.
+      - text: The weights become uniform, so every token attends equally to all others
+        feedback: That is what happens with very **small** scores. Large scores do the opposite.
+      - text: The rows no longer sum to 1
+        feedback: Softmax always produces rows that sum to 1, whatever the scale. The problem is how the mass is spread.
+    hint: The dot product of two random 512-dimensional vectors has a variance of about 512.
+
+  - id: context-cost
+    type: mc
+    title: The cost of a longer context
+    question: |
+      ORBIT's model reads 4,000-token handbook excerpts. The crew wants it to read 16,000 tokens at once.
+      With standard attention, how much more compute do the attention score matrices need, per layer and head?
+    options:
+      - text: 4x, because the input is 4 times longer
+        feedback: That is the growth for the per-token parts (projections, MLP). The score matrix is $n \times n$, so both sides grow.
+      - text: 16x, because the $n \times n$ score matrix grows with the square of the length
+        correct: true
+        feedback: |
+          Right. $(16{,}000 / 4{,}000)^2 = 16$. Fused kernels avoid storing the matrix, but the compute is
+          still quadratic. That is why retrieving the relevant 4,000 tokens is often cheaper than reading 16,000.
+      - text: 2x, because attention is computed in parallel
+        feedback: Parallelism changes wall-clock time on big hardware, not the amount of work. Count the entries of $QK^\top$.
+      - text: No change, because the number of parameters is the same
+        feedback: The parameters do stay the same, but compute depends on the input length. The score matrix has $n^2$ entries.
+    hint: How many entries does $QK^\top$ have for $n$ tokens?

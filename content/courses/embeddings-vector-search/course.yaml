@@ -1,0 +1,43 @@
+title: Embeddings and Vector Search
+description: 'Represent text as vectors and search by meaning: similarity measures, semantic search,
+  vector indexes and their speed/recall trade-offs, and measuring search quality.'
+level: intermediate
+est_hours: 4
+prerequisites:
+- nlp-transformers
+objectives:
+- Create and compare embeddings, explain cosine similarity, and debug an index whose results look random
+- Build semantic search from scratch with NumPy, and know when keyword or hybrid search beats it
+- Choose between brute force and approximate indexes (graph, IVF, quantisation), and tune them against a latency budget
+- Measure search quality with recall@k and MRR, build a test set, and fix the queries that miss
+requires: []
+chapters:
+- id: vectors
+  title: Vectors and similarity
+  description: Dot product, cosine similarity, normalisation, embedding text, and debugging an index whose results look random.
+  lessons:
+  - dot-cosine
+  - embedding-text
+  - similarity-bugs
+- id: semantic-search
+  title: Semantic search
+  description: Search from scratch, keyword vs semantic search, and hybrid search when relevant docs are not found.
+  lessons:
+  - search-from-scratch
+  - keyword-vs-semantic
+  - hybrid-search
+- id: indexes
+  title: Vector indexes
+  description: Brute force cost, graph search (HNSW), IVF and quantisation, and fixing a search that is slow at scale.
+  lessons:
+  - brute-force-cost
+  - graph-search-hnsw
+  - ivf-quantisation
+  - slow-search-lab
+- id: search-eval
+  title: Evaluating search
+  description: Recall@k, MRR and nDCG, building a test set, and diagnosing the queries that miss.
+  lessons:
+  - recall-mrr
+  - test-set
+  - diagnosing-misses

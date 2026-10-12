@@ -1,0 +1,284 @@
+title: Is v2 really better?
+description: A higher score on 45 questions might be noise. Bootstrap confidence intervals by hand, compare versions with paired resampling, and break results down by slice before you decide.
+exercises:
+  - id: comparing-slides
+    type: video
+    title: Intervals, pairs and slices
+    slides: |
+      # Symptom: "v3 is better, ship it"
+
+      The candidate prompt v3 ("be as helpful as possible: always give the crew an answer") scores **86.5%** on factual
+      questions against v2's **83.8%**. The developer wants to ship.
+
+      Two questions come before any decision:
+
+      1. Is the difference bigger than the noise from having only 37 factual questions?
+      2. Is v3 better **everywhere**, or only where we happened to look?
+
+      ---
+
+      ## Measure the noise: the bootstrap
+
+      You don't need a formula. Pretend your test set is the population, **resample it with replacement** many times,
+      recompute the metric each time, and look at the spread:
+
+      ```python
+      rng = np.random.default_rng(0)
+      scores = results["correct"].to_numpy()
+      boot = [scores[rng.integers(0, len(scores), len(scores))].mean() for _ in range(2000)]
+      low, high = np.percentile(boot, [2.5, 97.5])         # 95% interval
+      ```
+
+      It works for any metric: accuracy, κ, cost per correct answer, p95 latency. On ORBIT's 45 questions, v2's 80%
+      comes with an interval of roughly **67%-91%**.
+
+      ---
+
+      ## Compare in pairs
+
+      Both versions answered the **same** questions. Bootstrap the **per-question difference**: draw one set of indices
+      and use it for both versions.
+
+      ```python
+      diff = v4["correct"].to_numpy() - v2["correct"].to_numpy()     # +1, 0 or -1 per question
+      boot = [diff[rng.integers(0, n, n)].mean() for _ in range(2000)]
+      ```
+
+      Question difficulty cancels out: a hard question is hard for both versions. The paired interval is much narrower than
+      the one you get from bootstrapping each version on its own. If it still includes 0, you can't rule out "no
+      difference" at this sample size.
+
+      ---
+
+      ## Break it down by slice
+
+      | slice | v2 | v3 | change |
+      | --- | --- | --- | --- |
+      | factual (37) | 83.8% | 86.5% | +2.7 |
+      | multi-hop (4) | 50% | 50% | 0 |
+      | unanswerable (4) | 75% | **25%** | **-50** |
+
+      The headline gain lives in one slice; the cost lives in another, and it's the safety-relevant one. Always compute
+      per-slice results, with intervals: on 4 cases an interval spans most of 0-100%, so a small slice can warn you but
+      can't prove much.
+
+      ---
+
+      ## Playbook: someone says "v2 is better"
+
+      1. Ask for the **paired** difference and its interval, not two point scores.
+      2. Ask for the **per-slice** table. Look hardest at safety slices and small slices.
+      3. Interval includes 0? Either get more cases (stratified, aimed at the slice in doubt) or decide on other grounds
+         (cost, latency, a known bug it fixes) and say so.
+      4. Report intervals, never bare points: "+4.4 points (95% CI 0 to +11, n=45, paired)".
+
+      | cases | typical 95% CI on a paired difference | cost per run |
+      | --- | --- | --- |
+      | 45 | ±7-10 points | cheap |
+      | 400 | ±3 points | about 9× the calls |
+      | 2,000 | ±1-1.5 points | about 45× the calls, plus labels |
+
+  - id: bootstrap-ci
+    type: coding
+    title: A bootstrap interval by hand
+    context: |
+      `scores` is a numpy array of 45 zeros and ones: whether ORBIT v2 answered each golden question correctly.
+    instructions:
+      - Store the plain accuracy in `acc`.
+      - "With `rng = np.random.default_rng(0)`, draw 2,000 bootstrap resamples: each picks 45 indices with replacement (`rng.integers(0, 45, 45)`). Store the 2,000 resampled accuracies in the array `boot`."
+      - Store the 2.5th and 97.5th percentiles of `boot` as a tuple `ci`, and `ci[1] - ci[0]` in `width`.
+    hint: |
+      `boot = np.array([scores[rng.integers(0, n, n)].mean() for _ in range(2000)])`, then
+      `tuple(np.percentile(boot, [2.5, 97.5]))`.
+    pre_code: |
+      import numpy as np
+      from kits.llm_evaluation import run_orbit
+      scores = run_orbit("v2")["human"].to_numpy()
+    sample_code: |
+      acc = ____
+      rng = np.random.default_rng(0)
+      n = len(scores)
+      boot = np.array([____ for _ in range(2000)])
+      ci = ____
+      width = ____
+      print(acc, ci, width)
+    solution: |
+      acc = scores.mean()
+      rng = np.random.default_rng(0)
+      n = len(scores)
+      boot = np.array([scores[rng.integers(0, n, n)].mean() for _ in range(2000)])
+      ci = tuple(np.percentile(boot, [2.5, 97.5]))
+      width = ci[1] - ci[0]
+      print(acc, ci, width)
+    tests: |
+      import numpy as np
+      check_equal("acc", msg="`acc` is `scores.mean()`.")
+      check_object("boot")
+      b = np.asarray(user["boot"])
+      assert b.shape == (2000,), f"`boot` should hold 2,000 resampled accuracies, it has shape {b.shape}."
+      assert abs(b.mean() - 0.8) < 0.02, "The resampled accuracies should centre on the original accuracy (0.8). Resample indices with replacement."
+      check_object("ci")
+      lo, hi = user["ci"]
+      assert 0.62 <= lo <= 0.71 and 0.88 <= hi <= 0.94, f"`ci` should be the 2.5th and 97.5th percentiles of `boot`, roughly (0.67, 0.91); got ({lo:.3f}, {hi:.3f})."
+      check_object("width")
+      assert abs(user["width"] - (hi - lo)) < 1e-9, "`width` is `ci[1] - ci[0]`."
+    success_msg: |
+      ORBIT's 80% is really "somewhere from about 67% to 91%". Any single-number comparison between two versions on 45
+      questions sits inside that fog.
+
+  - id: paired-bootstrap
+    type: coding
+    title: Paired versus unpaired
+    context: |
+      `a` and `b` are the 0/1 correctness arrays of ORBIT v2 and v4 on the same 45 questions, in the same order. v4 adds
+      "If the documents do not contain the answer, say you don't know" to v3's eager prompt.
+    instructions:
+      - Store `b.mean() - a.mean()` in `delta`.
+      - "**Paired**: with `rng = np.random.default_rng(0)`, resample the per-question difference `b - a` 2,000 times (one set of indices each time). Store the 95% interval as the tuple `ci_paired`."
+      - "**Unpaired**: with a fresh `rng = np.random.default_rng(0)`, resample `a` and `b` **independently** 2,000 times and take the difference of means. Store the interval as `ci_unpaired`."
+      - Store `ci_paired[0] > 0` in `significant`.
+    hint: |
+      Paired: `d = b - a`, then `d[rng.integers(0, n, n)].mean()`. Unpaired:
+      `b[rng.integers(0, n, n)].mean() - a[rng.integers(0, n, n)].mean()`.
+    pre_code: |
+      import numpy as np
+      from kits.llm_evaluation import run_orbit
+      a = run_orbit("v2")["human"].to_numpy()
+      b = run_orbit("v4")["human"].to_numpy()
+      n = len(a)
+    sample_code: |
+      delta = ____
+
+      rng = np.random.default_rng(0)
+      d = b - a
+      paired = [____ for _ in range(2000)]
+      ci_paired = tuple(np.percentile(paired, [2.5, 97.5]))
+
+      rng = np.random.default_rng(0)
+      unpaired = [____ for _ in range(2000)]
+      ci_unpaired = ____
+
+      significant = ____
+      print(round(delta, 3), ci_paired, ci_unpaired, significant)
+    solution: |
+      delta = b.mean() - a.mean()
+
+      rng = np.random.default_rng(0)
+      d = b - a
+      paired = [d[rng.integers(0, n, n)].mean() for _ in range(2000)]
+      ci_paired = tuple(np.percentile(paired, [2.5, 97.5]))
+
+      rng = np.random.default_rng(0)
+      unpaired = [b[rng.integers(0, n, n)].mean() - a[rng.integers(0, n, n)].mean() for _ in range(2000)]
+      ci_unpaired = tuple(np.percentile(unpaired, [2.5, 97.5]))
+
+      significant = ci_paired[0] > 0
+      print(round(delta, 3), ci_paired, ci_unpaired, significant)
+    tests: |
+      check_equal("delta", msg="`delta` is `b.mean() - a.mean()`.")
+      check_object("ci_paired")
+      lo, hi = user["ci_paired"]
+      assert abs(lo) < 0.025 and 0.08 <= hi <= 0.14, f"`ci_paired` should be about (0.0, 0.11): resample the per-question differences `b - a`. Got ({lo:.3f}, {hi:.3f})."
+      check_object("ci_unpaired")
+      ulo, uhi = user["ci_unpaired"]
+      assert ulo < -0.05 and uhi > 0.15, f"`ci_unpaired` should be much wider, about (-0.11, 0.20): resample `a` and `b` separately. Got ({ulo:.3f}, {uhi:.3f})."
+      check_object("significant")
+      assert user["significant"] == (lo > 0) and not user["significant"], "`significant` is `ci_paired[0] > 0`. Here the lower bound is 0, so it's False."
+    success_msg: |
+      Pairing shrinks the interval from about 31 points wide to 11. The two versions differ on only 2 questions, both
+      in v4's favour, yet the paired interval still touches 0: at n = 45 you can't prove a 4-point gain. Not proven is
+      not the same as no effect, though.
+
+  - id: slices-and-scale
+    type: coding
+    title: Slices, then more data
+    context: |
+      `v2` and `v3` are ORBIT's results on the 45 golden questions (`type`, `human`). `big` holds **400** labelled
+      production conversations answered by both versions, in the production mix: columns `type`, `v2` and `v3` (1 =
+      correct). `paired_ci(diff)` returns the 95% paired bootstrap interval of an array of differences.
+    instructions:
+      - "Store a DataFrame `by_type` with the mean `human` per `type` for v2 and v3 (columns `v2`, `v3`) and a column `delta` = v3 - v2."
+      - Store the slice with the most negative `delta` in `worst_slice`.
+      - "On `big`, store `paired_ci((s['v3'] - s['v2']).to_numpy())` for the factual rows in `factual_ci`, for the unanswerable rows in `unanswerable_ci`, and for all rows in `overall_ci`."
+    hint: |
+      `pd.DataFrame({"v2": v2.groupby("type")["human"].mean(), "v3": v3.groupby("type")["human"].mean()})`, then add
+      `delta`. For `big`: `s = big[big["type"] == "factual"]`.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      from kits.llm_evaluation import run_orbit, big_comparison
+      v2, v3 = run_orbit("v2"), run_orbit("v3")
+      big = big_comparison()
+
+      def paired_ci(diff, n_boot=2000, seed=0):
+          rng = np.random.default_rng(seed)
+          n = len(diff)
+          boot = [diff[rng.integers(0, n, n)].mean() for _ in range(n_boot)]
+          return tuple(np.percentile(boot, [2.5, 97.5]))
+    sample_code: |
+      by_type = pd.DataFrame({"v2": ____, "v3": ____})
+      by_type["delta"] = ____
+      worst_slice = ____
+      print(by_type)
+
+      s = big[big["type"] == "factual"]
+      factual_ci = ____
+      s = big[big["type"] == "unanswerable"]
+      unanswerable_ci = ____
+      overall_ci = ____
+      print(factual_ci, unanswerable_ci, overall_ci)
+    solution: |
+      by_type = pd.DataFrame({"v2": v2.groupby("type")["human"].mean(), "v3": v3.groupby("type")["human"].mean()})
+      by_type["delta"] = by_type["v3"] - by_type["v2"]
+      worst_slice = by_type["delta"].idxmin()
+      print(by_type)
+
+      s = big[big["type"] == "factual"]
+      factual_ci = paired_ci((s["v3"] - s["v2"]).to_numpy())
+      s = big[big["type"] == "unanswerable"]
+      unanswerable_ci = paired_ci((s["v3"] - s["v2"]).to_numpy())
+      overall_ci = paired_ci((big["v3"] - big["v2"]).to_numpy())
+      print(factual_ci, unanswerable_ci, overall_ci)
+    tests: |
+      check_object("by_type")
+      bt = user["by_type"]
+      for c in ("v2", "v3", "delta"):
+          assert c in bt.columns, f"`by_type` needs a `{c}` column."
+      assert dict(bt["delta"].round(6)) == dict(sol["by_type"]["delta"].round(6)), "`delta` should be v3 minus v2, per type."
+      check_equal("worst_slice", msg="`worst_slice` is the type with the smallest (most negative) delta: `by_type['delta'].idxmin()`.")
+      for name in ("factual_ci", "unanswerable_ci", "overall_ci"):
+          check_object(name)
+          got, exp = user[name], sol[name]
+          assert abs(got[0] - exp[0]) < 1e-9 and abs(got[1] - exp[1]) < 1e-9, f"`{name}` should be `paired_ci` of v3 - v2 on the right rows of `big`; expected ({exp[0]:.3f}, {exp[1]:.3f})."
+    success_msg: |
+      With 400 cases the picture is sharp: v3 really is better on factual questions (the interval is above 0), really is
+      much worse on unanswerable ones (about -46 points), and worse overall. The 45-question set could only hint at
+      this. The fix isn't to choose between the two: keep v3's factual gain and repair its refusals. That's next.
+
+  - id: ship-decision
+    type: mc
+    title: Ship v4?
+    question: |
+      v4 adds a refusal rule to v3's eager prompt. On the 45 golden questions against v2: **+4.4 points**, paired 95% CI
+      **0 to +11**. Per slice: factual +2.7, multi-hop 0, unanswerable **+25** (it now refuses the cargo-cost question v2
+      answered). Same cost and latency. What do you do?
+    options:
+      - text: Don't ship. The interval includes 0, so v4 isn't better.
+        feedback: |
+          "Not significant" means "not proven at this sample size", not "no effect". v4 is no worse on any slice, fixes a
+          failure you found in error analysis, and costs the same. Blocking it protects nothing.
+      - text: Ship it, and report the change as +4.4 points.
+        feedback: |
+          Shipping is reasonable, but a bare +4.4 overstates what you know. Report the interval and the per-slice table so
+          nobody plans around a gain that might be closer to 0.
+      - text: Ship it, report "+4.4 points (95% CI 0 to +11, n = 45)" with the slice table, and keep measuring on production traffic.
+        correct: true
+        feedback: |
+          Yes. The decision rests on "no slice got worse, a known bug is fixed, nothing costs more", which the data does
+          support. The interval tells readers how sure to be about the size of the gain, and production monitoring will
+          tighten it.
+      - text: Hold the release until 2,000 more questions are labelled.
+        feedback: |
+          That would narrow the interval to about ±1.5 points, at the cost of weeks of labelling. Worth it for a risky or
+          expensive change; not for one that is no worse anywhere and fixes a known failure.
+    hint: What would make shipping risky here, and does the per-slice table show any of it?

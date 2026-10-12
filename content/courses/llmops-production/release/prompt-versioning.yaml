@@ -1,0 +1,290 @@
+title: Prompt versioning
+description: Treat prompts and model settings as versioned, content-addressed releases, then troubleshoot a release that quietly broke ORBIT, roll back and ship a proper fix.
+exercises:
+  - id: prompt-versioning-slides
+    type: video
+    title: A prompt change is a release
+    slides: |
+      # Prompts are code
+
+      Changing one sentence of the system prompt, the model id, `max_tokens` or the temperature can change ORBIT's
+      behaviour as much as a code change. Yet prompts are often edited in a dashboard text box, with no review, no
+      eval and no record of what was live when.
+
+      Treat the **whole bundle** as one versioned artifact:
+
+      ```python
+      config = {
+          "name": "orbit-answer",
+          "model": "claude-sonnet-5-5",
+          "max_tokens": 600,
+          "temperature": 0.2,
+          "rules": "You are ORBIT, the station assistant ...",
+      }
+      ```
+
+      ---
+
+      ## Content-addressed versions
+
+      Give each version an id derived from its content: the hash of its canonical JSON.
+
+      ```python
+      vid = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
+      ```
+
+      - Same content, same id, however the dict was built (`sort_keys=True` makes key order irrelevant).
+      - Change anything, get a new id. Versions are **immutable**: never edit one in place.
+      - **Labels** such as `production` and `canary` point at a version. Releasing moves a label forward; rolling back
+        moves it back. That is one line, with no redeploy.
+
+      ---
+
+      ## Tie versions to evals and to traffic
+
+      - Every **eval run** records the version it tested, so "v4 scored 78%" means something.
+      - Every **log line and trace** carries `prompt_version`, so production metrics can be grouped by version.
+      - A release gate (from the evaluation course): a version cannot get the `production` label unless its eval
+        run passes the thresholds.
+
+      Without the version in the logs you can see *that* quality dropped on Tuesday, but not *which change* did it.
+
+      ---
+
+      ## Playbook: "answers got worse after a release"
+
+      1. **Symptom:** thumbs-down went up; crew say answers "stop mid-sentence".
+      2. **Measure by version:** thumbs-down rate, `stop_reason == "max_tokens"` share, output tokens and cost per `prompt_version`.
+      3. **Diagnose:** find the first bad version and **diff** its config against the previous one.
+      4. **Fix:** first **roll back** (move the label) to stop the damage. Then make a proper fix that keeps the
+         intent of the change, and run it through the eval set.
+      5. **Verify:** eval accuracy is back, the original goal (here: cost) is met, and then release it carefully (next lesson).
+
+      ---
+
+      ## Trade-off: where prompts live
+
+      | | in the code repo | prompt registry / database | feature-flag config |
+      | --- | --- | --- | --- |
+      | review and history | pull requests, full history | depends on the tool | partial |
+      | speed of change | a deploy | instant | instant |
+      | who can change it | engineers | anyone with access, which is a risk | engineers and ops |
+      | eval gate | in CI | must be added | must be added |
+      | rollback | a revert and a deploy | move a label | flip a flag |
+
+      Many teams keep prompts in the repo (reviewed, tested in CI) and use labels or flags only to choose which
+      version is live. Whatever you choose: immutable versions, a version in every log line, an eval before every label move.
+
+  - id: prompt-registry
+    type: coding
+    title: A content-addressed prompt registry
+    context: |
+      Build a tiny registry for ORBIT's prompt configs. `PROMPT_HISTORY` lists the four versions shipped so far; each
+      has behaviour fields (`model`, `max_tokens`, `temperature`, `rules`) plus metadata (`name`, `version`, `note`).
+    instructions:
+      - "Complete `register(config)`: compute the id as the first 8 hex characters of the sha256 of `json.dumps(config, sort_keys=True)`, store a deep copy under that id, and return the id."
+      - "Complete `get(vid)` (return a deep copy), `set_label(label, vid)` (raise `KeyError` for an unknown id) and `resolve(label)` (the config the label points at)."
+      - "Register the behaviour fields of each `PROMPT_HISTORY` entry (use `BEHAVIOUR`) and store the ids in `ids`. Point the `production` label at the last one."
+    hint: |
+      `hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]`. Build each behaviour dict with
+      `{k: p[k] for k in BEHAVIOUR}`.
+    pre_code: |
+      import copy, hashlib, json
+      from kits.llmops_production import PROMPT_HISTORY
+      BEHAVIOUR = ["model", "max_tokens", "temperature", "rules"]
+    sample_code: |
+      class PromptRegistry:
+          def __init__(self):
+              self.versions = {}
+              self.labels = {}
+
+          def register(self, config):
+              vid = ____
+              self.versions[vid] = copy.deepcopy(config)
+              return vid
+
+          def get(self, vid):
+              return ____
+
+          def set_label(self, label, vid):
+              if vid not in self.versions:
+                  raise KeyError(vid)
+              ____
+
+          def resolve(self, label):
+              return ____
+
+      registry = PromptRegistry()
+      ids = [registry.register({k: p[k] for k in BEHAVIOUR}) for p in PROMPT_HISTORY]
+      registry.set_label("production", ____)
+      print(ids, registry.labels)
+    solution: |
+      class PromptRegistry:
+          def __init__(self):
+              self.versions = {}
+              self.labels = {}
+
+          def register(self, config):
+              vid = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:8]
+              self.versions[vid] = copy.deepcopy(config)
+              return vid
+
+          def get(self, vid):
+              return copy.deepcopy(self.versions[vid])
+
+          def set_label(self, label, vid):
+              if vid not in self.versions:
+                  raise KeyError(vid)
+              self.labels[label] = vid
+
+          def resolve(self, label):
+              return self.get(self.labels[label])
+
+      registry = PromptRegistry()
+      ids = [registry.register({k: p[k] for k in BEHAVIOUR}) for p in PROMPT_HISTORY]
+      registry.set_label("production", ids[-1])
+      print(ids, registry.labels)
+    tests: |
+      check_equal("ids", msg="`ids` should hold the 8-character sha256 ids of the four behaviour configs, in order.")
+      R = user["PromptRegistry"]
+      r = R()
+      a = r.register({"model": "m", "max_tokens": 10, "rules": "x"})
+      b = r.register({"rules": "x", "max_tokens": 10, "model": "m"})
+      assert a == b, "The same content with a different key order must get the same id: use `sort_keys=True`."
+      c = r.register({"model": "m", "max_tokens": 11, "rules": "x"})
+      assert c != a, "Changing any field must give a new id."
+      got = r.get(a)
+      got["max_tokens"] = 999
+      assert r.get(a)["max_tokens"] == 10, "`get` must return a copy: editing it must not change the stored version (versions are immutable)."
+      try:
+          r.set_label("production", "nope1234")
+          raise AssertionError("`set_label` should raise KeyError for an id that was never registered.")
+      except KeyError:
+          pass
+      r.set_label("production", a)
+      r.set_label("production", c)
+      assert r.resolve("production")["max_tokens"] == 11, "`resolve(label)` should return the config the label currently points at."
+      assert user["registry"].labels.get("production") == user["ids"][-1], "Point `production` at the last registered id."
+    success_msg: |
+      Four immutable versions, each with an id you can put in every log line, and a `production` label you can move
+      forward or back in one call.
+
+  - id: find-regression
+    type: coding
+    title: "Troubleshoot: which version broke ORBIT?"
+    context: |
+      Since day 7 the crew complain that ORBIT's answers "stop in the middle". `prod` is the production log for 12 days
+      (one row per request, with `prompt_version`, `stop_reason`, `output_tokens`, `cost` and `thumbs`).
+      `PROMPT_HISTORY` holds the configs.
+    instructions:
+      - "Build `by_version`, indexed by `prompt_version`, with columns `thumbs_down` (share of `\"down\"`), `truncated` (share of `stop_reason == \"max_tokens\"`) and `cost` (mean)."
+      - "Store `bad_version`: the version with the highest `truncated` share that comes first in `PROMPT_HISTORY`, i.e. the earliest version where `truncated` is above 0.5."
+      - "Store `changed`: the sorted list of behaviour fields (`BEHAVIOUR`) whose values differ between `bad_version` and the version just before it."
+    hint: |
+      `prod.groupby("prompt_version").agg(thumbs_down=("thumbs", lambda s: (s == "down").mean()), ...)`. Find the
+      earliest bad one with `[p["version"] for p in PROMPT_HISTORY if by_version.loc[p["version"], "truncated"] > 0.5][0]`.
+    pre_code: |
+      import pandas as pd
+      from kits.llmops_production import release_log, PROMPT_HISTORY
+      prod = release_log()
+      BEHAVIOUR = ["model", "max_tokens", "temperature", "rules"]
+      configs = {p["version"]: p for p in PROMPT_HISTORY}
+    sample_code: |
+      by_version = prod.groupby("prompt_version").agg(
+          thumbs_down=("thumbs", lambda s: (s == "down").mean()),
+          truncated=____,
+          cost=____,
+      )
+
+      bad_version = ____
+      order = [p["version"] for p in PROMPT_HISTORY]
+      previous = order[order.index(bad_version) - 1]
+      changed = sorted(k for k in BEHAVIOUR if ____)
+      print(by_version.round(4))
+      print(bad_version, "changed", changed, "vs", previous)
+    solution: |
+      by_version = prod.groupby("prompt_version").agg(
+          thumbs_down=("thumbs", lambda s: (s == "down").mean()),
+          truncated=("stop_reason", lambda s: (s == "max_tokens").mean()),
+          cost=("cost", "mean"),
+      )
+
+      bad_version = [p["version"] for p in PROMPT_HISTORY if by_version.loc[p["version"], "truncated"] > 0.5][0]
+      order = [p["version"] for p in PROMPT_HISTORY]
+      previous = order[order.index(bad_version) - 1]
+      changed = sorted(k for k in BEHAVIOUR if configs[bad_version][k] != configs[previous][k])
+      print(by_version.round(4))
+      print(bad_version, "changed", changed, "vs", previous)
+    tests: |
+      import numpy as np
+      check_object("by_version")
+      b, e = user["by_version"], sol["by_version"]
+      for col in ("thumbs_down", "truncated", "cost"):
+          assert col in b.columns, f"`by_version` needs a `{col}` column."
+          assert np.allclose(b.loc[e.index, col].astype(float), e[col].astype(float)), f"`by_version['{col}']` is off."
+      check_equal("bad_version", msg="The first version whose truncated share is above 0.5 is the one that broke ORBIT.")
+      check_equal("changed", msg=f"Compare the behaviour fields of {sol['bad_version']} and the version before it; only {sol['changed']} differ.")
+    success_msg: |
+      v3 lowered `max_tokens` from 600 to 120 "to cut output cost". Every v3 and v4 reply hit the cap, thumbs-down
+      rose from about 5% to over 20%, and the cost per request fell by only about 7%, because output was never the
+      expensive part. v4 then
+      shipped on top of the broken setting. The version column turned a vague complaint into a one-line diff.
+
+  - id: fix-regression
+    type: coding
+    title: Roll back, then fix it properly
+    context: |
+      Rolling back to v2 stops the damage but loses v4's new rule (mention the handbook section) and v3's goal of
+      lower cost. `evaluate(config, cache=False)` runs the eval set for a config and returns the summary dict.
+    instructions:
+      - "Store `rollback = evaluate(configs[\"v2\"])` and `current = evaluate(configs[\"v4\"])`."
+      - "Build `v5`: a copy of v4's config with `version` `\"v5\"`, `max_tokens` back to a safe 300, and `CONCISE` appended to its `rules` (keep v4's rules)."
+      - "Store `candidate = evaluate(v5, cache=True)` and `ship`: True if the candidate's accuracy is at least 0.95 **and** its cost is at most v3's goal (`evaluate(configs[\"v3\"])[\"cost\"]`, stored in `v3_cost`)."
+    hint: |
+      `v5 = dict(configs["v4"], version="v5", max_tokens=300, rules=configs["v4"]["rules"] + " " + CONCISE)`.
+    pre_code: |
+      from kits.llmops_production import PROMPT_HISTORY, CONCISE, make_client, run_eval, summarize
+      configs = {p["version"]: p for p in PROMPT_HISTORY}
+
+      def evaluate(config, cache=False):
+          df = run_eval(make_client(), model=config["model"], rules=config["rules"],
+                        max_tokens=config["max_tokens"], cache=cache)
+          return summarize(df)
+    sample_code: |
+      rollback = ____
+      current = ____
+
+      v5 = dict(configs["v4"], version="v5", max_tokens=____, rules=____)
+      candidate = ____
+      v3_cost = evaluate(configs["v3"])["cost"]
+      ship = ____
+      for name, s in [("v2 rollback", rollback), ("v4 current", current), ("v5 candidate", candidate)]:
+          print(f"{name:13s} accuracy {s['accuracy']:.0%}  cost ${s['cost']:.3f}  p95 {s['p95_ms']:.0f} ms")
+      print("ship v5:", ship)
+    solution: |
+      rollback = evaluate(configs["v2"])
+      current = evaluate(configs["v4"])
+
+      v5 = dict(configs["v4"], version="v5", max_tokens=300, rules=configs["v4"]["rules"] + " " + CONCISE)
+      candidate = evaluate(v5, cache=True)
+      v3_cost = evaluate(configs["v3"])["cost"]
+      ship = candidate["accuracy"] >= 0.95 and candidate["cost"] <= v3_cost
+      for name, s in [("v2 rollback", rollback), ("v4 current", current), ("v5 candidate", candidate)]:
+          print(f"{name:13s} accuracy {s['accuracy']:.0%}  cost ${s['cost']:.3f}  p95 {s['p95_ms']:.0f} ms")
+      print("ship v5:", ship)
+    tests: |
+      check_object("rollback")
+      assert abs(user["rollback"]["accuracy"] - sol["rollback"]["accuracy"]) < 1e-9, "`rollback` should be `evaluate(configs['v2'])`."
+      assert abs(user["current"]["accuracy"] - sol["current"]["accuracy"]) < 1e-9, "`current` should be `evaluate(configs['v4'])`."
+      check_object("v5")
+      v5 = user["v5"]
+      assert v5.get("version") == "v5", "Set `version` to 'v5'."
+      assert user["configs"]["v4"]["rules"] in v5.get("rules", ""), "Keep v4's rules (they contain the new 'mention the handbook section' rule) and add CONCISE to them."
+      assert user["CONCISE"] in v5["rules"], "Append CONCISE to the rules: ask for brevity instead of cutting answers off."
+      cand = user["candidate"]
+      assert cand["accuracy"] >= 0.95, f"The candidate is only {cand['accuracy']:.0%} accurate. Is `max_tokens` high enough for a brief answer (300)?"
+      assert cand["cost"] <= user["v3_cost"], f"The candidate costs ${cand['cost']:.3f}, more than v3's ${user['v3_cost']:.3f}. Evaluate it with `cache=True`."
+      assert bool(user["ship"]) is True, "`ship` should be True: the candidate meets both conditions."
+    success_msg: |
+      v5 keeps v4's feature, is as accurate as the rollback, and costs about an eighth of v3, because it asks for brevity
+      and caches the handbook instead of cutting answers off. Now it needs a safe path to production: next lesson.

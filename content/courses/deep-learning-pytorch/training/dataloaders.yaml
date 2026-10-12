@@ -1,0 +1,269 @@
+title: Datasets, DataLoaders and mini-batches
+description: How Dataset and DataLoader work underneath, how to choose a batch size, and the shuffling bug that quietly costs accuracy.
+exercises:
+  - id: intro
+    type: video
+    title: Feeding the model in batches
+    slides: |
+      # Why mini-batches?
+
+      So far every step used **all** the data (full batch). That stops working when the data does
+      not fit in memory, and it is wasteful: one update per pass over the data.
+
+      **Mini-batch training:** split each epoch into batches of, say, 32 examples and take a step
+      after each one. Each gradient is a noisy estimate of the full one, but you get
+      $N / 32$ updates per epoch instead of 1, and memory depends on the batch size, not on $N$.
+
+      PyTorch splits the job in two:
+      - a **`Dataset`** knows how to fetch example `i`;
+      - a **`DataLoader`** decides which examples go into each batch and stacks them.
+
+      ---
+
+      ## `Dataset`: two methods
+
+      ```python
+      from torch.utils.data import Dataset, TensorDataset, DataLoader
+
+      class WindowDataset(Dataset):
+          def __init__(self, series, window):
+              self.series, self.window = series, window
+          def __len__(self):
+              return len(self.series) - self.window
+          def __getitem__(self, i):                     # built on demand, one example at a time
+              return self.series[i : i + self.window], self.series[i + self.window]
+
+      ds = TensorDataset(X, y)       # ready-made Dataset for tensors already in memory
+      ```
+
+      `__getitem__` is lazy: nothing is built until asked for. That is how datasets of images on
+      disk work: open the file inside `__getitem__`.
+
+      ---
+
+      ## Underneath: what a `DataLoader` does
+
+      ```python
+      loader = DataLoader(ds, batch_size=32, shuffle=True)
+      for xb, yb in loader: ...
+      ```
+
+      is roughly:
+
+      ```python
+      order = torch.randperm(len(ds)) if shuffle else torch.arange(len(ds))   # a new order every epoch
+      for start in range(0, len(ds), 32):
+          items = [ds[i] for i in order[start : start + 32]]
+          xb = torch.stack([x for x, _ in items])        # "collate": list of examples -> batch tensor
+          yb = torch.stack([torch.as_tensor(t) for _, t in items])
+      ```
+
+      The last batch is smaller unless `drop_last=True`. `num_workers=k` runs `__getitem__` in
+      `k` background processes: worth it when loading is slow (disk, decoding, augmentation), pure
+      overhead for small in-memory tensors.
+
+      ---
+
+      ## Trade-off: batch size
+
+      | batch size | steps per epoch | gradient noise | memory | hardware use | notes |
+      | --- | --- | --- | --- | --- | --- |
+      | 1-8 | very many | high | tiny | poor: GPU mostly idle | slow per epoch; BatchNorm misbehaves |
+      | 32-256 | many | moderate | moderate | good | the usual default |
+      | 1,000+ | few | low | large | best per example | needs a larger lr (scale lr roughly with batch size) and warm-up; may generalise slightly worse |
+      | full batch | 1 | none | all of it | | only for tiny data |
+
+      Pick the largest batch that fits comfortably in memory within the usual range, then tune the
+      learning rate **for that batch size**. Changing one without the other changes the training.
+
+      ---
+
+      ## Playbook: data order bugs
+
+      **Symptom:** the per-batch loss has a sawtooth pattern, validation accuracy is lower than it
+      should be, and the model over-predicts whichever class or source came last.
+
+      **Measure:** look at the labels in the first few batches (`torch.bincount(yb)`), and count
+      the model's predictions per class on validation data.
+
+      **Diagnose:** the data is sorted (by label, by date, by source file) and the loader does not
+      shuffle, so each stretch of steps pulls the model towards one class, and the last stretch wins.
+
+      **Fix:** `shuffle=True` for the training loader. Keep `shuffle=False` for validation and test:
+      order does not change their metrics, and a fixed order makes runs comparable.
+
+      Related: `drop_last=True` avoids a final batch of size 1 (which breaks BatchNorm), and random
+      augmentation in workers needs each worker seeded differently.
+
+  - id: window-dataset
+    type: coding
+    title: Write a Dataset, batch it with a DataLoader
+    context: |
+      `series` holds 100 values of a signal. To train a model that predicts the next value from
+      the previous 5, each example is a window of 5 values and its target is the value right after.
+    instructions:
+      - "Complete `WindowDataset`: `__len__` returns the number of full windows, and `__getitem__(i)` returns `(series[i : i + window], series[i + window])`."
+      - "Create `ds = WindowDataset(series, 5)` and `loader = DataLoader(ds, batch_size=16, shuffle=False)`."
+      - "Store the size of every batch in the list `batch_sizes`, and the first batch's inputs and targets in `first_x` and `first_y`. Print `len(ds)` and `batch_sizes`."
+    hint: |
+      With 100 values and windows of 5 there are `100 - 5 = 95` examples. `batch_sizes = [xb.shape[0] for xb, yb in loader]`;
+      `first_x, first_y = next(iter(loader))`.
+    pre_code: |
+      import torch
+      from torch.utils.data import Dataset, DataLoader
+      series = torch.sin(torch.arange(100) * 0.2)
+    sample_code: |
+      class WindowDataset(Dataset):
+          def __init__(self, series, window):
+              self.series = series
+              self.window = window
+
+          def __len__(self):
+              return ____
+
+          def __getitem__(self, i):
+              return ____
+
+      ds = WindowDataset(series, 5)
+      loader = DataLoader(ds, batch_size=16, shuffle=False)
+      batch_sizes = ____
+      first_x, first_y = ____
+      print(len(ds), batch_sizes)
+    solution: |
+      class WindowDataset(Dataset):
+          def __init__(self, series, window):
+              self.series = series
+              self.window = window
+
+          def __len__(self):
+              return len(self.series) - self.window
+
+          def __getitem__(self, i):
+              return self.series[i : i + self.window], self.series[i + self.window]
+
+      ds = WindowDataset(series, 5)
+      loader = DataLoader(ds, batch_size=16, shuffle=False)
+      batch_sizes = [xb.shape[0] for xb, yb in loader]
+      first_x, first_y = next(iter(loader))
+      print(len(ds), batch_sizes)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_object("ds")
+      assert len(user["ds"]) == 95, f"`len(ds)` should be 95 (100 values minus a window of 5), got {len(user['ds'])}."
+      x0, y0 = user["ds"][0]
+      assert tuple(x0.shape) == (5,), "`ds[0]` should return a window of 5 values first."
+      check_tensor({"x": x0}, {"x": sol["series"][:5]}, "x", msg="`ds[i]` should start with `series[i : i + window]`.")
+      check_tensor({"t": user["ds"][94][1]}, {"t": sol["series"][99]}, "t", msg="The target of the last example should be the last value of the series: `series[i + window]`.")
+      check_equal("batch_sizes", [16, 16, 16, 16, 16, 15], msg="`batch_sizes` should list the size of every batch: five of 16, then the 15 left over.")
+      check_tensor(user, sol, "first_x", msg="`first_x` should be the inputs of the first batch, shape `(16, 5)`.")
+      check_tensor(user, sol, "first_y", msg="`first_y` should be the targets of the first batch, shape `(16,)`.")
+    success_msg: The loader called your `__getitem__` 16 times per batch and stacked the results. Note the smaller last batch.
+
+  - id: shuffle-bug
+    type: coding
+    title: "Fix it: the model that favours the last class"
+    context: |
+      A 3-class classifier scores worse on validation than it should. The training data
+      `X_train`, `y_train` (900 points) is stored sorted by label, and `train(loader)` trains a
+      fresh small network for 5 epochs from the batches `loader` gives it. `X_val`, `y_val` are
+      600 validation points, 200 per class.
+    instructions:
+      - "Measure: store the set of labels in the first batch of `loader` in `first_batch_labels`, then train `model = train(loader)` and store its validation accuracy in `acc_before` and its prediction counts per class (`torch.bincount(..., minlength=3)`) in `pred_counts`."
+      - "Fix: build `fixed_loader` that fixes the cause, train `fixed_model = train(fixed_loader)`, and store its validation accuracy in `acc_after`. It must reach at least `0.81`."
+      - Print the accuracies and the prediction counts.
+    hint: |
+      `set(next(iter(loader))[1].tolist())` gives the labels in the first batch. If they are all
+      the same, the loader is walking through sorted data. `DataLoader(TensorDataset(X_train, y_train), batch_size=30, shuffle=True)`.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from torch.utils.data import TensorDataset, DataLoader
+      g = torch.Generator().manual_seed(0)
+      centers = torch.tensor([[0.0, 0.0], [2.5, 0.0], [0.0, 2.5]])
+      y_train = torch.arange(3).repeat_interleave(300)
+      X_train = centers[y_train] + torch.randn(900, 2, generator=g)
+      y_val = torch.arange(3).repeat_interleave(200)
+      X_val = centers[y_val] + torch.randn(600, 2, generator=g)
+
+      def train(loader, epochs=5):
+          torch.manual_seed(42)
+          model = nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 3))
+          opt = torch.optim.SGD(model.parameters(), lr=0.1)
+          for _ in range(epochs):
+              for xb, yb in loader:
+                  opt.zero_grad()
+                  F.cross_entropy(model(xb), yb).backward()
+                  opt.step()
+          return model
+
+      loader = DataLoader(TensorDataset(X_train, y_train), batch_size=30, shuffle=False)
+    sample_code: |
+      def accuracy(model, X, y):
+          with torch.no_grad():
+              return (model(X).argmax(dim=1) == y).float().mean().item()
+
+      first_batch_labels = ____
+      model = train(loader)
+      acc_before = accuracy(model, X_val, y_val)
+      with torch.no_grad():
+          pred_counts = ____
+      print(first_batch_labels, acc_before, pred_counts)
+
+      fixed_loader = ____
+      fixed_model = train(fixed_loader)
+      acc_after = accuracy(fixed_model, X_val, y_val)
+      print(acc_after)
+    solution: |
+      def accuracy(model, X, y):
+          with torch.no_grad():
+              return (model(X).argmax(dim=1) == y).float().mean().item()
+
+      first_batch_labels = set(next(iter(loader))[1].tolist())
+      model = train(loader)
+      acc_before = accuracy(model, X_val, y_val)
+      with torch.no_grad():
+          pred_counts = torch.bincount(model(X_val).argmax(dim=1), minlength=3)
+      print(first_batch_labels, acc_before, pred_counts)
+
+      fixed_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=30, shuffle=True)
+      fixed_model = train(fixed_loader)
+      acc_after = accuracy(fixed_model, X_val, y_val)
+      print(acc_after)
+    tests: |
+      import torch
+      from kits.deep_learning_pytorch import check_tensor
+      check_equal("first_batch_labels", {0}, msg="`first_batch_labels` should be the set of labels in the first batch of the original `loader`: `set(next(iter(loader))[1].tolist())`.")
+      check_equal("acc_before", tol=1e-4, msg="`acc_before` should be the validation accuracy of `train(loader)` with the original loader.")
+      check_tensor(user, sol, "pred_counts", msg="`pred_counts` should be `torch.bincount(model(X_val).argmax(dim=1), minlength=3)` for the original model.")
+      check_object("fixed_model")
+      with torch.no_grad():
+          preds = user["fixed_model"](sol["X_val"]).argmax(dim=1)
+      acc = (preds == sol["y_val"]).float().mean().item()
+      counts = torch.bincount(preds, minlength=3).tolist()
+      assert acc >= 0.81, f"`fixed_model` reaches {acc:.3f} validation accuracy (prediction counts {counts}); it needs 0.81. The batches still come in label order: shuffle them."
+      check_equal("acc_after", acc, tol=1e-4, msg="`acc_after` should be `fixed_model`'s accuracy on `X_val`, `y_val`.")
+    success_msg: |
+      Same model, same data, same epochs: shuffling alone took accuracy from about 0.78 to 0.83, and
+      class 0 is no longer starved of predictions. Sorted data is common (files written per class
+      or per day); shuffle the training loader every time.
+
+  - id: choose-batch-size
+    type: mc
+    title: Pick a batch size
+    question: |
+      You have 20,000 training examples and a GPU. Full-batch training takes 1 step per epoch and
+      the loss falls very slowly per epoch. Batch size 1 gives 20,000 steps per epoch but an epoch
+      takes 50 times longer because the GPU sits mostly idle. Batches of 512 use 2 GB of the GPU's
+      16 GB. What do you try next?
+    options:
+      - text: Keep full batch and train for many more epochs
+        feedback: "One update per epoch is the bottleneck. More epochs means many more passes over the data for the same number of steps that mini-batches give you in one epoch."
+      - text: Batch size 1, because noisier gradients generalise better
+        feedback: "Some noise helps, but batch size 1 wastes the GPU (50x slower per epoch here) and is so noisy it needs a tiny learning rate."
+      - text: "Batch size 64-512, and re-tune the learning rate for it"
+        correct: true
+        feedback: "Right. Hundreds of steps per epoch, good GPU use, comfortable memory, and you re-tune the lr because the right lr depends on the batch size."
+      - text: "Batch size 8,192 at the same learning rate, to use all the memory"
+        feedback: "Filling memory is not the goal. With only 2-3 steps per epoch and an lr tuned for a different batch size, it behaves almost like full batch. Large batches need a larger lr and usually warm-up."
+    hint: You want many steps per epoch **and** a busy GPU.

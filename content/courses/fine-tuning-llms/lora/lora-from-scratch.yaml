@@ -1,0 +1,266 @@
+title: LoRA from scratch
+description: "Low-rank adapters: why a rank-r update is enough, why B starts at zero, how to count parameters, and how to merge an adapter so it costs nothing at inference."
+exercises:
+  - id: intro
+    type: video
+    title: Fine-tuning a few numbers instead of all of them
+    slides: |
+      # What full fine-tuning moves
+
+      A linear layer computes $h = Wx + b$ with $W \in \mathbb{R}^{d_\text{out} \times d_\text{in}}$.
+      Full fine-tuning learns an update $\Delta W$ of the **same size** for every layer:
+
+      | | one 4096 × 4096 projection | a 7B model |
+      | --- | --- | --- |
+      | trainable numbers | 16.8 M | 7 B |
+      | memory during training (weights + gradients + 2 Adam states, fp32) | ~270 MB | ~112 GB |
+      | one saved fine-tune | 67 MB | ~14 GB (fp16) |
+
+      And every customer or task variant is another full copy of the model.
+
+      ---
+
+      ## The LoRA idea: a low-rank update
+
+      Research on fine-tuning found that the update a pretrained model needs for a new task has **low
+      intrinsic rank**. So constrain it:
+
+      $$h = Wx + b + \frac{\alpha}{r}\,B A x, \qquad A \in \mathbb{R}^{r \times d_\text{in}},\; B \in \mathbb{R}^{d_\text{out} \times r},\; r \ll d$$
+
+      - $W$ and $b$ are **frozen** (`requires_grad = False`). Only $A$ and $B$ train.
+      - Trainable numbers per layer: $r\,(d_\text{in} + d_\text{out})$ instead of $d_\text{in} d_\text{out}$.
+      - $x \to Ax$ squeezes the input into $r$ numbers; $B$ expands them back to $d_\text{out}$.
+
+      ---
+
+      ## Initialisation: B = 0
+
+      $$A \sim \text{small random}, \qquad B = 0 \;\Rightarrow\; \Delta W = \tfrac{\alpha}{r} BA = 0$$
+
+      At step 0 the model is **exactly** the base model, so training starts from what already works.
+
+      | init | what happens |
+      | --- | --- |
+      | A random, **B = 0** | starts at the base; $\partial L/\partial B = (\ldots)(Ax)^\top \neq 0$, so B moves first, then A |
+      | A = 0 and B = 0 | both gradients are 0 for ever: **nothing ever trains** |
+      | both random | starts away from the base: random noise added to every layer |
+
+      The scale $\alpha / r$ keeps the size of the update roughly constant when you change $r$, so a
+      learning rate tuned at one rank still works at another. A common choice is $\alpha = 2r$.
+
+      ---
+
+      ## In code
+
+      ```python
+      class LoRALinear(nn.Module):
+          def __init__(self, base: nn.Linear, r=4, alpha=8.0):
+              super().__init__()
+              self.base = base
+              for p in self.base.parameters():
+                  p.requires_grad = False                       # freeze W and b
+              self.scale = alpha / r
+              self.A = nn.Parameter(torch.randn(r, base.in_features) / base.in_features ** 0.5)
+              self.B = nn.Parameter(torch.zeros(base.out_features, r))
+
+          def forward(self, x):
+              return self.base(x) + self.scale * (x @ self.A.T) @ self.B.T
+      ```
+
+      With Hugging Face's `peft` library, the same thing is configured rather than written:
+
+      ```python
+      from peft import LoraConfig, get_peft_model
+      model = get_peft_model(base, LoraConfig(r=8, lora_alpha=16, target_modules=["q_proj", "v_proj"]))
+      model.print_trainable_parameters()
+      ```
+
+      ---
+
+      ## Merge: zero cost at inference
+
+      After training, fold the adapter into the weight:
+
+      $$W' = W + \frac{\alpha}{r} B A$$
+
+      One ordinary `nn.Linear` with $W'$ gives the same outputs, with **no extra latency**. Keep $A$ and
+      $B$ unmerged instead when you want to **swap adapters** on one shared base model (one adapter per
+      station, per customer, per task).
+
+  - id: lora-linear
+    type: coding
+    title: Write a LoRA layer
+    context: |
+      Build the layer from the slides. Tests wrap a fresh `nn.Linear(20, 30)` with your class. `torch`
+      and `torch.nn as nn` are imported.
+    instructions:
+      - "In `__init__`, freeze every parameter of `base`, and store `self.scale = alpha / r`."
+      - "Create `self.A` as an `nn.Parameter` of shape `(r, base.in_features)` from `torch.randn(...) / base.in_features ** 0.5`, and `self.B` as an `nn.Parameter` of zeros with shape `(base.out_features, r)`."
+      - "`forward(x)` returns `self.base(x) + self.scale * (x @ self.A.T) @ self.B.T`."
+    hint: "Freeze with `for p in self.base.parameters(): p.requires_grad = False`. Zeros: `torch.zeros(base.out_features, r)`."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+    sample_code: |
+      class LoRALinear(nn.Module):
+          def __init__(self, base, r=4, alpha=8.0):
+              super().__init__()
+              self.base = base
+              for p in self.base.parameters():
+                  ____
+              self.scale = ____
+              self.A = nn.Parameter(torch.randn(r, base.in_features) / base.in_features ** 0.5)
+              self.B = nn.Parameter(____)
+
+          def forward(self, x):
+              return ____
+
+      layer = LoRALinear(nn.Linear(20, 30), r=4, alpha=8)
+      x = torch.randn(5, 20)
+      print(torch.allclose(layer(x), layer.base(x)))
+      print(sum(p.numel() for p in layer.parameters() if p.requires_grad), "trainable")
+    solution: |
+      class LoRALinear(nn.Module):
+          def __init__(self, base, r=4, alpha=8.0):
+              super().__init__()
+              self.base = base
+              for p in self.base.parameters():
+                  p.requires_grad = False
+              self.scale = alpha / r
+              self.A = nn.Parameter(torch.randn(r, base.in_features) / base.in_features ** 0.5)
+              self.B = nn.Parameter(torch.zeros(base.out_features, r))
+
+          def forward(self, x):
+              return self.base(x) + self.scale * (x @ self.A.T) @ self.B.T
+
+      layer = LoRALinear(nn.Linear(20, 30), r=4, alpha=8)
+      x = torch.randn(5, 20)
+      print(torch.allclose(layer(x), layer.base(x)))
+      print(sum(p.numel() for p in layer.parameters() if p.requires_grad), "trainable")
+    tests: |
+      import torch, torch.nn as nn
+      Cls = check_object("LoRALinear")
+      torch.manual_seed(3)
+      base = nn.Linear(20, 30)
+      lay = Cls(base, r=4, alpha=8)
+      assert all(not p.requires_grad for p in base.parameters()), "The base layer's weight and bias must be frozen (`requires_grad = False`)."
+      assert tuple(lay.A.shape) == (4, 20), f"`A` should have shape (r, in_features) = (4, 20); it has {tuple(lay.A.shape)}."
+      assert tuple(lay.B.shape) == (30, 4), f"`B` should have shape (out_features, r) = (30, 4); it has {tuple(lay.B.shape)}."
+      assert lay.A.requires_grad and lay.B.requires_grad, "`A` and `B` must be trainable `nn.Parameter`s."
+      assert float(lay.B.abs().max()) == 0.0, "`B` must start at zero so the layer equals the base at initialisation."
+      assert float(lay.A.abs().max()) > 0, "`A` must start random, not zero: with A = B = 0 nothing would ever train."
+      x = torch.randn(7, 20)
+      assert torch.allclose(lay(x), base(x)), "At initialisation the output should equal `base(x)` exactly."
+      with torch.no_grad():
+          lay.B.copy_(torch.randn(30, 4))
+      want = base(x) + 2.0 * (x @ lay.A.T) @ lay.B.T
+      assert torch.allclose(lay(x), want, atol=1e-5), "With non-zero B, `forward` should return `base(x) + (alpha / r) * (x @ A.T) @ B.T`. Check the scale is `alpha / r`."
+      n = sum(p.numel() for p in lay.parameters() if p.requires_grad)
+      assert n == 4 * (20 + 30), f"Only A and B should train: r * (in + out) = 200 numbers. You have {n} trainable."
+    success_msg: "The layer equals its base at step 0 and trains 200 numbers instead of 630. That ratio gets far better as layers get wider."
+
+  - id: count-r8
+    type: mc
+    title: How many numbers does LoRA train?
+    question: |
+      You add a rank-8 LoRA adapter to one 4096 × 4096 attention projection. How many numbers does it
+      train, and what share of that layer's weights is that?
+    pre_code: |
+      d_in = d_out = 4096
+      r = 8
+      # try: r * (d_in + d_out), d_in * d_out
+    options:
+      - text: "32,768 (0.20%)"
+        feedback: "That's $r \\times d$ for one matrix only. LoRA has two: $A$ is $r \\times d_\\text{in}$ and $B$ is $d_\\text{out} \\times r$."
+      - text: "65,536 (0.39%)"
+        correct: true
+        feedback: "Right: $8 \\times (4096 + 4096) = 65{,}536$, against $4096^2 = 16{,}777{,}216$ for the full matrix. Doubling the rank doubles it; doubling the width only doubles it too, while the full matrix quadruples."
+      - text: "131,072 (0.78%)"
+        feedback: "That's rank 16. At rank 8 it is $8 \\times (4096 + 4096)$."
+      - text: "16,777,216 (100%)"
+        feedback: "That's full fine-tuning of the layer. LoRA keeps $W$ frozen and trains only $A$ and $B$."
+    hint: Count A ($r \times d_\text{in}$) and B ($d_\text{out} \times r$), then divide by $d_\text{in} \times d_\text{out}$. The console has the numbers.
+
+  - id: both-zero
+    type: mc
+    title: "Predict, then run: what if A starts at zero too?"
+    question: |
+      A teammate "simplifies" the init to `A = zeros` and `B = zeros`. The console has a LoRA layer
+      `lay` built that way, and `grads()` runs one backward pass and returns the gradient norms of A
+      and B. What happens during training?
+    pre_code: |
+      import torch, torch.nn as nn
+      torch.manual_seed(0)
+      class Lay(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.base = nn.Linear(8, 8).requires_grad_(False)
+              self.A = nn.Parameter(torch.zeros(2, 8))
+              self.B = nn.Parameter(torch.zeros(8, 2))
+          def forward(self, x):
+              return self.base(x) + (x @ self.A.T) @ self.B.T
+      lay = Lay()
+      def grads():
+          lay.zero_grad()
+          lay(torch.randn(4, 8)).pow(2).sum().backward()
+          return lay.A.grad.norm().item(), lay.B.grad.norm().item()
+      # try: grads()
+    options:
+      - text: It trains normally; the zeros only affect the first step.
+        feedback: "Run `grads()`: both are 0.0. $\\partial L/\\partial B$ depends on $Ax = 0$ and $\\partial L/\\partial A$ depends on $B = 0$, so no step ever moves either one."
+      - text: Nothing ever trains, because both gradients are exactly zero and stay zero.
+        correct: true
+        feedback: "Right. Each matrix's gradient goes through the other, and both are zero, so the adapter is stuck at zero for ever. Random A with zero B breaks the deadlock while still starting at the base model."
+      - text: Training diverges, because zero weights cause division by zero.
+        feedback: "Nothing divides by the weights. The problem is the opposite of divergence: the gradients are exactly zero."
+      - text: It becomes equivalent to full fine-tuning of W.
+        feedback: "W is frozen (`requires_grad_(False)`), so it never changes whatever A and B do."
+    hint: Call `grads()` in the console. Then look at which factor each gradient is multiplied by.
+
+  - id: merge-adapter
+    type: coding
+    title: Merge the adapter for serving
+    context: |
+      `lay` is a trained `LoRALinear` (the reference version from this course: `lay.base`, `lay.A`,
+      `lay.B`, `lay.scale`) wrapping a 64 → 32 layer. `x` is a batch of inputs. `torch` and `nn` are imported.
+    instructions:
+      - "Store the merged weight `lay.base.weight + lay.scale * lay.B @ lay.A` in `W_merged` (inside `torch.no_grad()`)."
+      - "Create `merged = nn.Linear(64, 32)` and copy `W_merged` into its weight and `lay.base.bias` into its bias."
+      - "Store the largest absolute difference between `merged(x)` and `lay(x)` as a float in `max_diff`."
+    hint: "`with torch.no_grad(): merged.weight.copy_(W_merged); merged.bias.copy_(lay.base.bias)`. Then `(merged(x) - lay(x)).abs().max().item()`."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      from kits.fine_tuning_llms import LoRALinear
+      torch.manual_seed(5)
+      lay = LoRALinear(nn.Linear(64, 32), r=4, alpha=8)
+      with torch.no_grad():
+          lay.B.copy_(torch.randn(32, 4) * 0.1)      # pretend it was trained
+      x = torch.randn(10, 64)
+    sample_code: |
+      with torch.no_grad():
+          W_merged = ____
+          merged = nn.Linear(64, 32)
+          merged.weight.copy_(____)
+          merged.bias.copy_(____)
+          max_diff = ____
+      print(f"max difference {max_diff:.2e}; extra parameters at inference: 0")
+    solution: |
+      with torch.no_grad():
+          W_merged = lay.base.weight + lay.scale * lay.B @ lay.A
+          merged = nn.Linear(64, 32)
+          merged.weight.copy_(W_merged)
+          merged.bias.copy_(lay.base.bias)
+          max_diff = (merged(x) - lay(x)).abs().max().item()
+      print(f"max difference {max_diff:.2e}; extra parameters at inference: 0")
+    tests: |
+      import torch
+      from kits.fine_tuning_llms import check_tensor
+      check_tensor(user, sol, "W_merged", atol=1e-6, msg="`W_merged` should be `lay.base.weight + lay.scale * lay.B @ lay.A`, shape (32, 64).")
+      m = check_object("merged")
+      with torch.no_grad():
+          d = (m(user["x"]) - user["lay"](user["x"])).abs().max().item()
+      assert d < 1e-5, f"`merged(x)` differs from `lay(x)` by {d:.3g}. Copy `W_merged` into the weight and `lay.base.bias` into the bias."
+      md = float(check_object("max_diff"))
+      assert md < 1e-5, "`max_diff` should be tiny (float rounding only)."
+    success_msg: "Same outputs from one plain matrix multiply. Merge for single-model serving; keep A and B separate when one base must serve many adapters."

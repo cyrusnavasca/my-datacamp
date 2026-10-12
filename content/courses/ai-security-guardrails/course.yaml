@@ -1,0 +1,44 @@
+title: AI Security and Guardrails
+description: 'Defend LLM applications: threat modelling with the OWASP Top 10 for LLMs, how direct and
+  indirect prompt injection work, safe output handling and data leakage, least privilege and human approval, with
+  every defence measured for both safety and usability.'
+level: advanced
+est_hours: 4
+prerequisites:
+- agents-tool-use
+- rag-systems
+objectives:
+- Threat-model an LLM app with the OWASP Top 10 for LLMs
+- Explain direct and indirect prompt injection, observe it on a provided sample, and defend every channel
+- Validate model output and prevent sensitive data and system prompt leaks
+- Limit agent power with least privilege and approvals, and prove it with an evaluation harness and ablations
+requires: []
+chapters:
+- id: threat-model
+  title: Threat modelling
+  description: The OWASP Top 10 for LLM applications, trust boundaries, and measuring safety and usability together.
+  lessons:
+  - owasp-llm-top-10
+  - trust-boundaries
+  - measure-security
+- id: prompt-injection
+  title: Prompt injection
+  description: Why models follow injected text, observing an indirect injection in three channels, and layered defences measured for safety and cost.
+  lessons:
+  - how-injection-works
+  - indirect-injection
+  - defences
+- id: output-handling
+  title: Output handling and leakage
+  description: Validating and rendering model output safely, redacting crew medical data, and stopping system prompt leaks.
+  lessons:
+  - validate-outputs
+  - pii-leakage
+  - leak-drill
+- id: excessive-agency
+  title: Excessive agency
+  description: Least-privilege tools, human approval without approval fatigue, and a defence-in-depth drill with measured results.
+  lessons:
+  - least-privilege
+  - human-approval
+  - defence-in-depth-drill

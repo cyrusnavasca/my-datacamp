@@ -1,0 +1,304 @@
+title: "Troubleshooting: new words break the classifier"
+description: The triage model collapses on messages typed with EVA gloves. Measure why, fix it with subword features, and prove the fix.
+exercises:
+  - id: intro
+    type: video
+    title: When accuracy drops on new text
+    slides: |
+      # Symptom: great in testing, bad this week
+
+      The triage model scored 100% on held-out tickets. This week the crew switched to
+      keypads on their EVA gloves, and the medical officer reports that her queue is
+      suddenly full of printer faults and lab bookings.
+
+      Messages now look like this:
+
+      ```
+      before: "Requesting a check-up, my headache is not going away."
+      now:    "rqeuesting cheeck-up headahce giong aawy"
+      ```
+
+      Do not retrain on a hunch. Work the loop: **Symptom → Measure → Diagnose → Fix → Verify.**
+
+      ---
+
+      ## Measure: three numbers before any fix
+
+      1. **Accuracy on a labelled sample of the new text**, next to accuracy on the old test set.
+         Even 50 hand-labelled messages show a 30-point drop clearly.
+      2. **OOV rate** against the model's vocabulary (`vectorizer.vocabulary_`).
+      3. **Empty rows**: messages with **no** known token at all.
+
+      ```python
+      vec = model.named_steps["tfidfvectorizer"]
+      analyze = vec.build_analyzer()          # the exact tokeniser the model uses
+      tokens = [t for text in new_texts for t in analyze(text)]
+      oov = sum(t not in vec.vocabulary_ for t in tokens) / len(tokens)
+      empty = (vec.transform(new_texts).getnnz(axis=1) == 0).sum()
+      ```
+
+      ---
+
+      ## Diagnose: what an empty row does
+
+      A message whose tokens are all unknown becomes the **zero vector**. A linear model then
+      outputs only its intercepts:
+
+      $$\text{logits} = W \cdot \mathbf{0} + b = b$$
+
+      so every empty message gets the **same** class, whichever has the largest intercept. That is
+      why errors pile up in one queue instead of spreading out.
+
+      Usual causes of an OOV jump, most common first:
+
+      | cause | looks like | check |
+      | --- | --- | --- |
+      | typos, new input device | `pasword`, `hedache` | OOV tokens are near-misses of known words |
+      | new vocabulary (equipment, names) | `centrifuge` | OOV tokens are real words |
+      | different preprocessing | `Module` vs `module`, Unicode quotes | compare tokeniser output on old and new text |
+      | different language or register | shorthand, slang | read 20 OOV tokens by eye |
+
+      ---
+
+      ## Fix: options in the order to try them
+
+      | fix | helps with | cost and risk |
+      | --- | --- | --- |
+      | normalise text (lowercase, map known abbreviations) | `pls`, `mod`, casing | minutes; only covers variants you listed |
+      | **character n-grams** (`analyzer="char_wb", ngram_range=(2, 4)`) | typos, inflections, compounds | bigger feature space (10x), slightly slower; no help with true synonyms |
+      | subword tokeniser + embeddings | typos and new words | needs a neural model; more latency |
+      | label new data and retrain | everything, including new meanings | the best fix, but costs crew time and is slow |
+
+      A typo changes one or two characters, so most of a word's character n-grams survive:
+      `headache` and `headahce` share `he`, `hea`, `ead`, `ach`, ... That is the same idea as
+      subword tokenisation: fall back to pieces you know.
+
+      ---
+
+      ## Verify: on both slices, every time
+
+      ```python
+      for name, m in [("word", word_model), ("char", char_model)]:
+          print(name, m.score(test_texts, y_test), m.score(glove_texts, y_glove))
+      ```
+
+      - The fix must lift the **new** slice above your target.
+      - It must **not** regress the old slice. A fix that trades one queue for another is not a fix.
+      - Re-measure the diagnostic too: OOV over the new features should fall sharply.
+      - Keep the labelled new-text sample as a permanent regression test.
+
+  - id: zero-vector
+    type: mc
+    title: Predict, then run - the empty message
+    question: |
+      `model` is the word-level TF-IDF + logistic regression triage model. Every token in
+      `"xqzt vrrp blorf"` is out of vocabulary. What will `model.predict` return for it, and for
+      `"zzzz"`, and for any other message made only of unknown words?
+    context: "The console has `model`, `vec = model.named_steps['tfidfvectorizer']` and `clf = model.named_steps['logisticregression']` loaded. Try `vec.transform([...]).toarray().sum()` and `clf.intercept_`."
+    pre_code: |
+      from sklearn.feature_extraction.text import TfidfVectorizer
+      from sklearn.linear_model import LogisticRegression
+      from sklearn.pipeline import make_pipeline
+      from kits.nlp_transformers import ticket_split
+      _train, _test = ticket_split()
+      model = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=1000)).fit(_train["text"], _train["category"])
+      vec = model.named_steps["tfidfvectorizer"]
+      clf = model.named_steps["logisticregression"]
+    options:
+      - text: A random category each time
+        feedback: Logistic regression is deterministic. Run `model.predict(["xqzt vrrp blorf", "zzzz"])` and look.
+      - text: The same category for all of them, the one with the largest intercept
+        correct: true
+        feedback: |
+          Right. Unknown words give an all-zero vector, so the logits are just `clf.intercept_`, identical
+          for every such message. `clf.classes_[clf.intercept_.argmax()]` tells you which queue
+          silently fills up.
+      - text: An error, because the vector is empty
+        feedback: The vector is not empty; it has the full vocabulary length and is all zeros. scikit-learn happily predicts from it.
+      - text: The category of the training message with the most similar spelling
+        feedback: A word-level model has no notion of spelling. Unknown tokens are simply dropped by the vectoriser.
+    hint: Multiply a zero vector by any weight matrix and you get zero. What is left in $Wx + b$?
+
+  - id: measure-drift
+    type: coding
+    title: Measure the damage
+    context: |
+      `word_model` is the TF-IDF triage model from the last lesson, fitted on `train_texts`.
+      `glove_texts` are the 60 test tickets as the crew now types them; their labels are still
+      `test_labels`. `vec = word_model.named_steps["tfidfvectorizer"]` is loaded.
+    instructions:
+      - "Store the model's accuracy on `test_texts` in `acc_clean` and on `glove_texts` in `acc_glove`."
+      - "Using `analyze = vec.build_analyzer()`, store the share of tokens in `glove_texts` that are not in `vec.vocabulary_` in `oov_glove`."
+      - "Store the number of `glove_texts` with **no** known token in `empty_rows`."
+    hint: "`vec.transform(glove_texts).getnnz(axis=1)` counts the known tokens in each row; count the rows where it is 0."
+    pre_code: |
+      from sklearn.feature_extraction.text import TfidfVectorizer
+      from sklearn.linear_model import LogisticRegression
+      from sklearn.pipeline import make_pipeline
+      from kits.nlp_transformers import ticket_split, glove_typed
+      _train, _test = ticket_split()
+      train_texts, train_labels = list(_train["text"]), list(_train["category"])
+      test_texts, test_labels = list(_test["text"]), list(_test["category"])
+      glove_texts = glove_typed(test_texts)
+      word_model = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=1000)).fit(train_texts, train_labels)
+      vec = word_model.named_steps["tfidfvectorizer"]
+    sample_code: |
+      acc_clean = word_model.score(____, ____)
+      acc_glove = ____
+
+      analyze = vec.build_analyzer()
+      tokens = [t for text in glove_texts for t in analyze(text)]
+      oov_glove = ____
+
+      empty_rows = int((____.getnnz(axis=1) == 0).sum())
+
+      print(f"clean {acc_clean:.0%}  glove {acc_glove:.0%}  OOV {oov_glove:.0%}  empty rows {empty_rows}")
+    solution: |
+      acc_clean = word_model.score(test_texts, test_labels)
+      acc_glove = word_model.score(glove_texts, test_labels)
+
+      analyze = vec.build_analyzer()
+      tokens = [t for text in glove_texts for t in analyze(text)]
+      oov_glove = sum(t not in vec.vocabulary_ for t in tokens) / len(tokens)
+
+      empty_rows = int((vec.transform(glove_texts).getnnz(axis=1) == 0).sum())
+
+      print(f"clean {acc_clean:.0%}  glove {acc_glove:.0%}  OOV {oov_glove:.0%}  empty rows {empty_rows}")
+    tests: |
+      check_equal("acc_clean", msg="`acc_clean` is `word_model.score(test_texts, test_labels)`.")
+      check_equal("acc_glove", msg="`acc_glove` is `word_model.score(glove_texts, test_labels)`: same labels, new spelling.")
+      check_equal("oov_glove", msg="`oov_glove` is the share of tokens from `analyze(text)` over all `glove_texts` that are not keys of `vec.vocabulary_`.")
+      check_equal("empty_rows", msg="`empty_rows` counts glove messages where `vec.transform(...)` has no non-zero entry.")
+    success_msg: Accuracy fell from 100% to 65%, three quarters of tokens are unknown, and almost a third of messages are completely empty vectors. The cause is clear; now pick a fix.
+
+  - id: which-fix
+    type: mc
+    title: Choose the first fix
+    question: |
+      Your measurements: OOV went from 2% to 77%, the unknown tokens are misspellings of words the
+      model knows (`hedache`, `printr`, `bookng`), and nobody has time to label new tickets this
+      week. The model must keep running on the same CPU. What do you try first?
+    options:
+      - text: Switch the vectoriser to character n-grams (`analyzer="char_wb"`) and retrain on the same labels
+        correct: true
+        feedback: |
+          Right. Misspellings share most of their character n-grams with the correct word, the
+          training data already has the labels, and it still runs in well under a millisecond.
+      - text: Refit the word vectoriser with `min_df=1` so it keeps more training words
+        feedback: The default already keeps every training word. New misspellings are not in the training data, so no word-level vocabulary built from it can contain them.
+      - text: Label 5,000 glove-typed tickets and retrain the word model
+        feedback: That would work eventually, but it costs crew time you do not have, and the word model would still break on the next new typo. Try the cheap structural fix first.
+      - text: Replace the model with a fine-tuned transformer
+        feedback: Possible later, but it means a training job, a GPU and much higher latency. Its subword tokeniser helps, yet character n-grams give most of that benefit today for nearly no cost.
+    hint: The unknown tokens are near-misses of known words. Which option lets the model match parts of words?
+
+  - id: glove-keypad-mission
+    type: sequential
+    title: "Mission: fix ticket triage for glove keypads"
+    xp: 200
+    context: |
+      **Mission.** Since the glove keypads arrived, ORBIT's ticket triage misroutes a third of all
+      tickets. Measure the failure, find the cause, fix the model and prove the fix holds on both
+      old and new text.
+
+      Loaded: `train_texts`, `train_labels`, `test_texts`, `test_labels`, `glove_texts` (the test
+      tickets as typed on the keypads, same labels), `word_model` (fitted word-level TF-IDF +
+      logistic regression), `TfidfVectorizer`, `LogisticRegression`, `make_pipeline` and `np`.
+    pre_code: |
+      import numpy as np
+      from sklearn.feature_extraction.text import TfidfVectorizer
+      from sklearn.linear_model import LogisticRegression
+      from sklearn.pipeline import make_pipeline
+      from kits.nlp_transformers import ticket_split, glove_typed
+      _train, _test = ticket_split()
+      train_texts, train_labels = list(_train["text"]), list(_train["category"])
+      test_texts, test_labels = list(_test["text"]), list(_test["category"])
+      glove_texts = glove_typed(test_texts)
+      word_model = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=1000)).fit(train_texts, train_labels)
+    steps:
+      - instructions:
+          - "**Measure.** Store `word_model`'s accuracy on `glove_texts` in `baseline`."
+          - "Store its predictions for `glove_texts` in `preds`."
+        hint: "`word_model.score(glove_texts, test_labels)` and `word_model.predict(glove_texts)`."
+        sample_code: |
+          baseline = ____
+          preds = ____
+          print(f"Accuracy on glove-typed tickets: {baseline:.0%}")
+        solution: |
+          baseline = word_model.score(glove_texts, test_labels)
+          preds = word_model.predict(glove_texts)
+          print(f"Accuracy on glove-typed tickets: {baseline:.0%}")
+        tests: |
+          check_equal("baseline", msg="`baseline` is `word_model.score(glove_texts, test_labels)`.")
+          check_equal("preds", msg="`preds` is `word_model.predict(glove_texts)`.")
+      - instructions:
+          - "**Diagnose.** Store a boolean array, `True` where a glove message has no known word, in `empty`. Use `word_model.named_steps[\"tfidfvectorizer\"]`."
+          - "Store the set of predicted labels for the empty messages in `empty_preds`, and the accuracy on just those messages in `empty_acc`."
+        hint: "`empty = vec.transform(glove_texts).getnnz(axis=1) == 0`. Then `set(preds[empty].tolist())` and `np.mean(preds[empty] == np.array(test_labels)[empty])`."
+        sample_code: |
+          vec = word_model.named_steps["tfidfvectorizer"]
+          empty = ____
+          empty_preds = ____
+          empty_acc = ____
+          print(f"{empty.sum()} empty messages, all predicted as {empty_preds}, accuracy {empty_acc:.0%}")
+        solution: |
+          vec = word_model.named_steps["tfidfvectorizer"]
+          empty = vec.transform(glove_texts).getnnz(axis=1) == 0
+          empty_preds = set(preds[empty].tolist())
+          empty_acc = np.mean(preds[empty] == np.array(test_labels)[empty])
+          print(f"{empty.sum()} empty messages, all predicted as {empty_preds}, accuracy {empty_acc:.0%}")
+        tests: |
+          check_equal("empty", msg="`empty` should be True for each glove message whose transformed row has no non-zero entries.")
+          check_equal("empty_preds", msg="`empty_preds` should be `set(preds[empty].tolist())`: all empty messages fall into one queue.")
+          check_equal("empty_acc", msg="`empty_acc` is the accuracy of `preds` on the empty messages only.")
+      - instructions:
+          - "**Fix.** Build and fit `fixed_model` on `train_texts`/`train_labels` so that it scores **at least 90%** on `glove_texts` and **at least 95%** on `test_texts`. Any approach that clears both bars passes; keep it a `make_pipeline(vectoriser, classifier)` so the next step can inspect the vectoriser."
+          - Print both accuracies.
+        hint: "Try `make_pipeline(TfidfVectorizer(analyzer=\"char_wb\", ngram_range=(2, 4)), LogisticRegression(max_iter=1000))`. Character n-grams survive typos."
+        sample_code: |
+          fixed_model = make_pipeline(TfidfVectorizer(____), LogisticRegression(max_iter=1000))
+          fixed_model.fit(train_texts, train_labels)
+          print(f"clean {fixed_model.score(test_texts, test_labels):.0%}  glove {fixed_model.score(glove_texts, test_labels):.0%}")
+        solution: |
+          fixed_model = make_pipeline(TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4)), LogisticRegression(max_iter=1000))
+          fixed_model.fit(train_texts, train_labels)
+          print(f"clean {fixed_model.score(test_texts, test_labels):.0%}  glove {fixed_model.score(glove_texts, test_labels):.0%}")
+        tests: |
+          m = check_object("fixed_model")
+          tl = user["test_labels"]
+          g = sum(p == y for p, y in zip(m.predict(user["glove_texts"]), tl)) / len(tl)
+          c = sum(p == y for p, y in zip(m.predict(user["test_texts"]), tl)) / len(tl)
+          assert g >= 0.90, f"`fixed_model` scores {g:.0%} on glove_texts; it needs at least 90%. Word features cannot match misspellings; try character n-grams (`analyzer='char_wb'`)."
+          assert c >= 0.95, f"`fixed_model` scores {c:.0%} on the clean test set; the fix must not regress it below 95%."
+      - instructions:
+          - "**Verify.** Store `{\"clean\": ..., \"glove\": ...}` accuracies for `fixed_model` in `report`."
+          - "Store the OOV rate of `fixed_model`'s own features on `glove_texts` in `oov_fixed`: the share of items from its vectoriser's `build_analyzer()` that are not in its `vocabulary_`."
+        hint: "Get the vectoriser with `fixed_model.steps[0][1]`, then reuse the OOV recipe from the slides with its analyser and vocabulary."
+        sample_code: |
+          report = {"clean": ____, "glove": ____}
+
+          fvec = fixed_model.steps[0][1]
+          analyze = fvec.build_analyzer()
+          items = [g for text in glove_texts for g in analyze(text)]
+          oov_fixed = ____
+          print(report, f"OOV now {oov_fixed:.0%}")
+        solution: |
+          report = {"clean": fixed_model.score(test_texts, test_labels), "glove": fixed_model.score(glove_texts, test_labels)}
+
+          fvec = fixed_model.steps[0][1]
+          analyze = fvec.build_analyzer()
+          items = [g for text in glove_texts for g in analyze(text)]
+          oov_fixed = sum(g not in fvec.vocabulary_ for g in items) / len(items)
+          print(report, f"OOV now {oov_fixed:.0%}")
+        tests: |
+          r = check_object("report")
+          assert isinstance(r, dict) and set(r) == {"clean", "glove"}, "`report` should be a dict with keys 'clean' and 'glove'."
+          assert abs(r["clean"] - user["fixed_model"].score(user["test_texts"], user["test_labels"])) < 1e-9, "report['clean'] should be fixed_model's accuracy on test_texts."
+          assert abs(r["glove"] - user["fixed_model"].score(user["glove_texts"], user["test_labels"])) < 1e-9, "report['glove'] should be fixed_model's accuracy on glove_texts."
+          fv = user["fixed_model"].steps[0][1]
+          an = fv.build_analyzer()
+          its = [g for t in user["glove_texts"] for g in an(t)]
+          exp = sum(g not in fv.vocabulary_ for g in its) / len(its)
+          check_equal("oov_fixed", exp, msg="`oov_fixed` is the share of your fixed vectoriser's analyser outputs on glove_texts that are missing from its `vocabulary_`.")
+          assert exp < 0.5, f"Your fixed model's features are still {exp:.0%} unknown on glove text. Use features that overlap with misspellings."
+    success_msg: Mission complete. Accuracy on glove-typed tickets is back above 90% without hurting clean tickets, and you can show why. Keep the glove sample as a regression test.

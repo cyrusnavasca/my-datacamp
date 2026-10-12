@@ -1,0 +1,6 @@
+# Extra libraries for the AI Engineering track (large downloads).
+# Install with: .venv/bin/pip install -r runner/requirements-ai.txt
+torch
+transformers
+anthropic
+pydantic

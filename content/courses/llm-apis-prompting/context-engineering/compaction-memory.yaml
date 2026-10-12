@@ -1,0 +1,312 @@
+title: Compaction and memory
+description: Keep long conversations under budget without forgetting what matters, by trimming, summarising or retrieving, and prove it with a fact-recall test.
+exercises:
+  - id: memory-slides
+    type: video
+    title: What stays in context?
+    slides: |
+      # Long conversations hit three walls
+
+      Every turn resends the whole history (chapter 1), so a long chat eventually runs into:
+
+      1. **The window:** the request no longer fits, and the API returns "prompt is too long".
+      2. **Cost and latency:** turn 80 pays for turns 1-79 again, and prefill gets slower.
+      3. **Attention:** a fact from turn 3 is buried under 70 turns of chit-chat.
+
+      You need a **policy** for what stays in context. There are three basic moves, and real systems combine them.
+
+      ---
+
+      ## Three strategies
+
+      **Trim (sliding window):** keep only the newest messages that fit the budget. Cheap, simple, and it forgets
+      early facts **silently**.
+
+      **Compact (summarise):** replace old turns with a summary the model writes, and keep recent turns verbatim.
+
+      ```python
+      def compact(messages, keep_last=20):
+          old, recent = messages[:-keep_last], messages[-keep_last:]
+          transcript = "\n".join(f"{m['role']}: {m['content']}" for m in old)
+          summary = client.messages.create(model=MODEL, max_tokens=300, messages=[{"role": "user",
+                    "content": f"{SUMMARY_PROMPT}\n<transcript>{transcript}</transcript>"}]).content[0].text
+          return [{"role": "user", "content": summary},
+                  {"role": "assistant", "content": "Understood."}] + recent    # keep the roles alternating
+      ```
+
+      **Retrieve (external memory):** store past messages or extracted facts outside the prompt, and for each new question
+      put back only the few relevant ones. That's RAG over your own conversation (the RAG course goes deeper).
+
+      ---
+
+      ## The summary prompt decides what survives
+
+      > "Summarise this conversation."
+
+      gives "*The crew chatted about the galley, the night shift and other station matters.*" That's fluent, and useless:
+      the locker number, the allergy and the agreed schedule are gone.
+
+      > "Summarise this conversation. Keep every fact, number, name, time and decision exactly as stated; drop small talk."
+
+      keeps the details that later questions depend on. Treat the summary prompt like any other prompt: **test it** with
+      questions whose answers live only in the old turns.
+
+      ---
+
+      ## Trade-offs
+
+      | strategy | tokens per turn | remembers | extra cost | failure mode |
+      | --- | --- | --- | --- | --- |
+      | resend everything | grows without limit | everything, until it overflows | none | overflow, cost, buried facts |
+      | sliding window | flat | recent turns only | none | silent forgetting of early facts |
+      | compaction | flat after each compaction | what the summary kept | a summary call now and then | summary drops or distorts a detail |
+      | retrieval memory | small and flat | anything stored, **if** retrieval finds it | storage, plus a lookup per turn | a retrieval miss looks like forgetting |
+      | a bigger window | grows | everything, for longer | every call costs more | postpones the problem |
+
+      Common combination: a few recent turns verbatim, a running summary of older turns, and retrieval for long-term facts
+      (crew allergies, standing decisions).
+
+      ---
+
+      ## Playbook: "ORBIT forgot X"
+
+      1. **Measure:** a **fact-recall test**. Plant facts in a long conversation, then ask about each one at the end.
+         Track tokens per request at the same time.
+      2. **Diagnose:** is the fact **still in the context you sent**?
+         - **No:** your trimming or compaction dropped it. Fix the summary prompt, or retrieve facts back in.
+         - **Yes:** it's buried. Shorten the context, move key facts to a pinned "notes" block in the system prompt,
+           and put the question last.
+      3. **Fix** with the cheapest strategy that meets both numbers.
+      4. **Verify:** recall at 100% on the planted facts **and** tokens under budget, on every turn rather than just the last.
+
+  - id: retrieve-memory
+    type: coding
+    title: Retrieval instead of stuffing
+    context: |
+      `conv` is an 80-message chat in which a crew member mentioned five important facts among a lot of small talk. `FACTS`
+      lists `(question, expected)` pairs about them. Instead of sending the whole chat, put back only the few earlier user
+      messages that look relevant to each question. `content_words(text)` returns a text's meaningful words.
+    instructions:
+      - "Store every **user** message's content from `conv` in `store` (a list of strings)."
+      - "Write `retrieve(question, k=3)`: return the `k` messages in `store` sharing the most `content_words` with the question."
+      - "For each question in `FACTS`, call the model with `system` = `\"Notes from earlier in this conversation:\\n\"` plus the retrieved messages joined by newlines, and `messages` = the last 6 messages of `conv` plus the question. Use `max_tokens=100`."
+      - "Store the share of replies containing `expected` (case-insensitive) in `retrieval_recall`, and the mean `usage.input_tokens` in `mean_input`."
+    hint: |
+      Score with `len(set(content_words(question)) & set(content_words(s)))` and sort `store` by it, highest first.
+      `conv[-6:]` starts with a user message, so appending the question keeps the roles alternating.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import WindowedClaude, memory_model, crew_conversation, content_words, KEY_FACTS, MODEL
+      client = WindowedClaude(memory_model(), context_window=1200, clock=aikit.VirtualClock())
+      conv = crew_conversation()
+      FACTS = [(q, expected) for _, _, q, expected in KEY_FACTS]
+    sample_code: |
+      store = ____
+
+      def retrieve(question, k=3):
+          q = set(content_words(question))
+          ranked = sorted(store, key=lambda s: ____, reverse=True)
+          return ____
+
+      hits, inputs = 0, []
+      for question, expected in FACTS:
+          system = "Notes from earlier in this conversation:\n" + ____
+          messages = ____
+          r = client.messages.create(model=MODEL, max_tokens=100, system=system, messages=messages)
+          hits += expected.lower() in r.content[0].text.lower()
+          inputs.append(r.usage.input_tokens)
+
+      retrieval_recall = ____
+      mean_input = ____
+      print(retrieval_recall, mean_input)
+    solution: |
+      store = [m["content"] for m in conv if m["role"] == "user"]
+
+      def retrieve(question, k=3):
+          q = set(content_words(question))
+          ranked = sorted(store, key=lambda s: len(q & set(content_words(s))), reverse=True)
+          return ranked[:k]
+
+      hits, inputs = 0, []
+      for question, expected in FACTS:
+          system = "Notes from earlier in this conversation:\n" + "\n".join(retrieve(question))
+          messages = conv[-6:] + [{"role": "user", "content": question}]
+          r = client.messages.create(model=MODEL, max_tokens=100, system=system, messages=messages)
+          hits += expected.lower() in r.content[0].text.lower()
+          inputs.append(r.usage.input_tokens)
+
+      retrieval_recall = hits / len(FACTS)
+      mean_input = sum(inputs) / len(inputs)
+      print(retrieval_recall, mean_input)
+    tests: |
+      check_object("store")
+      assert len(user["store"]) == 40 and all(isinstance(s, str) for s in user["store"]), "`store` should hold the content of the 40 user messages."
+      check_object("retrieve")
+      got = user["retrieve"]("What is Kenji allergic to?")
+      assert len(got) == 3 and any("penicillin" in g for g in got), "`retrieve` should return the 3 stored messages sharing the most content words with the question."
+      check_equal("retrieval_recall", 1.0, msg="Every planted fact should be recalled. Put the retrieved notes in `system`, and send `conv[-6:]` plus the question as `messages`.")
+      assert user["mean_input"] < 200, f"Requests should stay small (under 200 input tokens on average); yours average {user['mean_input']:.0f}. Send only the last 6 messages, not the whole conversation."
+    success_msg: |
+      All five facts came back with requests of about 145 tokens instead of 1,200 or more. The catch is the retriever: a
+      question phrased with different words than the original message would miss, and to the crew that looks exactly like forgetting.
+
+  - id: memory-strategy
+    type: classify
+    title: Pick the memory strategy
+    prompt: Choose the simplest strategy that meets each situation's needs.
+    hint: Ask how long the conversation gets, whether early details matter later, and whether facts must survive across sessions.
+    zones: [Resend everything, Sliding window, Compact with a summary, Retrieval memory]
+    items:
+      - { text: "One-off handbook questions with at most 5 follow-ups", zone: Resend everything }
+      - { text: "A quick crew poll where only the current question matters", zone: Resend everything }
+      - { text: "Small talk during exercise, where only the last few exchanges matter", zone: Sliding window }
+      - { text: "Live captioning of the comms loop, where context older than a minute is irrelevant", zone: Sliding window }
+      - { text: "A 3-hour EVA planning session where earlier decisions must carry forward", zone: Compact with a summary }
+      - { text: "A long debugging chat with ORBIT about a scrubber fault, full of tool output", zone: Compact with a summary }
+      - { text: "ORBIT must remember each crew member's allergies across months of sessions", zone: Retrieval memory }
+      - { text: "Answering questions about two years of past incident chats", zone: Retrieval memory }
+
+  - id: forty-turns
+    type: sequential
+    title: "Mission: forty turns without forgetting"
+    context: |
+      Kenji has been chatting with ORBIT all shift: 40 exchanges, 80 messages. Somewhere in the small talk are five facts the
+      crew will ask about later (`KEY_FACTS`). The model's context window is 1,200 tokens, and the ops rule is that the history sent with a
+      question must stay under `HISTORY_BUDGET` = 600 tokens. `recall_test(client, messages)` asks all five questions after
+      `messages` and returns the share answered correctly; `tokens(messages)` counts a message list.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import WindowedClaude, memory_model, crew_conversation, recall_test, KEY_FACTS, MODEL
+      client = WindowedClaude(memory_model(), context_window=1200, clock=aikit.VirtualClock())
+      conv = crew_conversation()
+      HISTORY_BUDGET = 600
+
+      def tokens(messages):
+          return client.messages.count_tokens(model=MODEL, messages=messages).input_tokens
+    steps:
+      - instructions:
+          - "**Symptom and measure:** store the token count of the whole conversation in `full_tokens` and its recall score in `full_recall`."
+        hint: "`tokens(conv)` and `recall_test(client, conv)`. Questions that don't fit the window count as misses."
+        sample_code: |
+          full_tokens = ____
+          full_recall = ____
+          print(full_tokens, full_recall)
+        solution: |
+          full_tokens = tokens(conv)
+          full_recall = recall_test(client, conv)
+          print(full_tokens, full_recall)
+        tests: |
+          check_equal("full_tokens")
+          check_equal("full_recall", 0.0, msg="`full_recall` is `recall_test(client, conv)`. Every question overflows the window, so it scores 0.")
+      - instructions:
+          - "**Cheap fix first:** write `window(messages, budget)` that keeps the newest messages whose `tokens(...)` fit `budget`, then drops leading assistant messages so the list starts with a user turn."
+          - "Store `window(conv, HISTORY_BUDGET)` in `windowed`, and its recall in `window_recall`."
+        hint: |
+          Walk `reversed(messages)`, putting each one in front of `kept` while `tokens([m] + kept) <= budget`; stop at the first
+          that doesn't fit (the order must stay contiguous). Then `while kept and kept[0]["role"] != "user": kept.pop(0)`.
+        sample_code: |
+          def window(messages, budget):
+              kept = []
+              for m in reversed(messages):
+                  if ____:
+                      break
+                  kept.insert(0, m)
+              while ____:
+                  kept.pop(0)
+              return kept
+
+          windowed = window(conv, HISTORY_BUDGET)
+          window_recall = ____
+          print(len(windowed), tokens(windowed), window_recall)
+        solution: |
+          def window(messages, budget):
+              kept = []
+              for m in reversed(messages):
+                  if tokens([m] + kept) > budget:
+                      break
+                  kept.insert(0, m)
+              while kept and kept[0]["role"] != "user":
+                  kept.pop(0)
+              return kept
+
+          windowed = window(conv, HISTORY_BUDGET)
+          window_recall = recall_test(client, windowed)
+          print(len(windowed), tokens(windowed), window_recall)
+        tests: |
+          check_object("windowed")
+          w = user["windowed"]
+          assert w and w[0]["role"] == "user", "`windowed` must start with a user message."
+          assert w[-1] == user["conv"][-1], "`windowed` must end with the newest message, so keep the newest messages."
+          assert user["tokens"](w) <= 600, "`windowed` is over the 600-token history budget."
+          check_equal("windowed", msg="Keep as many of the newest messages as fit, contiguous, then drop leading assistant messages.")
+          check_equal("window_recall", msg="`window_recall` is `recall_test(client, windowed)`.")
+      - instructions:
+          - "**Compaction:** write `compact(messages, summary_prompt, keep_last=20)`: summarise everything except the last `keep_last` messages (as a `role: content` transcript inside `<transcript>` tags after `summary_prompt`, `max_tokens=250`), then return `[summary as user message, {\"role\": \"assistant\", \"content\": \"Understood.\"}]` plus the last `keep_last` messages."
+          - "Try the obvious prompt first: store the recall of `compact(conv, \"Summarise this conversation.\")` in `vague_recall`."
+        hint: |
+          `transcript = "\n".join(f"{m['role']}: {m['content']}" for m in old)` and
+          `content = f"{summary_prompt}\n<transcript>{transcript}</transcript>"`.
+        sample_code: |
+          def compact(messages, summary_prompt, keep_last=20):
+              old, recent = messages[:-keep_last], messages[-keep_last:]
+              transcript = ____
+              r = client.messages.create(model=MODEL, max_tokens=250, messages=[
+                  {"role": "user", "content": ____}])
+              summary = r.content[0].text
+              return ____
+
+          vague = compact(conv, "Summarise this conversation.")
+          vague_recall = ____
+          print(vague[0]["content"])
+          print(tokens(vague), vague_recall)
+        solution: |
+          def compact(messages, summary_prompt, keep_last=20):
+              old, recent = messages[:-keep_last], messages[-keep_last:]
+              transcript = "\n".join(f"{m['role']}: {m['content']}" for m in old)
+              r = client.messages.create(model=MODEL, max_tokens=250, messages=[
+                  {"role": "user", "content": f"{summary_prompt}\n<transcript>{transcript}</transcript>"}])
+              summary = r.content[0].text
+              return [{"role": "user", "content": summary}, {"role": "assistant", "content": "Understood."}] + recent
+
+          vague = compact(conv, "Summarise this conversation.")
+          vague_recall = recall_test(client, vague)
+          print(vague[0]["content"])
+          print(tokens(vague), vague_recall)
+        tests: |
+          check_object("compact")
+          v = user["vague"]
+          assert len(v) == 22 and v[1] == {"role": "assistant", "content": "Understood."}, "`compact` should return the summary (user), the 'Understood.' reply (assistant), then the last 20 messages."
+          assert v[2:] == user["conv"][-20:], "Keep the last `keep_last` messages verbatim."
+          check_equal("vague_recall", 0.0, msg="`vague_recall` is `recall_test(client, vague)`.")
+      - instructions:
+          - "**Fix the summary prompt:** write `FACT_PROMPT`, a summary instruction that tells the model to keep facts, numbers, names, times and decisions exactly and drop small talk."
+          - "Store `compact(conv, FACT_PROMPT)` in `compacted`, its token count in `compact_tokens` and its recall in `compact_recall`. Targets: recall 1.0, at most 600 tokens."
+        hint: The summariser keeps details only when the instruction asks for them explicitly (facts, numbers, names, times, decisions).
+        sample_code: |
+          FACT_PROMPT = ____
+          compacted = compact(conv, FACT_PROMPT)
+          compact_tokens = ____
+          compact_recall = ____
+          print(compacted[0]["content"])
+          print(f"full {full_tokens} tokens, recall {full_recall:.0%} | window {tokens(windowed)}, {window_recall:.0%} | compacted {compact_tokens}, {compact_recall:.0%}")
+        solution: |
+          FACT_PROMPT = ("Summarise this conversation for ORBIT's memory. Keep every fact, number, name, time and decision "
+                         "exactly as stated, and drop small talk.")
+          compacted = compact(conv, FACT_PROMPT)
+          compact_tokens = tokens(compacted)
+          compact_recall = recall_test(client, compacted)
+          print(compacted[0]["content"])
+          print(f"full {full_tokens} tokens, recall {full_recall:.0%} | window {tokens(windowed)}, {window_recall:.0%} | compacted {compact_tokens}, {compact_recall:.0%}")
+        tests: |
+          check_object("compacted")
+          c = user["compacted"]
+          n = user["tokens"](c)
+          assert n <= 600, f"The compacted history is {n} tokens; the budget is 600."
+          from kits.llm_apis_prompting import recall_test
+          rec = recall_test(user["client"], c)
+          assert rec == 1.0, f"Recall after compaction is {rec:.0%}. Make `FACT_PROMPT` ask explicitly to keep facts, numbers, names, times and decisions."
+          assert user.get("compact_recall") == 1.0 and user.get("compact_tokens") == n, "Store `compact_tokens` and `compact_recall` for `compacted`."
+    success_msg: |
+      You measured the failure (overflow, 0% recall), saw that trimming fits the budget but forgets (40%), saw that a vague summary
+      forgets everything (0%), and fixed it with one summary call and a better instruction: 100% recall in about 400 tokens.
+      That's the Symptom, Measure, Diagnose, Fix, Verify loop on memory.

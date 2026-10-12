@@ -1,0 +1,177 @@
+title: Clear, specific instructions
+description: Why vague prompts get generic answers, what a specific prompt contains, and how to measure a prompt instead of eyeballing it.
+exercises:
+  - id: clear-slides
+    type: video
+    title: Say exactly what you want
+    slides: |
+      # Why vague prompts get generic answers
+
+      A model continues text in the most likely way **given its context**. Whatever the prompt leaves out, the model fills
+      with the most typical guess: typical length, typical audience, typical format.
+
+      > "Tell me about the scrubbers."
+
+      Should the answer be one line or a page? For a new crew member or an engineer? Should it cite the handbook?
+      The model doesn't know, so you get an average answer to an average question.
+
+      **The new-colleague test:** hand the prompt to a smart colleague who just arrived on Helios-7 and knows nothing
+      about your project. Could they do the task exactly right without asking you anything? If not, the model can't either.
+
+      ---
+
+      ## What a specific prompt contains
+
+      ```text
+      You are ORBIT, the assistant on research station Helios-7.          ← role and setting
+      Crew members ask you questions during their shifts, often mid-task,
+      so they need short answers they can act on.                         ← audience and why
+      Answer only from the handbook documents provided.                   ← task and limits
+      If the documents don't contain the answer, say you don't know.      ← what to do in the edge case
+      Keep answers to 1-2 sentences.                                      ← length
+      Wrap the answer in <answer></answer> tags and cite the document id
+      in square brackets, like [co2-scrubbers].                           ← exact output format
+      ```
+
+      - **Say what to do**, not only what to avoid: "Answer in plain sentences" works better than "don't use markdown".
+      - **Give the reason**: "...because the text is read aloud on the comms loop" lets the model handle cases you didn't list.
+      - **Show the exact format** with a literal example. Code will parse it.
+
+      ---
+
+      ## Measure, don't eyeball
+
+      Reading three replies and deciding "looks better" is how prompts get worse without anyone noticing.
+
+      1. Collect 10-50 real inputs with the outcome you expect.
+      2. Write a **check you can compute**: format matches a regex, the answer contains the right number, the label is right.
+      3. Run the current prompt and record the score (the **baseline**).
+      4. Change **one thing**, re-run the same inputs, and keep the change only if the score improves without new failures.
+
+      This loop is the same one you'll use for evaluation later in the track. Here it fits in a few lines of Python.
+
+      ---
+
+      ## How much instruction is enough?
+
+      | prompt style | quality | cost per call | failure mode |
+      | --- | --- | --- | --- |
+      | one-liner | generic, inconsistent format | lowest | parse failures, wrong length or audience |
+      | specific (role, task, limits, format) | consistent | a few hundred more input tokens | usually the sweet spot |
+      | a wall of rules | can get worse | every rule is paid on every call | rules contradict each other, and the important ones get lost |
+
+      Add instructions to fix **measured** failures, and stop once the metric passes. Every sentence in a system prompt
+      is paid for on every call, for the life of the product. Chapter 4 shows how caching makes a long, stable prefix cheaper.
+
+  - id: vague-or-specific
+    type: classify
+    title: Vague or specific?
+    prompt: Sort each prompt. A prompt is specific if a new colleague could do the task exactly right without asking anything.
+    hint: Look for audience, length, limits and an exact output format. Missing any of those leaves the model guessing.
+    zones: [Vague, Specific]
+    items:
+      - { text: "Summarise this incident report.", zone: Vague }
+      - { text: "Make the answer better.", zone: Vague }
+      - { text: "Tell me about the scrubbers.", zone: Vague }
+      - { text: "Write something for the crew about the power systems.", zone: Vague }
+      - { text: "Summarise this incident report in 3 bullet points for the commander: cause, impact, follow-up action.", zone: Specific }
+      - { text: "Reply with only one word, one of maintenance, it, supplies, scheduling or medical.", zone: Specific }
+      - { text: "In 2 sentences, tell a new crew member when CO2 becomes dangerous, citing the handbook document id in brackets.", zone: Specific }
+      - { text: "List every module with its letter as 'A: habitat' lines, one per line, in alphabetical order.", zone: Specific }
+
+  - id: format-compliance
+    type: coding
+    title: Make ORBIT's answers parseable
+    context: |
+      The crew app shows ORBIT's answer and a link to the handbook page. It only works when a reply is wrapped in
+      `<answer></answer>` tags and cites a document id in square brackets, e.g. `<answer>... [co2-scrubbers]</answer>`.
+      `run(system_prompt)` asks ORBIT five test questions (with handbook documents) and returns the replies. `compliant(reply)` checks the format.
+    instructions:
+      - "**Baseline:** run `BASELINE_PROMPT` and store the share of compliant replies in `baseline_rate`."
+      - "Write `better_prompt`: a system prompt that states the exact output format, including the literal `<answer></answer>` tags and an instruction to cite the document id in square brackets."
+      - "Run it. Store the share of compliant replies in `new_rate`, and the share of replies that contain the expected fact (`expected` in `EXPECTED`) in `correct_rate`."
+    hint: |
+      For example: `"You are ORBIT ... Wrap your answer in <answer></answer> tags. Cite the id of the document you used in square brackets, like [co2-scrubbers]."`
+      A share is `sum(compliant(r) for r in replies) / len(replies)`.
+    pre_code: |
+      import re
+      import aikit
+      from kits.llm_apis_prompting import MODEL
+      client = aikit.FakeClaude(aikit.grounded(), clock=aikit.VirtualClock())
+      hb = {d["id"]: d for d in aikit.helios.handbook()}
+      DOC_IDS = ["airlock-procedure", "eva-prep-checklist", "hydroponics-schedule", "water-recycling", "co2-scrubbers"]
+      DOCS = "\n".join(f'<document id="{i}">{hb[i]["text"]}</document>' for i in DOC_IDS)
+      QUESTIONS = [
+          "How long is the leak-check hold when depressurising AL-1?",
+          "What is the maximum length of a spacewalk?",
+          "When do the hydroponics watering cycles run?",
+          "How big is the potable water tank?",
+          "At what CO2 level does ORBIT raise an alert?",
+      ]
+      EXPECTED = ["8 minutes", "6.5 hours", "06:00", "2,400", "0.4%"]
+      BASELINE_PROMPT = "You are ORBIT. Answer crew questions."
+
+      def run(system_prompt):
+          out = []
+          for q in QUESTIONS:
+              r = client.messages.create(model=MODEL, max_tokens=300, system=system_prompt,
+                                         messages=[{"role": "user", "content": DOCS + "\n\n" + q}])
+              out.append(r.content[0].text)
+          return out
+
+      def compliant(reply):
+          return bool(re.fullmatch(r"<answer>.+\[[a-z0-9-]+\].*</answer>", reply.strip(), re.S))
+    sample_code: |
+      baseline = run(BASELINE_PROMPT)
+      baseline_rate = ____
+
+      better_prompt = (
+          "You are ORBIT, the assistant on research station Helios-7. "
+          ____
+      )
+      replies = run(better_prompt)
+      new_rate = ____
+      correct_rate = ____
+      print(baseline_rate, new_rate, correct_rate)
+      print(replies[0])
+    solution: |
+      baseline = run(BASELINE_PROMPT)
+      baseline_rate = sum(compliant(r) for r in baseline) / len(baseline)
+
+      better_prompt = (
+          "You are ORBIT, the assistant on research station Helios-7. "
+          "Answer only from the handbook documents provided, in 1-2 sentences. "
+          "Wrap your answer in <answer></answer> tags and cite the id of the document you used "
+          "in square brackets, like [co2-scrubbers]."
+      )
+      replies = run(better_prompt)
+      new_rate = sum(compliant(r) for r in replies) / len(replies)
+      correct_rate = sum(e in r for r, e in zip(replies, EXPECTED)) / len(replies)
+      print(baseline_rate, new_rate, correct_rate)
+      print(replies[0])
+    tests: |
+      check_equal("baseline_rate", 0, msg="`baseline_rate` should be the share of `baseline` replies where `compliant(r)` is True.")
+      check_object("better_prompt")
+      p = user["better_prompt"]
+      import re
+      if re.search(r"\bjson\b", p, re.I):
+          raise AssertionError("Your prompt mentions JSON, so ORBIT answers in JSON instead of tags. Ask for the <answer></answer> format only.")
+      check_object("new_rate")
+      assert user["new_rate"] == 1, f"Only {user['new_rate']:.0%} of replies are compliant. State the format literally in `better_prompt`: wrap the answer in <answer></answer> tags and cite the document id in square brackets."
+      assert user.get("correct_rate") == 1, "Some replies lost the expected fact, or `correct_rate` isn't computed as the share of replies containing their `EXPECTED` string."
+    success_msg: |
+      Compliance went from 0% to 100% with one paragraph of instructions, and every answer still holds the right fact.
+      You checked both, because a format fix that breaks correctness is no fix.
+
+  - id: prompt-iteration-loop
+    type: order
+    title: The prompt iteration loop
+    prompt: Put the steps for improving a prompt in order.
+    hint: You can't tell whether a change helped without a score from before the change.
+    items:
+      - Collect real inputs with the outcome you expect for each
+      - Write a check you can compute for every reply
+      - Run the current prompt and record the baseline score
+      - Read the failures and name the most common cause
+      - Change one thing in the prompt to target that cause
+      - Re-run the same inputs and keep the change only if the score improved

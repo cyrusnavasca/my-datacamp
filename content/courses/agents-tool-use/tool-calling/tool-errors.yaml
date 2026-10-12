@@ -1,0 +1,192 @@
+title: When tools fail
+description: Return errors to the model as results it can act on, validate inputs at the boundary, and decide which errors the harness handles.
+exercises:
+  - id: tool-errors-slides
+    type: video
+    title: Errors are information
+    slides: |
+      # Tools fail. Plan for it.
+
+      | kind | example | whose fault |
+      | --- | --- | --- |
+      | invalid input | `metric="carbon dioxide"`, but the enum says `co2` | the model's |
+      | tool failure | sensor E/co2 is offline | the world's |
+      | transient | the handbook search returns 503 once | the network's |
+      | forbidden | `open_airlock` without approval | policy (chapter 5) |
+      | bug | `KeyError` in your own dispatch code | yours |
+
+      If your harness lets a `ToolError` escape, the whole run dies and the crew gets a stack trace. If it swallows the
+      error, the model answers as if the tool worked. Both are wrong for the first three rows.
+
+      ---
+
+      ## Return the error as a result
+
+      ```python
+      try:
+          output = station.run_tool(block.name, block.input)
+          result = {"type": "tool_result", "tool_use_id": block.id, "content": output}
+      except ToolError as e:
+          result = {"type": "tool_result", "tool_use_id": block.id,
+                    "content": f"Error: {e}", "is_error": True}
+      ```
+
+      `is_error: True` tells the model the call failed. It reads the message and then does what a person would: fixes the
+      input and retries, tries another route, or explains the problem to the user. The pairing rule still holds: a failed
+      call still gets its `tool_result`.
+
+      ---
+
+      ## Write errors for the model to act on
+
+      | error text | what the model can do |
+      | --- | --- |
+      | `Error` | guess, and often retry the identical call (chapter 2 shows the loop this causes) |
+      | `no 'carbon dioxide' sensor in module 'E'` | guess another name |
+      | `'metric' must be one of ['temperature', 'humidity', 'co2', 'o2', 'pressure'], got 'carbon dioxide'` | fix it in one try |
+      | `sensor E/co2 is offline; retrying won't help` | stop and tell the user |
+
+      Validate inputs against the schema **before** running the tool. Your validator knows the valid values; the tool's
+      own exception often doesn't say them. Good error = what went wrong + what is valid + whether retrying helps.
+
+      ---
+
+      ## Trade-off: who handles which error?
+
+      | strategy | best for | latency | cost | failure mode |
+      | --- | --- | --- | --- | --- |
+      | retry in the harness, with backoff | transient errors (503, timeouts, 429) | adds wait time | no extra model calls | hides a real outage if retries are unbounded |
+      | return `is_error` to the model | invalid input, offline, not found | one more round trip | one more model call | loops if the message is opaque |
+      | fall back to another source | a backup sensor or a cached value | low | low | stale data presented as fresh; label it |
+      | stop the run | bugs in your code, auth failures, policy violations | none | saves the rest of the budget | the user gets no answer; report clearly |
+
+      Rule of thumb: the harness absorbs **noise**, the model handles **meaning**, and **your bugs** stop the run.
+
+      ---
+
+      ## Playbook: "the agent breaks when a tool fails"
+
+      **Check first:** the transcript around the failure. What did the model receive in the `tool_result`?
+
+      1. **Nothing, the run crashed**: catch the tool's exceptions and return `is_error` results.
+      2. **An opaque message** ("Error", "failed"): put the reason and the valid options in the text.
+      3. **A success-looking result** (an empty list, `None`): failures must say they failed, or the model reports "no
+         readings" as a fact.
+      4. **A 503 the model kept retrying**: move transient retries into the harness, with a limit.
+
+      Verify by replaying the failing request: the run should end with an answer that names the problem.
+
+  - id: errors-as-results
+    type: coding
+    title: Let ORBIT recover
+    context: |
+      ORBIT's model asks for metrics in the crew's words ("carbon dioxide") on its first try. One station (`station`) has
+      every sensor working; the other (`broken`) has the hydroponics humidity sensor offline. `run_agent(client, task,
+      TOOLS, execute)` runs the agent loop and calls your `execute(name, input)` for each tool call. If `execute` returns a
+      tuple `(text, True)`, the loop sends it as an `is_error` result.
+    instructions:
+      - "In `make_execute`, validate `input` with `validate_input(SCHEMAS[name], input)`. If there are problems, return `(\"Error: \" + \"; \".join(problems), True)`."
+      - "Otherwise run `st.run_tool(name, input)`. If it raises `ToolError`, return `(f\"Error: {e}\", True)`; if it succeeds, return its output."
+      - Run both tasks and store the final answers in `co2_answer` and `humidity_answer`.
+    hint: |
+      ```python
+      problems = validate_input(SCHEMAS[name], input)
+      if problems:
+          return "Error: " + "; ".join(problems), True
+      try:
+          return st.run_tool(name, input)
+      except ToolError as e:
+          return f"Error: {e}", True
+      ```
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, ToolError, validate_input, run_agent, sensor_assistant
+      station = HeliosStation()
+      broken = HeliosStation(offline=[("C", "humidity")])
+      TOOLS = station.tools
+      SCHEMAS = {t["name"]: t for t in TOOLS}
+      client = aikit.FakeClaude(sensor_assistant(), clock=aikit.VirtualClock())
+    sample_code: |
+      def make_execute(st):
+          def execute(name, input):
+              problems = ____
+              if problems:
+                  return ____
+              try:
+                  return st.run_tool(name, input)
+              except ToolError as e:
+                  return ____
+          return execute
+
+      run1 = run_agent(client, "What's the CO2 level in engineering?", TOOLS, make_execute(station))
+      co2_answer = run1["answer"]
+      run2 = run_agent(client, "How humid is hydroponics?", TOOLS, make_execute(broken))
+      humidity_answer = run2["answer"]
+      print(co2_answer, "| steps:", run1["steps"])
+      print(humidity_answer, "| steps:", run2["steps"])
+    solution: |
+      def make_execute(st):
+          def execute(name, input):
+              problems = validate_input(SCHEMAS[name], input)
+              if problems:
+                  return "Error: " + "; ".join(problems), True
+              try:
+                  return st.run_tool(name, input)
+              except ToolError as e:
+                  return f"Error: {e}", True
+          return execute
+
+      run1 = run_agent(client, "What's the CO2 level in engineering?", TOOLS, make_execute(station))
+      co2_answer = run1["answer"]
+      run2 = run_agent(client, "How humid is hydroponics?", TOOLS, make_execute(broken))
+      humidity_answer = run2["answer"]
+      print(co2_answer, "| steps:", run1["steps"])
+      print(humidity_answer, "| steps:", run2["steps"])
+    tests: |
+      check_object("co2_answer")
+      check_object("humidity_answer")
+      first = user["run1"]["messages"][2]["content"][0]
+      assert first.get("is_error"), "The first CO2 call used an invalid metric. Its tool_result should be marked `is_error` (return a tuple `(text, True)`)."
+      assert "co2" in first["content"], "The validation error should list the valid metrics (validate_input's message does), so the model can correct itself."
+      assert "0.282" in user["co2_answer"], f"ORBIT should correct itself and report the CO2 reading (0.282). It said: {user['co2_answer']!r}"
+      assert user["run1"]["steps"] == 3, f"Recovering should take 3 model calls (bad call, corrected call, answer); it took {user['run1']['steps']}."
+      assert "offline" in user["humidity_answer"].lower(), f"With the sensor offline, ORBIT should say so. It said: {user['humidity_answer']!r}. Return the ToolError message as an error result."
+    success_msg: |
+      The model fixed its own mistake because your error listed the valid values, and it stopped cleanly on the offline
+      sensor because the error said what was wrong. Try removing the validation step: the station's own error doesn't
+      list the valid metrics, and ORBIT gives up.
+
+  - id: error-routing
+    type: classify
+    title: Who should handle it?
+    prompt: Sort each failure by where it should be handled.
+    hint: Transient noise goes to the harness, problems the model can fix or explain go back to the model, and your own bugs or broken credentials stop the run.
+    zones: [Retry in the harness, Return to the model, Stop the run]
+    items:
+      - { text: "Handbook search returns 503 once, then works", zone: Retry in the harness }
+      - { text: "Messaging service answers 429 with retry-after: 2", zone: Retry in the harness }
+      - { text: "A sensor read times out once during a network blip", zone: Retry in the harness }
+      - { text: "metric='carbon dioxide' is not in the enum", zone: Return to the model }
+      - { text: "Sensor E/co2 is offline for maintenance", zone: Return to the model }
+      - { text: "book_module asked for 6 hours; the maximum is 4", zone: Return to the model }
+      - { text: "The model called a tool name that doesn't exist", zone: Return to the model }
+      - { text: "KeyError inside your own dispatch function", zone: Stop the run }
+      - { text: "The station API rejects your credentials (401)", zone: Stop the run }
+
+  - id: retry-or-report
+    type: mc
+    title: The flaky search backend
+    question: |
+      The handbook search backend fails with a 503 on about 3% of calls and works on the next try. ORBIT answers about
+      2,000 questions a day and each question searches once or twice. What should the harness do with a 503?
+    options:
+      - text: "Retry it in the harness up to 3 times with exponential backoff; if it still fails, return an `is_error` result that says the search is unavailable."
+        correct: true
+        feedback: "Right. Transient noise is the harness's job: retries cost a little latency and no model calls. The cap and the final error result stop a real outage from turning into a silent hang."
+      - text: Return every 503 to the model as an `is_error` result and let it decide.
+        feedback: "It works, but each 503 costs a full model round trip, and the model can't do anything smarter than retrying. Save model calls for errors that need judgement."
+      - text: Retry in the harness until it succeeds.
+        feedback: "During a real outage this hangs forever and the crew waits. Every retry loop needs a cap and a final error."
+      - text: Return an empty list, as if nothing matched.
+        feedback: "Now a failure looks like a fact. The model will say the handbook has nothing on the topic, which is wrong and hard to debug."
+    hint: Is there anything the model can do about a 503 that the harness can't?

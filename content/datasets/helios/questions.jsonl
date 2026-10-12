@@ -1,0 +1,45 @@
+{"id": "q01", "question": "How long is the leak-check hold when depressurising AL-1?", "answer": "8 minutes at 0.7 bar.", "doc_ids": ["airlock-procedure"], "type": "factual"}
+{"id": "q02", "question": "How many crew members must be present for an airlock cycle?", "answer": "Two.", "doc_ids": ["airlock-procedure"], "type": "factual"}
+{"id": "q03", "question": "Can ORBIT open the airlock?", "answer": "No. ORBIT may never operate airlock controls.", "doc_ids": ["airlock-procedure", "orbit-assistant-policy"], "type": "factual"}
+{"id": "q04", "question": "How long do spacewalkers prebreathe oxygen?", "answer": "2 hours of 100% oxygen.", "doc_ids": ["eva-prep-checklist"], "type": "factual"}
+{"id": "q05", "question": "What is the maximum length of a spacewalk?", "answer": "6.5 hours.", "doc_ids": ["eva-prep-checklist"], "type": "factual"}
+{"id": "q06", "question": "What humidity range is normal in hydroponics?", "answer": "Between 60% and 75%.", "doc_ids": ["hydroponics-troubleshooting"], "type": "factual"}
+{"id": "q07", "question": "The plants are wilting but the roots are wet. What should I check?", "answer": "The root zone pump P-2.", "doc_ids": ["hydroponics-troubleshooting"], "type": "factual"}
+{"id": "q08", "question": "How often should the pH probe be recalibrated?", "answer": "Every week.", "doc_ids": ["hydroponics-troubleshooting"], "type": "factual"}
+{"id": "q09", "question": "When do the hydroponics watering cycles run?", "answer": "At 06:00 and 18:00.", "doc_ids": ["hydroponics-schedule"], "type": "factual"}
+{"id": "q10", "question": "How often is lettuce harvested?", "answer": "Every 28 days.", "doc_ids": ["hydroponics-schedule"], "type": "factual"}
+{"id": "q11", "question": "What share of water does the recovery system reclaim?", "answer": "About 93%.", "doc_ids": ["water-recycling"], "type": "factual"}
+{"id": "q12", "question": "How big is the potable water tank?", "answer": "2,400 litres.", "doc_ids": ["water-recycling"], "type": "factual"}
+{"id": "q13", "question": "What is the normal cabin oxygen level?", "answer": "Between 20.5% and 21.5%.", "doc_ids": ["oxygen-generation"], "type": "factual"}
+{"id": "q14", "question": "How many oxygen candles are stored and where?", "answer": "12 candles, in Module D.", "doc_ids": ["oxygen-generation"], "type": "factual"}
+{"id": "q15", "question": "At what CO2 level does ORBIT raise an alert?", "answer": "0.4%.", "doc_ids": ["co2-scrubbers"], "type": "factual"}
+{"id": "q16", "question": "How often are scrubber beds swapped?", "answer": "Every 90 days.", "doc_ids": ["co2-scrubbers"], "type": "factual"}
+{"id": "q17", "question": "How long is the eclipse on each orbit?", "answer": "36 minutes.", "doc_ids": ["power-systems"], "type": "factual"}
+{"id": "q18", "question": "What happens when battery charge drops below 30%?", "answer": "Non-essential loads are shed automatically.", "doc_ids": ["power-systems"], "type": "factual"}
+{"id": "q19", "question": "What should I do if I smell ammonia?", "answer": "Put on a mask, leave the module and close the hatch.", "doc_ids": ["thermal-control"], "type": "factual"}
+{"id": "q20", "question": "Who can open the controlled medicines cabinet?", "answer": "Dr. Priya Raman and the commander.", "doc_ids": ["med-bay-access"], "type": "factual"}
+{"id": "q21", "question": "Where is the defibrillator?", "answer": "Next to the Module A hatch.", "doc_ids": ["medical-emergencies"], "type": "factual"}
+{"id": "q22", "question": "Who is the flight engineer?", "answer": "Tomas Lindqvist.", "doc_ids": ["crew-roster"], "type": "factual"}
+{"id": "q23", "question": "What time does the crew wake up?", "answer": "06:00 station time.", "doc_ids": ["daily-schedule"], "type": "factual"}
+{"id": "q24", "question": "What time is dinner?", "answer": "19:00.", "doc_ids": ["galley-and-meals"], "type": "factual"}
+{"id": "q25", "question": "How long must each crew member exercise per day?", "answer": "2.5 hours.", "doc_ids": ["exercise-requirements"], "type": "factual"}
+{"id": "q26", "question": "When are private family calls?", "answer": "Sundays, 15:00 to 16:00 station time.", "doc_ids": ["comms-windows"], "type": "factual"}
+{"id": "q27", "question": "How far in advance must a lab bench be booked?", "answer": "At least 24 hours.", "doc_ids": ["lab-booking-policy"], "type": "factual"}
+{"id": "q28", "question": "What is the longest a lab booking can last?", "answer": "4 hours.", "doc_ids": ["lab-booking-policy"], "type": "factual"}
+{"id": "q29", "question": "At what temperature are biological samples stored?", "answer": "-80 °C in the deep freezer DF-1.", "doc_ids": ["sample-handling"], "type": "factual"}
+{"id": "q30", "question": "Where does the crew gather if a fire is not out within two minutes?", "answer": "Module D.", "doc_ids": ["fire-response"], "type": "factual"}
+{"id": "q31", "question": "Where does the crew gather during a depressurisation alarm?", "answer": "Module F, next to the lifeboat capsule L-1.", "doc_ids": ["depressurisation-response"], "type": "factual"}
+{"id": "q32", "question": "Where do we shelter during a radiation storm?", "answer": "Module D, behind the water wall.", "doc_ids": ["radiation-storm-protocol"], "type": "factual"}
+{"id": "q33", "question": "How often does the cargo vehicle arrive?", "answer": "Every 60 days.", "doc_ids": ["cargo-resupply"], "type": "factual"}
+{"id": "q34", "question": "How often are network passwords rotated?", "answer": "Every 30 days.", "doc_ids": ["it-network"], "type": "factual"}
+{"id": "q35", "question": "How long are ORBIT logs kept?", "answer": "90 days.", "doc_ids": ["orbit-assistant-policy"], "type": "factual"}
+{"id": "q36", "question": "What caused the 2025 hydroponics flood?", "answer": "Mineral build-up made the P-2 outlet valve stick open.", "doc_ids": ["incident-2025-hydro-flood"], "type": "factual"}
+{"id": "q37", "question": "What does ECLSS stand for?", "answer": "Environmental Control and Life Support System.", "doc_ids": ["glossary"], "type": "factual"}
+{"id": "q38", "question": "Who can book the glovebox, and in which module is it?", "answer": "Noor Haddad and Priya Raman; it is in Module B.", "doc_ids": ["lab-booking-policy", "modules-map"], "type": "multi-hop"}
+{"id": "q39", "question": "Who owns the hydroponics schedule and what is their role?", "answer": "Kenji Watanabe, the botanist.", "doc_ids": ["hydroponics-schedule", "crew-roster"], "type": "multi-hop"}
+{"id": "q40", "question": "Which module holds the oxygen generator, and what does that module also contain?", "answer": "Module E (Engineering), which also holds the CO2 scrubbers and the power controllers.", "doc_ids": ["oxygen-generation", "modules-map"], "type": "multi-hop"}
+{"id": "q41", "question": "Who should I report a suspicious message to, and what is their role?", "answer": "Lucía Ferreira, the systems specialist.", "doc_ids": ["it-network", "crew-roster"], "type": "multi-hop"}
+{"id": "q42", "question": "What is the Wi-Fi password?", "answer": null, "doc_ids": [], "type": "unanswerable"}
+{"id": "q43", "question": "Who is the station dentist?", "answer": null, "doc_ids": [], "type": "unanswerable"}
+{"id": "q44", "question": "How much does the cargo vehicle Tern cost to launch?", "answer": null, "doc_ids": [], "type": "unanswerable"}
+{"id": "q45", "question": "What is the commander's favourite food?", "answer": null, "doc_ids": [], "type": "unanswerable"}

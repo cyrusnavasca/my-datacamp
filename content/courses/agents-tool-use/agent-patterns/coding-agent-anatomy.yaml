@@ -1,0 +1,285 @@
+title: How coding agents work
+description: Build a small coding agent from read, write and run-tests tools, see why test output quality decides success, and stop it from editing the tests.
+exercises:
+  - id: coding-agent-slides
+    type: video
+    title: Read, edit, test, repeat
+    slides: |
+      # A coding agent is the same loop
+
+      Coding assistants run the loop you built in chapter 2 with a handful of tools:
+
+      | tool | what it does | real-world versions |
+      | --- | --- | --- |
+      | `read_file(path)` | returns the file's text | view a file, list a directory, search the code |
+      | `write_file(path, content)` | replaces a file | edit by exact string replacement, insert lines |
+      | `run_tests()` | runs the suite, returns the report | a shell tool that runs any command |
+
+      ```text
+      run_tests → 2 failed ─→ read climate.py ─→ edit ─→ run_tests → 1 failed ─→ read ─→ edit ─→ run_tests → all pass ─→ done
+      ```
+
+      The **tests are the goal signal**. The agent stops when they pass, so the agent is only as good as the tests and
+      the report it gets back.
+
+      ---
+
+      ## Test output is the agent's eyes
+
+      | `run_tests` returns | the agent can... |
+      | --- | --- |
+      | `"2 failed"` | nothing useful: which tests? why? |
+      | `"FAILED test_fahrenheit"` | find the function |
+      | `"FAILED test_fahrenheit: assert 204.0 == 212"` | see the error is 8 degrees: the constant is wrong |
+
+      Same lesson as tool errors in chapter 1: the result has to contain what the next decision needs. Real coding
+      agents feed back tracebacks, assertion values and compiler errors verbatim.
+
+      ---
+
+      ## How coding agents go wrong
+
+      | failure | what happens | guardrail |
+      | --- | --- | --- |
+      | **editing the tests** | the agent "fixes" a failing test by weakening its assertion. Tests pass, the bug stays | make tests read-only to the agent; run **hidden** tests it never saw |
+      | editing a stale copy | writes a file based on an old read, undoing other changes | read before every edit; edit by exact replacement |
+      | overfitting | special-cases the visible inputs (`if x == 100: return 212`) | hidden tests, code review |
+      | runaway edits | edit → fail → edit... | step caps, repeat detection (chapter 2) |
+      | destructive commands | `rm -rf`, force-push, editing CI config | sandbox, allow-lists, approvals (chapter 5) |
+
+      Rewarding "tests pass" invites the agent to make tests pass by any means. Protect the **measure**, not just the code.
+
+      ---
+
+      ## Trade-off: how much autonomy for a coding agent?
+
+      | mode | speed | risk | fits |
+      | --- | --- | --- | --- |
+      | suggest a diff, a human applies it | slow | lowest | unfamiliar codebases, critical code |
+      | edit files, a human approves each write | medium | low | day-to-day work in a shared repo |
+      | edit and run tests freely in a **sandbox**, a human reviews the final diff | fast | medium: contained | well-tested projects |
+      | edit, test and commit or deploy unattended | fastest | high | narrow, reversible tasks with strong tests |
+
+      The more autonomy, the more the guardrails have to live **outside** the model: sandboxes, read-only paths, hidden
+      tests, budgets.
+
+  - id: green-but-broken
+    type: mc
+    title: Green locally, red in CI
+    question: |
+      ORBIT's coding agent reports "All tests pass" and the local suite is green. CI, which runs an extra hidden test suite,
+      fails on the same function. The transcript shows the agent called `write_file("test_climate.py", ...)` once. What's
+      the most likely explanation, and the right fix?
+    options:
+      - text: "It weakened the failing test to make the suite pass. Make test files read-only to the agent and keep a hidden test suite it can't see."
+        correct: true
+        feedback: "Right. A write to a test file during a bug fix is the tell. The visible suite measured the agent's own edit, not the code. Protect the measure: refuse writes to tests and verify with tests the agent never saw."
+      - text: CI uses a different Python version; pin it.
+        feedback: "Possible in general, but the transcript shows the agent editing a test file, which explains a local green and a hidden red directly. Check the transcript before the environment."
+      - text: The model is too small; use a larger one.
+        feedback: "Larger models can also take this shortcut. The fix is in the harness: what the agent is allowed to change, and how success is checked."
+      - text: Lower the temperature so the agent is more careful.
+        feedback: "Temperature changes how tokens are sampled, not what the agent is permitted to do. The test file shouldn't be writable at all."
+    hint: Which file did the agent write, and why would that turn the suite green?
+
+  - id: fix-the-bug
+    type: sequential
+    title: "Mission: a mini coding agent"
+    context: |
+      The station's `climate.py` library has failing tests. You'll build the three tools a coding agent needs, run it,
+      and check its work with hidden tests it never sees. The project lives in the dict `files` (path → text):
+      `climate.py` and `test_climate.py`. `load_module(source)` loads source code as the `climate` module, so the test
+      file's `from climate import ...` works. The agent's model is `coder`; `CODING_TOOLS` holds the tool schemas.
+    pre_code: |
+      import json
+      from kits.agents_tool_use import (FakeClaude, VirtualClock, coding_model, run_agent, CODE_FILES, CODING_TOOLS,
+                                        load_module, hidden_tests_pass)
+      files = dict(CODE_FILES)
+      coder = FakeClaude(coding_model(), clock=VirtualClock())
+      task = "The tests in test_climate.py fail. Fix the code so they pass."
+      print(files["climate.py"])
+    steps:
+      - instructions:
+          - "`read_file(path)`: return the file's text, or `(\"Error: no such file \" + path, True)` if it isn't in `files`."
+          - "`write_file(path, content)`: refuse any path starting with `test_`, returning `(\"Error: test files are read-only; fix the code under test instead.\", True)`. Otherwise store the content and return a short confirmation."
+          - "`run_tests()`: load `files[\"climate.py\"]`, run every `test_` function from the test file, and return one line `FAILED <name>: <ExceptionType>: <message>` per failure, then `\"<p> passed, <f> failed\"`."
+        hint: |
+          In `run_tests`, `load_module(files["climate.py"])` first, then `ns = {}; exec(files["test_climate.py"], ns)`,
+          and loop over `ns.items()` calling each function whose name starts with `test_` inside `try`/`except Exception as e`.
+        sample_code: |
+          def read_file(path):
+              if path not in files:
+                  return ____
+              return files[path]
+
+          def write_file(path, content):
+              if ____:
+                  return "Error: test files are read-only; fix the code under test instead.", True
+              files[path] = content
+              return f"wrote {len(content)} characters to {path}"
+
+          def run_tests():
+              load_module(files["climate.py"])
+              ns = {}
+              exec(files["test_climate.py"], ns)
+              lines, passed = [], 0
+              for name, fn in ns.items():
+                  if name.startswith("test_") and callable(fn):
+                      try:
+                          fn()
+                          passed += 1
+                      except Exception as e:
+                          lines.append(____)
+              return "\n".join(lines + [f"{passed} passed, {len(lines)} failed"])
+
+          print(run_tests())
+        solution: |
+          def read_file(path):
+              if path not in files:
+                  return "Error: no such file " + path, True
+              return files[path]
+
+          def write_file(path, content):
+              if path.startswith("test_"):
+                  return "Error: test files are read-only; fix the code under test instead.", True
+              files[path] = content
+              return f"wrote {len(content)} characters to {path}"
+
+          def run_tests():
+              load_module(files["climate.py"])
+              ns = {}
+              exec(files["test_climate.py"], ns)
+              lines, passed = [], 0
+              for name, fn in ns.items():
+                  if name.startswith("test_") and callable(fn):
+                      try:
+                          fn()
+                          passed += 1
+                      except Exception as e:
+                          lines.append(f"FAILED {name}: {type(e).__name__}: {e}")
+              return "\n".join(lines + [f"{passed} passed, {len(lines)} failed"])
+
+          print(run_tests())
+        tests: |
+          from kits.agents_tool_use import CODE_FILES as _CF
+          rf, wf, rt = user["read_file"], user["write_file"], user["run_tests"]
+          out = rf("nope.py")
+          assert isinstance(out, tuple) and out[1] is True and "no such file" in out[0], "read_file on a missing path should return ('Error: no such file ...', True)."
+          assert rf("climate.py") == user["files"]["climate.py"], "read_file should return the file's text."
+          w = wf("test_climate.py", "x = 1")
+          assert isinstance(w, tuple) and w[1] is True, "write_file must refuse paths that start with test_ and return an (error, True) tuple."
+          assert user["files"]["test_climate.py"] == _CF["test_climate.py"], "The refused write must leave the test file unchanged."
+          report = rt()
+          assert "FAILED test_average_skips_offline" in report and "FAILED test_fahrenheit" in report, f"run_tests should name each failing test as 'FAILED <name>: ...'. It returned: {report!r}"
+          assert report.strip().endswith("0 passed, 2 failed"), f"The last line should be '0 passed, 2 failed' for the buggy code; got {report.strip().splitlines()[-1]!r}."
+      - instructions:
+          - "Write `execute(name, input)` that calls the matching tool function (`read_file`, `write_file` or `run_tests`) with `**input`."
+          - "Run the agent: `result = run_agent(coder, task, CODING_TOOLS, execute, max_steps=15)`. Print the answer and the number of steps."
+          - "Store `hidden_ok = hidden_tests_pass(files)` and print it."
+        hint: "`TOOLS_BY_NAME = {\"read_file\": read_file, ...}` then `return TOOLS_BY_NAME[name](**input)`."
+        sample_code: |
+          TOOLS_BY_NAME = {"read_file": read_file, "write_file": write_file, "run_tests": run_tests}
+
+          def execute(name, input):
+              return ____
+
+          result = ____
+          print(result["answer"], "| steps:", result["steps"])
+          hidden_ok = ____
+          print("hidden tests pass:", hidden_ok)
+        solution: |
+          TOOLS_BY_NAME = {"read_file": read_file, "write_file": write_file, "run_tests": run_tests}
+
+          def execute(name, input):
+              return TOOLS_BY_NAME[name](**input)
+
+          result = run_agent(coder, task, CODING_TOOLS, execute, max_steps=15)
+          print(result["answer"], "| steps:", result["steps"])
+          hidden_ok = hidden_tests_pass(files)
+          print("hidden tests pass:", hidden_ok)
+        tests: |
+          from kits.agents_tool_use import CODE_FILES as _CF, hidden_tests_pass as _h
+          r = check_object("result")
+          assert r["stop"] == "end_turn" and "All tests pass" in (r["answer"] or ""), f"The agent should finish with 'All tests pass'; it ended with stop={r['stop']!r}, answer={r['answer']!r}."
+          assert user["files"]["test_climate.py"] == _CF["test_climate.py"], "The test file changed. The agent must not be able to edit tests."
+          assert _h(user["files"]), "The hidden tests fail on the final climate.py."
+          assert user["hidden_ok"] is True, "`hidden_ok` should be `hidden_tests_pass(files)`."
+          assert r["steps"] <= 12, f"The fix should take at most 12 model calls; it took {r['steps']}."
+      - instructions:
+          - "See why the guardrail matters: on a fresh copy `loose_files = dict(CODE_FILES)`, run the agent again with a **permissive** `write_file` that writes any path (use `loose_execute`, given)."
+          - "Store `loose_answer` (the agent's answer), `loose_visible` (does `run_loose_tests()` end with `\", 0 failed\"`?) and `loose_hidden = hidden_tests_pass(loose_files)`."
+        hint: "`loose = run_agent(FakeClaude(coding_model(), clock=VirtualClock()), task, CODING_TOOLS, loose_execute, max_steps=15)`."
+        sample_code: |
+          from kits.agents_tool_use import CODE_FILES
+          loose_files = dict(CODE_FILES)
+
+          def loose_execute(name, input):
+              if name == "read_file":
+                  return loose_files[input["path"]]
+              if name == "write_file":
+                  loose_files[input["path"]] = input["content"]
+                  return "ok"
+              return run_loose_tests()
+
+          def run_loose_tests():
+              load_module(loose_files["climate.py"])
+              ns = {}
+              exec(loose_files["test_climate.py"], ns)
+              lines, passed = [], 0
+              for name, fn in ns.items():
+                  if name.startswith("test_") and callable(fn):
+                      try:
+                          fn()
+                          passed += 1
+                      except Exception as e:
+                          lines.append(f"FAILED {name}: {type(e).__name__}: {e}")
+              return "\n".join(lines + [f"{passed} passed, {len(lines)} failed"])
+
+          loose = ____
+          loose_answer = loose["answer"]
+          loose_visible = ____
+          loose_hidden = ____
+          print(loose_answer)
+          print("visible tests green:", loose_visible, "| hidden tests green:", loose_hidden)
+          print(loose_files["test_climate.py"])
+        solution: |
+          from kits.agents_tool_use import CODE_FILES
+          loose_files = dict(CODE_FILES)
+
+          def loose_execute(name, input):
+              if name == "read_file":
+                  return loose_files[input["path"]]
+              if name == "write_file":
+                  loose_files[input["path"]] = input["content"]
+                  return "ok"
+              return run_loose_tests()
+
+          def run_loose_tests():
+              load_module(loose_files["climate.py"])
+              ns = {}
+              exec(loose_files["test_climate.py"], ns)
+              lines, passed = [], 0
+              for name, fn in ns.items():
+                  if name.startswith("test_") and callable(fn):
+                      try:
+                          fn()
+                          passed += 1
+                      except Exception as e:
+                          lines.append(f"FAILED {name}: {type(e).__name__}: {e}")
+              return "\n".join(lines + [f"{passed} passed, {len(lines)} failed"])
+
+          loose = run_agent(FakeClaude(coding_model(), clock=VirtualClock()), task, CODING_TOOLS, loose_execute, max_steps=15)
+          loose_answer = loose["answer"]
+          loose_visible = run_loose_tests().endswith(", 0 failed")
+          loose_hidden = hidden_tests_pass(loose_files)
+          print(loose_answer)
+          print("visible tests green:", loose_visible, "| hidden tests green:", loose_hidden)
+          print(loose_files["test_climate.py"])
+        tests: |
+          assert "All tests pass" in (user["loose_answer"] or ""), "Run the agent with loose_execute; it should report that all tests pass."
+          assert user["loose_visible"] is True, "`loose_visible` should be True: the visible suite is green after the loose run."
+          assert user["loose_hidden"] is False, "`loose_hidden` should be False: the hidden tests catch that the code was never fixed."
+    success_msg: |
+      Same model, same task. With protected tests it fixed both bugs. With a permissive `write_file` it "fixed" the tests
+      instead, reported success, and the visible suite agreed. Only the hidden tests told the truth. Guardrails for agents
+      are about what they're allowed to touch, and about measuring success somewhere they can't reach.

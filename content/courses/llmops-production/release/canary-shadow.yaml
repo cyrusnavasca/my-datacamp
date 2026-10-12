@@ -1,0 +1,253 @@
+title: Canary and shadow releases
+description: Get real-traffic evidence before everyone sees a change. Shadow traffic, sticky canary buckets, guardrails with automatic rollback, and how much a small canary can really tell you.
+exercises:
+  - id: canary-shadow-slides
+    type: video
+    title: Ship to a few before you ship to all
+    slides: |
+      # Why the eval set is not enough
+
+      The eval set is fixed and offline. Real traffic has new phrasings, new topics, real load and real rate limits.
+      A safe release climbs a ladder, gathering more real evidence at each rung while exposing as few people as possible:
+
+      ```
+      offline eval  →  shadow  →  canary 1%  →  5%  →  25%  →  100%
+       (gate)          (no user    (real users, guardrails,
+                        sees it)    automatic rollback)
+      ```
+
+      ---
+
+      ## Shadow traffic
+
+      Copy each live request to the new version **as well**, keep the old version's answer for the user, and
+      log both for comparison: latency, cost, format errors, a judge's verdict on the pair.
+
+      - No user ever sees the new output, so the risk is zero... **unless the new version has side effects**.
+        A shadowed agent must not really `send_message` or `book_module`: stub its tools and record the calls instead.
+      - It **costs** an extra LLM call for every shadowed request, so shadow a sample.
+      - There is **no user feedback** (nobody saw the answer), so judge quality with evals or an LLM judge.
+
+      ---
+
+      ## Canary
+
+      Send a small share of real users to the new version and watch **guardrail metrics** against the control group.
+
+      - **Sticky assignment:** hash the user id, so each crew member always gets the same version (no flip-flopping
+        mid-conversation) and the 5% group is inside the 25% group as you ramp up.
+        `bucket = int(sha256(f"{salt}:{user_id}").hexdigest()[:8], 16) % 10_000`, in the canary if `bucket < percent × 100`.
+        A new salt per experiment reshuffles who goes first.
+      - **Guardrails with stop rules:** error rate, p95, cost per request, thumbs-down. Breach one and the rollout
+        **rolls back automatically**; do not wait for a person to notice.
+
+      ---
+
+      ## What a small canary can and cannot tell you
+
+      | effect | how big | how fast a canary sees it |
+      | --- | --- | --- |
+      | crashes, error spikes | large | minutes |
+      | p95 latency, cost per request | large, low noise | an hour or two |
+      | answer quality (thumbs, rephrases) | a few points, very noisy | days, or never at 1% |
+
+      With 100 canary requests, a thumbs-down rate of 9% vs 8% has a bootstrap interval of about **−5 to +7 points**:
+      it is consistent with "better", "same" and "worse". Use canaries to catch **breakage**, and use evals,
+      judges and properly sized A/B tests to prove **improvement**.
+
+      ---
+
+      ## Trade-off: which release check?
+
+      | | offline eval | shadow | canary | A/B test |
+      | --- | --- | --- | --- | --- |
+      | measures | quality on known cases | latency, cost, errors, pairwise quality on real inputs | real-user guardrails | the real effect on users, with confidence |
+      | user risk | none | none (tools stubbed) | a small group | half the users, on purpose |
+      | extra cost | eval runs | one extra call per shadowed request | none | none |
+      | time to signal | minutes | hours | hours to days | days to weeks |
+      | wins when | every change (the gate) | risky model swaps, agents | every release | "is v2 actually better?" |
+
+  - id: rollout-order
+    type: order
+    title: Order the rollout
+    prompt: v5 is ready. Put the release steps in a safe order.
+    hint: Each step should need more trust than the one before it, and nothing reaches all users before the guardrails have been watched on a few.
+    items:
+      - Run the eval set and the regression gate on the new version
+      - Shadow a sample of live traffic to it, with tools stubbed, and compare latency, cost and format errors
+      - Canary 1% of crew, assigned sticky by user id, with automatic rollback on guardrail breaches
+      - Ramp to 5%, then 25%, while the guardrails hold
+      - Move the production label to 100%, keeping the old version ready for rollback
+      - Retire the old version after a quiet week
+
+  - id: sticky-buckets
+    type: coding
+    title: Sticky canary assignment
+    context: |
+      Crew members must keep the same version across a conversation, and the canary group has to grow by adding
+      people, never by reshuffling them. `users` holds 20,000 user ids.
+    instructions:
+      - "Write `bucket(user_id, salt)`: the first 8 hex characters of `sha256(f\"{salt}:{user_id}\")` as an integer, modulo 10,000."
+      - "Write `in_canary(user_id, percent, salt=\"orbit-v5\")`: True when the bucket is below `percent * 100`."
+      - "Store `share_5`: the share of `users` in a 5% canary, and `grows`: True if every user in the 5% canary is also in the 25% canary."
+    hint: |
+      `int(hashlib.sha256(f"{salt}:{user_id}".encode()).hexdigest()[:8], 16) % 10_000`.
+      `grows = all(in_canary(u, 25) for u in users if in_canary(u, 5))`.
+    pre_code: |
+      import hashlib
+      users = [f"crew-{i:05d}" for i in range(20000)]
+    sample_code: |
+      def bucket(user_id, salt):
+          h = hashlib.sha256(____.encode()).hexdigest()
+          return ____
+
+      def in_canary(user_id, percent, salt="orbit-v5"):
+          return ____
+
+      share_5 = sum(in_canary(u, 5) for u in users) / len(users)
+      grows = ____
+      print(f"{share_5:.2%} in the 5% canary; grows without reshuffling: {grows}")
+    solution: |
+      def bucket(user_id, salt):
+          h = hashlib.sha256(f"{salt}:{user_id}".encode()).hexdigest()
+          return int(h[:8], 16) % 10_000
+
+      def in_canary(user_id, percent, salt="orbit-v5"):
+          return bucket(user_id, salt) < percent * 100
+
+      share_5 = sum(in_canary(u, 5) for u in users) / len(users)
+      grows = all(in_canary(u, 25) for u in users if in_canary(u, 5))
+      print(f"{share_5:.2%} in the 5% canary; grows without reshuffling: {grows}")
+    tests: |
+      check_object("bucket")
+      b = user["bucket"]
+      assert b("crew-00001", "orbit-v5") == sol["bucket"]("crew-00001", "orbit-v5"), "`bucket` should be int(first 8 hex chars of sha256('salt:user_id'), 16) % 10000."
+      assert b("crew-00001", "orbit-v5") == b("crew-00001", "orbit-v5"), "`bucket` must be deterministic."
+      check_equal("share_5", tol=1e-9)
+      assert abs(user["share_5"] - 0.05) < 0.005, "About 5% of users should be in a 5% canary."
+      assert user["grows"] is True, "Users in the 5% canary must also be in the 25% canary: compare the bucket against `percent * 100`."
+      ic = user["in_canary"]
+      moved = sum(ic(u, 5, salt="orbit-v5") != ic(u, 5, salt="orbit-v6") for u in user["users"][:2000])
+      assert moved > 50, "A different salt should pick a different 5%: include the salt in the hashed string."
+    success_msg: |
+      Assignment is a pure function of the user id: no table to store, the same answer on every server, and ramping
+      from 5% to 25% only adds people. A new salt per experiment means the same crew members are not always the
+      guinea pigs.
+
+  - id: canary-verdict
+    type: coding
+    title: Promote or roll back?
+    context: |
+      v6 sends hard questions to Opus "for better answers". A 5% canary ran for a morning. `log` holds one row per
+      request: `arm` (`control` or `canary`), `latency_ms`, `error`, `thumbs_down` and `cost`. `GUARDRAILS` gives the
+      limits for the canary relative to control.
+    instructions:
+      - "Build `metrics`, indexed by `arm`, with columns `n`, `p95_ms` (0.95 quantile), `error_rate`, `thumbs_down` and `cost` (means)."
+      - "Store `breaches`: the sorted list of guardrail names the canary breaks (see `GUARDRAILS`), and `decision`: `\"rollback\"` if there are any, else `\"promote\"`."
+      - "Bootstrap the thumbs-down difference (canary minus control): with `rng`, draw a `(2000, n_canary)` resample of the canary's `thumbs_down` values, **then** a `(2000, n_control)` one of control's, and store the 2.5th and 97.5th percentiles of the difference of row means in `ci`."
+    hint: |
+      `p95` ratio: `metrics.loc["canary", "p95_ms"] / metrics.loc["control", "p95_ms"] > GUARDRAILS["p95_ms"]`; the
+      error and thumbs-down guardrails are differences, the cost one a ratio. Resample with `rng.choice(values, size=(2000, len(values)))`.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      _r = np.random.default_rng(21)
+      def _arm(name, n, lat, err, down, cost):
+          return pd.DataFrame({"arm": name, "latency_ms": _r.lognormal(np.log(lat), 0.35, n).round(1),
+                               "error": _r.random(n) < err, "thumbs_down": _r.random(n) < down,
+                               "cost": _r.normal(cost, cost * 0.1, n).round(6)})
+      log = pd.concat([_arm("control", 1900, 800, 0.010, 0.08, 0.0017),
+                       _arm("canary", 100, 1150, 0.010, 0.06, 0.0029)], ignore_index=True)
+      GUARDRAILS = {
+          "p95_ms": 1.2,        # canary p95 at most 1.2x control
+          "error_rate": 0.01,   # at most 1 point above control
+          "thumbs_down": 0.03,  # at most 3 points above control
+          "cost": 1.3,          # cost per request at most 1.3x control
+      }
+      rng = np.random.default_rng(0)
+    sample_code: |
+      metrics = log.groupby("arm").agg(
+          n=("arm", "size"),
+          p95_ms=____,
+          error_rate=("error", "mean"),
+          thumbs_down=____,
+          cost=____,
+      )
+      can, ctl = metrics.loc["canary"], metrics.loc["control"]
+      checks = {
+          "p95_ms": can["p95_ms"] / ctl["p95_ms"] > GUARDRAILS["p95_ms"],
+          "error_rate": ____,
+          "thumbs_down": can["thumbs_down"] - ctl["thumbs_down"] > GUARDRAILS["thumbs_down"],
+          "cost": ____,
+      }
+      breaches = sorted(k for k, broken in checks.items() if broken)
+      decision = ____
+
+      c = log.loc[log["arm"] == "canary", "thumbs_down"].to_numpy()
+      k = log.loc[log["arm"] == "control", "thumbs_down"].to_numpy()
+      c_means = rng.choice(c, size=(2000, len(c))).mean(axis=1)
+      k_means = ____
+      ci = ____
+      print(metrics.round(4))
+      print(breaches, decision, np.round(ci, 3))
+    solution: |
+      metrics = log.groupby("arm").agg(
+          n=("arm", "size"),
+          p95_ms=("latency_ms", lambda s: s.quantile(0.95)),
+          error_rate=("error", "mean"),
+          thumbs_down=("thumbs_down", "mean"),
+          cost=("cost", "mean"),
+      )
+      can, ctl = metrics.loc["canary"], metrics.loc["control"]
+      checks = {
+          "p95_ms": can["p95_ms"] / ctl["p95_ms"] > GUARDRAILS["p95_ms"],
+          "error_rate": can["error_rate"] - ctl["error_rate"] > GUARDRAILS["error_rate"],
+          "thumbs_down": can["thumbs_down"] - ctl["thumbs_down"] > GUARDRAILS["thumbs_down"],
+          "cost": can["cost"] / ctl["cost"] > GUARDRAILS["cost"],
+      }
+      breaches = sorted(k for k, broken in checks.items() if broken)
+      decision = "rollback" if breaches else "promote"
+
+      c = log.loc[log["arm"] == "canary", "thumbs_down"].to_numpy()
+      k = log.loc[log["arm"] == "control", "thumbs_down"].to_numpy()
+      c_means = rng.choice(c, size=(2000, len(c))).mean(axis=1)
+      k_means = rng.choice(k, size=(2000, len(k))).mean(axis=1)
+      ci = np.percentile(c_means - k_means, [2.5, 97.5])
+      print(metrics.round(4))
+      print(breaches, decision, np.round(ci, 3))
+    tests: |
+      import numpy as np
+      check_object("metrics")
+      m, e = user["metrics"], sol["metrics"]
+      for col in ("n", "p95_ms", "error_rate", "thumbs_down", "cost"):
+          assert col in m.columns, f"`metrics` needs a `{col}` column."
+          assert np.allclose(m.loc[e.index, col].astype(float), e[col].astype(float)), f"`metrics['{col}']` is off."
+      check_equal("breaches", msg=f"The canary breaks these guardrails: {sol['breaches']}. Ratios for p95 and cost, differences for error rate and thumbs-down.")
+      check_equal("decision")
+      check_object("ci")
+      ci = np.asarray(user["ci"], dtype=float)
+      assert ci.shape == (2,), "`ci` should hold two numbers: the 2.5th and 97.5th percentiles."
+      assert np.allclose(ci, sol["ci"], atol=0.01), f"`ci` should be about {np.round(sol['ci'], 3)}. Resample the canary first, then control, with `rng.choice(..., size=(2000, n))`, and take percentiles of the difference of row means."
+    success_msg: |
+      Roll back: p95 rose by about 47% and cost by about 73%, both clear breaches. The "better answers" claim is not
+      visible either: the canary's thumbs-down interval runs from about 5 points better to 7 points worse. A 100-request
+      canary catches breakage, not small quality gains. Prove those offline, or with a larger A/B test.
+
+  - id: shadow-or-canary
+    type: mc
+    title: Shadow, canary or A/B?
+    question: |
+      ORBIT's **agent** (it can `send_message` to crew and `book_module`) is moving to a new model. You need real-traffic
+      evidence on latency, tool-call errors and answer quality, but no crew member may see the new model's output yet,
+      and nothing may be booked or sent twice. Which release step fits?
+    options:
+      - text: A 5% canary with automatic rollback.
+        feedback: A canary shows the new model's output to real crew, which is ruled out here, and its tool calls really run.
+      - text: Shadow live traffic to the new model with its tools running normally.
+        feedback: Dangerous. The shadow agent would really send messages and make bookings, so the crew would get duplicate messages and double bookings. Shadowing is only free of risk when it has no side effects.
+      - text: Shadow a sample of live traffic with the tools stubbed (record the calls, return canned results) and compare latency, tool-call validity and a judge's verdict.
+        correct: true
+        feedback: "Right. Nobody sees the output and nothing is executed, yet you measure real inputs: latency, cost, tool-call errors and pairwise quality with a judge. The costs: an extra model call per shadowed request, and stubs that cannot show what happens after a real tool result, so a canary still comes next."
+      - text: Skip the shadow step; the offline eval set is enough.
+        feedback: The eval set is the gate, but it does not reflect today's traffic mix, load or tool-call patterns. The requirement asks for real-traffic evidence.
+    hint: Two constraints. No crew member sees the output, and no side effects happen twice.

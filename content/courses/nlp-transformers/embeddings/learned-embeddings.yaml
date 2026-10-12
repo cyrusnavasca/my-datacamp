@@ -1,0 +1,206 @@
+title: Where embeddings come from
+description: Build word vectors from co-occurrence counts with PPMI and SVD, then compare count-based, predictive and contextual embeddings.
+exercises:
+  - id: intro
+    type: video
+    title: You shall know a word by its neighbours
+    slides: |
+      # The distributional idea
+
+      Words that appear in similar contexts tend to mean similar things.
+
+      ```
+      the medic drank coffee in the galley
+      the pilot drank tea in the galley
+      ```
+
+      `coffee` and `tea` share neighbours (`drank`, `in`, `galley`), so their vectors should be close.
+      Every embedding method, from 1990s count matrices to transformer embedding layers, turns this
+      idea into numbers. The **context window** decides what "neighbour" means: the $w$ words on each side.
+
+      ---
+
+      ## Count-based: co-occurrence, PPMI, SVD
+
+      1. **Count.** $C[i, j]$ = how often word $j$ appears within $w$ positions of word $i$.
+      2. **Reweight with PPMI.** Raw counts are dominated by `the`. Pointwise mutual information asks
+         "do these two co-occur more than chance?":
+         $$\text{PMI}(i, j) = \ln\frac{P(i, j)}{P(i)\,P(j)}, \qquad \text{PPMI} = \max(\text{PMI}, 0)$$
+         with $P(i, j) = C_{ij} / \sum C$, $P(i)$ = row sum / total and $P(j)$ = column sum / total.
+      3. **Compress with SVD.** Keep the top $k$ singular directions: `U[:, :k] * S[:k]` is a
+         $V \times k$ dense table. Similar rows of the PPMI matrix end up close together.
+
+      ---
+
+      ## Prediction-based: learn the table by gradient descent
+
+      **word2vec (skip-gram):** for each word, predict the words in its window. The input embedding
+      table is a weight matrix trained to make those predictions, and the vectors are a by-product.
+      It ends up close to a factorised PMI matrix, so the two families agree more than they differ.
+
+      **Inside a transformer** the `nn.Embedding` layer starts random and is trained end to end with the
+      rest of the model on next-token or masked-token prediction. No separate embedding step.
+
+      ---
+
+      ## Static vs contextual
+
+      A **static** embedding gives one vector per word type: `seal` (hatch seal) and `seal` (the animal)
+      share a vector that blends both senses.
+
+      A transformer's **hidden states** are **contextual**: each occurrence gets its own vector, computed
+      by attention over the sentence (next chapter). They capture sense, negation and word order, at the
+      cost of running the whole model for every text.
+
+      ---
+
+      ## Trade-offs: choosing embeddings
+
+      | knob or option | small / simple | large / complex |
+      | --- | --- | --- |
+      | dimension $k$ | fast, little memory, merges distinct meanings | more nuance, needs more data, more memory |
+      | window $w$ | 1-2: words that play the same role (`pump`/`valve`) | 5-10: words on the same topic (`pump`/`leak`) |
+      | train your own (count or word2vec) | covers your jargon; needs millions of tokens of your text | |
+      | pretrained static (GloVe, fastText) | instant lookup, tiny cost; general English only | |
+      | contextual (transformer) | | best quality and handles senses; a model call per text |
+
+      fastText adds character n-grams to word2vec, so even unseen words get a vector: the same trick
+      that fixed the glove-keypad classifier.
+
+  - id: cooccurrence
+    type: coding
+    title: Count co-occurrences
+    context: |
+      `sentences` holds 300 short station-log sentences such as `"the medic drank tea in the galley"`.
+      `vocab` is the sorted list of the 33 distinct words and `idx` maps each word to its row.
+      `np` is imported.
+    instructions:
+      - "Create `C`, a `len(vocab) x len(vocab)` array of zeros."
+      - "For every word at position `i` in every sentence, add 1 to `C[idx[word], idx[other]]` for each **other** word at positions `i-2` to `i+2` (window 2, never the word itself)."
+      - "Print the count for the pair `(\"drank\", \"tea\")`."
+    hint: |
+      Split each sentence with `.split()`. For position `i`, loop `j` over
+      `range(max(0, i - 2), min(len(tokens), i + 3))` and skip `j == i`.
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import station_corpus
+      sentences = station_corpus()
+      vocab = sorted({w for s in sentences for w in s.split()})
+      idx = {w: i for i, w in enumerate(vocab)}
+    sample_code: |
+      window = 2
+      C = np.zeros((len(vocab), len(vocab)))
+      for s in sentences:
+          tokens = s.split()
+          for i, word in enumerate(tokens):
+              for j in range(____, ____):
+                  if j != i:
+                      C[____, ____] += 1
+
+      print(C[idx["drank"], idx["tea"]])
+    solution: |
+      window = 2
+      C = np.zeros((len(vocab), len(vocab)))
+      for s in sentences:
+          tokens = s.split()
+          for i, word in enumerate(tokens):
+              for j in range(max(0, i - window), min(len(tokens), i + window + 1)):
+                  if j != i:
+                      C[idx[word], idx[tokens[j]]] += 1
+
+      print(C[idx["drank"], idx["tea"]])
+    tests: |
+      import numpy as np
+      c = check_object("C")
+      assert np.shape(c) == (33, 33), "`C` should be a 33 x 33 array, one row and one column per vocabulary word."
+      assert np.allclose(c, c.T), "A symmetric window gives a symmetric matrix: C[a, b] should equal C[b, a]. Check you look both left and right."
+      assert np.trace(c) == 0, "A word should not count as its own neighbour at the same position; skip `j == i`."
+      check_equal("C", msg="Some counts are off. Use positions max(0, i-2) up to and including i+2, clipped to the sentence length.")
+    success_msg: Every word now has a 33-number profile of its neighbours. `tea` and `coffee` have similar rows, which is all an embedding needs.
+
+  - id: ppmi-svd
+    type: coding
+    title: PPMI and SVD to word vectors
+    context: |
+      `C` is the co-occurrence matrix from the last exercise, with `vocab` and `idx`. `groups` maps
+      each of four topics (`crew`, `equipment`, `food`, `place`) to its four words. Turn counts into
+      5-dimensional word vectors and check that neighbours share a topic.
+    instructions:
+      - "Compute PPMI: $\\max(\\ln\\frac{P(i,j)}{P(i)P(j)}, 0)$ with zeros where the count is 0. Store it in `ppmi`."
+      - "Run `np.linalg.svd(ppmi)` and store the first 5 columns of `U` scaled by the first 5 singular values in `vectors` (shape `(33, 5)`)."
+      - "Store the share of the 16 topic words whose nearest other word by cosine (over all 33 words) is in the same topic in `neighbour_acc`. A helper `topic_accuracy(vectors)` is provided."
+    hint: |
+      `total = C.sum()`, `p_i = C.sum(axis=1) / total`, `p_j = C.sum(axis=0) / total`.
+      Inside `with np.errstate(divide="ignore"):` compute `np.log((C / total) / np.outer(p_i, p_j))`, then
+      `np.maximum(pmi, 0)`. For SVD: `U, S, Vt = np.linalg.svd(ppmi)` and `U[:, :5] * S[:5]`.
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import station_corpus, CORPUS_GROUPS as groups
+      sentences = station_corpus()
+      vocab = sorted({w for s in sentences for w in s.split()})
+      idx = {w: i for i, w in enumerate(vocab)}
+      C = np.zeros((len(vocab), len(vocab)))
+      for s in sentences:
+          t = s.split()
+          for i, w in enumerate(t):
+              for j in range(max(0, i - 2), min(len(t), i + 3)):
+                  if j != i:
+                      C[idx[w], idx[t[j]]] += 1
+      def topic_accuracy(vectors):
+          U = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
+          S = U @ U.T
+          np.fill_diagonal(S, -np.inf)
+          hits = [vocab[S[idx[w]].argmax()] in ws for ws in groups.values() for w in ws]
+          return float(np.mean(hits))
+    sample_code: |
+      total = C.sum()
+      p_i = C.sum(axis=1) / total
+      p_j = C.sum(axis=0) / total
+      with np.errstate(divide="ignore"):
+          pmi = ____
+      ppmi = ____
+
+      U, S, Vt = np.linalg.svd(ppmi)
+      vectors = ____
+
+      neighbour_acc = topic_accuracy(vectors)
+      print(f"Neighbours in the same topic: {neighbour_acc:.0%}")
+    solution: |
+      total = C.sum()
+      p_i = C.sum(axis=1) / total
+      p_j = C.sum(axis=0) / total
+      with np.errstate(divide="ignore"):
+          pmi = np.log((C / total) / np.outer(p_i, p_j))
+      ppmi = np.maximum(pmi, 0)
+
+      U, S, Vt = np.linalg.svd(ppmi)
+      vectors = U[:, :5] * S[:5]
+
+      neighbour_acc = topic_accuracy(vectors)
+      print(f"Neighbours in the same topic: {neighbour_acc:.0%}")
+    tests: |
+      import numpy as np
+      p = check_object("ppmi")
+      assert np.all(np.isfinite(p)), "`ppmi` contains -inf or NaN. Clip with `np.maximum(pmi, 0)` so log(0) = -inf becomes 0."
+      assert p.min() >= 0, "PPMI is never negative: apply `np.maximum(pmi, 0)`."
+      check_equal("ppmi", msg="`ppmi` values are off. PMI is log( (C/total) / outer(p_i, p_j) ).")
+      v = check_object("vectors")
+      assert np.shape(v) == (33, 5), f"`vectors` should have shape (33, 5): one 5-d row per word. Got {np.shape(v)}."
+      acc = user["topic_accuracy"](np.asarray(v))
+      assert acc >= 0.9, f"Only {acc:.0%} of topic words have a same-topic nearest neighbour; expected at least 90%. Use `U[:, :5] * S[:5]` from the SVD of `ppmi`."
+      check_equal("neighbour_acc", acc, msg="`neighbour_acc` should be `topic_accuracy(vectors)`.")
+    success_msg: Five numbers per word are enough to put every topic word next to a same-topic neighbour. Try `U[:, :2] * S[:2]`; with too few dimensions, topics start to merge.
+
+  - id: embedding-source
+    type: classify
+    title: Which embeddings would you use?
+    prompt: Sort each situation by the kind of embedding you would start with.
+    hint: Own jargon with lots of your own text points to training your own. Cheap, general and instant points to pretrained static vectors. Meaning that depends on the sentence points to contextual embeddings.
+    zones: [Train your own static vectors, Pretrained static vectors, Contextual transformer embeddings]
+    items:
+      - { text: "Two years of station logs full of part codes and jargon no public corpus contains; no GPU", zone: Train your own static vectors }
+      - { text: "Domain words like 'cupola' and 'scrubber' must have vectors, and you have millions of tokens of your own text", zone: Train your own static vectors }
+      - { text: "A quick general-English baseline on a microcontroller, where each lookup must cost microseconds", zone: Pretrained static vectors }
+      - { text: "Expand search queries with common synonyms ('fix' to 'repair') at almost no cost", zone: Pretrained static vectors }
+      - { text: "'Seal' means a hatch seal in tickets and an animal in a crew diary, and the two must not mix", zone: Contextual transformer embeddings }
+      - { text: "'The heater is not working' and 'the heater is working' must get different vectors", zone: Contextual transformer embeddings }

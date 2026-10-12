@@ -1,0 +1,230 @@
+title: "Lab: does your metric agree with humans?"
+description: The dashboard says v2 got worse; the crew says it got better. Treat the metric as a classifier of human judgement, measure its agreement, find why it disagrees, and fix it.
+exercises:
+  - id: validate-metrics-slides
+    type: video
+    title: Validate the metric before you trust the dashboard
+    slides: |
+      # Symptom: the metric and the crew disagree
+
+      After v2 shipped (3 documents instead of 1, titles, citations), the dashboard showed mean token F1 dropping from
+      **0.35 to 0.32**. A product review almost rolled it back.
+
+      The crew's spot checks said the opposite: v2 answers more questions correctly.
+
+      Before arguing about which version is better, ask a different question: **how often does this metric agree with a
+      human?** A metric nobody has checked against labels is a guess with a decimal point.
+
+      ---
+
+      ## Measure: a metric is a classifier
+
+      Threshold the metric to get pass/fail, then compare with human labels like any classifier:
+
+      ```python
+      metric_pass = answerable["f1"] >= 0.5
+      pd.crosstab(answerable["human"], metric_pass)       # rows: human, columns: metric
+      agreement = (metric_pass.astype(int) == answerable["human"]).mean()
+      ```
+
+      | | metric: pass | metric: fail |
+      | --- | --- | --- |
+      | **human: pass** | agree | **false fail**: good answers punished |
+      | **human: fail** | **false pass**: bad answers waved through | agree |
+
+      Compare against the trivial metric that **always says pass**: if humans accept 75%, it agrees 75% of the time
+      without reading anything.
+
+      ---
+
+      ## Diagnose: read the disagreements
+
+      Print the false fails and false passes and read them, like in error analysis. For reference metrics, the usual
+      causes are:
+
+      - **Length**: complete sentences lose precision against terse gold answers.
+      - **Boilerplate**: citations, greetings and disclaimers add tokens.
+      - **Refusals** aren't handled: the right answer to an unanswerable question has no gold text to match.
+      - **Threshold** picked by gut feeling instead of on labelled data.
+
+      If the disagreements line up with what changed between versions (v2 writes longer answers with citations), the
+      metric is measuring the change, not the quality.
+
+      ---
+
+      ## Fix, then verify
+
+      Try fixes in order of cost:
+
+      1. Strip boilerplate (citations) before scoring. Free.
+      2. Score **recall** of the gold tokens instead of F1 when answers are naturally longer than the gold. Free.
+      3. Handle refusals explicitly: unanswerable → pass only if it refuses. Free.
+      4. Pick the threshold on labelled data. Cheap.
+      5. Curate key facts per question, or move to an LLM judge (next chapter). Costs curation time or money.
+
+      **Verify** with the same agreement measurement, then re-run the version comparison. To be sure you haven't just
+      fitted the metric to these labels, check it on labels you didn't look at while tuning.
+
+  - id: base-rate
+    type: mc
+    title: Is 85% agreement good?
+    question: |
+      A metric agrees with the crew's labels on **85%** of outputs. The crew accepts **80%** of all outputs. What does
+      that tell you?
+    options:
+      - text: The metric is reliable; 85% is high agreement.
+        feedback: |
+          Not on its own. A "metric" that marks everything as pass agrees 80% of the time here without reading anything.
+          85% is only 5 points better than that. Agreement has to be compared with the base rate.
+      - text: Not much yet. Always-pass would already score 80%, so look at false passes and false fails separately.
+        correct: true
+        feedback: |
+          Right. With imbalanced labels, raw agreement flatters a metric. Check the confusion matrix: how many bad answers
+          does it let through, and how many good ones does it reject? Next chapter you'll use Cohen's kappa, which corrects
+          agreement for chance.
+      - text: The metric is useless because it's barely above 80%.
+        feedback: |
+          Too quick. A metric that is 5 points above the base rate could still catch most of the failures you care about,
+          or none of them. You need the confusion matrix to tell.
+      - text: The metric overestimates quality by 5 points.
+        feedback: |
+          Agreement and pass rate are different things. 85% agreement says nothing about whether the metric's pass rate is
+          above or below 80%.
+    hint: What would a metric that ignores the answer and always says "pass" score?
+
+  - id: metric-lab
+    type: sequential
+    title: "Mission: settle the v1 vs v2 argument"
+    context: |
+      `log` has 90 ORBIT outputs (v1 and v2 on all 45 questions) with `version`, `type`, `gold`, `answer` and the crew's
+      verdict `human`. `answerable` is the 82 rows with a gold answer. `normalize` and `token_f1` from the first lesson
+      are loaded, and `answerable["f1"]` is already computed.
+    pre_code: |
+      import re
+      import string
+      from collections import Counter
+      import pandas as pd
+      from kits.llm_evaluation import orbit_log
+
+      def normalize(text):
+          text = text.lower()
+          text = "".join(ch for ch in text if ch not in string.punctuation)
+          text = re.sub(r"\b(a|an|the)\b", " ", text)
+          return " ".join(text.split())
+
+      def token_f1(pred, gold):
+          p, g = normalize(pred).split(), normalize(gold).split()
+          same = sum((Counter(p) & Counter(g)).values())
+          if same == 0:
+              return 0.0
+          precision, recall = same / len(p), same / len(g)
+          return 2 * precision * recall / (precision + recall)
+
+      log = orbit_log()
+      answerable = log[log["type"] != "unanswerable"].reset_index(drop=True)
+      answerable["f1"] = [token_f1(a, g) for a, g in zip(answerable["answer"], answerable["gold"])]
+    steps:
+      - instructions:
+          - "**Symptom.** Store the mean `f1` per `version` of `answerable` in `f1_by_version`, and the mean `human` per `version` in `human_by_version`."
+        hint: "`answerable.groupby('version')['f1'].mean()`, and the same for `human`."
+        sample_code: |
+          f1_by_version = ____
+          human_by_version = ____
+          print(f1_by_version, human_by_version, sep="\n")
+        solution: |
+          f1_by_version = answerable.groupby("version")["f1"].mean()
+          human_by_version = answerable.groupby("version")["human"].mean()
+          print(f1_by_version, human_by_version, sep="\n")
+        tests: |
+          check_object("f1_by_version")
+          assert dict(user["f1_by_version"].round(6)) == dict(sol["f1_by_version"].round(6)), "`f1_by_version` should be the mean `f1` per version."
+          check_object("human_by_version")
+          assert dict(user["human_by_version"].round(6)) == dict(sol["human_by_version"].round(6)), "`human_by_version` should be the mean `human` per version."
+      - instructions:
+          - "**Measure.** Treat `f1 >= 0.5` as the metric's pass. Store the share of rows of `answerable` where it equals `human` in `agree_f1`."
+          - "Store the agreement of a metric that always says pass (the mean of `human`) in `agree_always_pass`."
+        hint: "`((answerable['f1'] >= 0.5).astype(int) == answerable['human']).mean()`"
+        sample_code: |
+          metric_pass = (answerable["f1"] >= 0.5).astype(int)
+          agree_f1 = ____
+          agree_always_pass = ____
+          print(round(agree_f1, 3), round(agree_always_pass, 3))
+          print(pd.crosstab(answerable["human"], metric_pass))
+        solution: |
+          metric_pass = (answerable["f1"] >= 0.5).astype(int)
+          agree_f1 = (metric_pass == answerable["human"]).mean()
+          agree_always_pass = answerable["human"].mean()
+          print(round(agree_f1, 3), round(agree_always_pass, 3))
+          print(pd.crosstab(answerable["human"], metric_pass))
+        tests: |
+          check_equal("agree_f1", msg="`agree_f1` is the share of rows where `(f1 >= 0.5)` equals `human`.")
+          check_equal("agree_always_pass", msg="An always-pass metric agrees exactly where `human == 1`, so its agreement is the mean of `human`.")
+      - instructions:
+          - "**Diagnose.** Store the rows where the metric fails but humans pass in `false_fails`, and the rows where the metric passes but humans fail in `false_passes` (both DataFrames)."
+          - "Store the share of `false_fails` that come from `v2` in `ff_v2_share`. Print a few `false_fails` answers next to their `gold` and read them."
+        hint: "`answerable[(metric_pass == 0) & (answerable['human'] == 1)]`; then `(false_fails['version'] == 'v2').mean()`."
+        sample_code: |
+          false_fails = ____
+          false_passes = ____
+          ff_v2_share = ____
+          print(len(false_fails), len(false_passes), round(ff_v2_share, 2))
+          print(false_fails[["gold", "answer"]].head(5).to_string())
+        solution: |
+          false_fails = answerable[(metric_pass == 0) & (answerable["human"] == 1)]
+          false_passes = answerable[(metric_pass == 1) & (answerable["human"] == 0)]
+          ff_v2_share = (false_fails["version"] == "v2").mean()
+          print(len(false_fails), len(false_passes), round(ff_v2_share, 2))
+          print(false_fails[["gold", "answer"]].head(5).to_string())
+        tests: |
+          check_object("false_fails")
+          assert len(user["false_fails"]) == len(sol["false_fails"]), f"`false_fails` should have {len(sol['false_fails'])} rows: metric_pass == 0 and human == 1."
+          check_object("false_passes")
+          assert len(user["false_passes"]) == len(sol["false_passes"]), f"`false_passes` should have {len(sol['false_passes'])} rows: metric_pass == 1 and human == 0."
+          check_equal("ff_v2_share", msg="`ff_v2_share` is the fraction of `false_fails` rows with `version == 'v2'`.")
+      - instructions:
+          - "**Fix.** Write `my_metric(answer, gold, qtype)` that returns 1 (pass) or 0 (fail). Use any approach. Ideas that work: unanswerable questions pass only on a refusal; strip `[doc-id]` citations; score the **recall** of the gold tokens instead of F1."
+          - "**Verify.** Apply it to every row of `log` (all 90, including unanswerable ones). Store the agreement with `human` in `agree_new` (must be at least 0.9) and the mean score per version in `new_by_version`."
+        hint: |
+          Recall of gold tokens: `sum((Counter(a) & Counter(g)).values()) / len(g)` with `a` the normalised answer
+          (citations removed with `re.sub(r"\[[^\]]*\]", " ", answer)`) and `g` the normalised gold. A threshold around
+          0.7 works well. For `qtype == "unanswerable"`, return `int("I don't know" in answer)`.
+        sample_code: |
+          def my_metric(answer, gold, qtype):
+              ____
+
+          log["new"] = [my_metric(a, g, t) for a, g, t in zip(log["answer"], log["gold"], log["type"])]
+          agree_new = ____
+          new_by_version = ____
+          print(round(agree_new, 3))
+          print(new_by_version)
+        solution: |
+          def my_metric(answer, gold, qtype):
+              if qtype == "unanswerable":
+                  return int("I don't know" in answer)
+              if "I don't know" in answer:
+                  return 0
+              a = normalize(re.sub(r"\[[^\]]*\]", " ", answer)).split()
+              g = normalize(gold).split()
+              recall = sum((Counter(a) & Counter(g)).values()) / len(g)
+              return int(recall >= 0.7)
+
+          log["new"] = [my_metric(a, g, t) for a, g, t in zip(log["answer"], log["gold"], log["type"])]
+          agree_new = (log["new"] == log["human"]).mean()
+          new_by_version = log.groupby("version")["new"].mean()
+          print(round(agree_new, 3))
+          print(new_by_version)
+        tests: |
+          check_object("my_metric")
+          scores = [user["my_metric"](a, g, t) for a, g, t in zip(user["log"]["answer"], user["log"]["gold"], user["log"]["type"])]
+          assert all(s in (0, 1, True, False) for s in scores), "`my_metric` should return 1 (pass) or 0 (fail)."
+          agree = sum(int(s) == h for s, h in zip(scores, user["log"]["human"])) / len(scores)
+          assert agree >= 0.9, f"`my_metric` agrees with the crew on {agree:.1%} of the 90 outputs; it needs at least 90%. Print the rows where it disagrees: refusals on unanswerable questions, citations, or long correct answers are the usual culprits."
+          check_object("agree_new")
+          assert abs(float(user["agree_new"]) - agree) < 1e-9, "`agree_new` should be the share of rows of `log` where your metric equals `human`."
+          check_object("new_by_version")
+          nb = user["new_by_version"]
+          assert nb["v2"] > nb["v1"], "With a validated metric, v2 should score higher than v1, as the crew says. Check `new_by_version`."
+    success_msg: |
+      F1 agreed with the crew 52% of the time, worse than a metric that always says pass (76%), and 60% of its false
+      fails were v2's longer, cited answers. Your metric agrees about 97% of the time and puts v2 ahead, as the crew
+      said. Same outputs, different ruler. Keep a held-out set of labels to check it again later.

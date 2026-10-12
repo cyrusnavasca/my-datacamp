@@ -1,0 +1,288 @@
+title: Prompting with retrieved context
+description: The anatomy of a RAG prompt, what the model does with no, wrong and right context, and what context costs.
+exercises:
+  - id: context-slides
+    type: video
+    title: Anatomy of a RAG prompt
+    slides: |
+      # Anatomy of a RAG prompt
+
+      ```text
+      system:  You are ORBIT, the Helios-7 assistant.                  <- role
+               Answer using only the documents.                        <- grounding rule
+               If they don't contain the answer, say you don't know.   <- permission to refuse
+               Cite the document id after each sentence, like [doc-id]. <- output contract
+      user:    <document id="airlock-procedure">...</document>         <- data, tagged, with ids
+               <document id="eva-prep-checklist">...</document>
+               <question>How long is the leak-check hold?</question>   <- question last
+      ```
+
+      - **Instructions go in `system`**, data in the user turn. The model treats them differently, and you can reuse the system prompt across questions (and cache it).
+      - **Tags with ids** mark where each document starts and ends and give the model something to cite.
+      - **Question last.** Models answer better when the question comes after the material it is about.
+      - **Permission to refuse.** Without "say you don't know", a model asked a question tends to produce *an* answer.
+
+      ---
+
+      ## Four contexts, four behaviours
+
+      Ask "How long is the leak-check hold on AL-1?" with different context:
+
+      | context | what a grounded model does | why |
+      | --- | --- | --- |
+      | none | invents a fluent number | nothing to read; it falls back on guessing |
+      | unrelated (galley doc) | "I don't know" | nothing relevant, and it's allowed to refuse |
+      | **related but wrong** (docking doc) | "after a 2-hour leak check" | a real leak check, for the wrong hatch |
+      | right (airlock doc) | "8 minutes" | the fact is there |
+
+      The third row is the dangerous one. The answer is fluent, quoted from a real document and **wrong**. A
+      grounding instruction can't fix it: the model did exactly what it was told. **Retrieval quality limits
+      answer quality**, and you'll measure it in the next lesson.
+
+      ---
+
+      ## Context costs tokens on every call
+
+      Every retrieved chunk is billed as input tokens on **every** question:
+
+      $$\text{context cost per day} = k \times \text{tokens per chunk} \times \text{questions per day} \times \text{price per token}$$
+
+      | k (whole handbook docs) | context tokens per question |
+      | --- | --- |
+      | 1 | about 95 |
+      | 3 | about 275 |
+      | 5 | about 475 |
+
+      More context also isn't automatically better: irrelevant chunks can distract the model, and facts buried in
+      the middle of a long context are used less reliably. A common guard is a **token budget**: keep chunks in rank
+      order until the next one would go over the budget.
+
+      ---
+
+      ## Return the sources, not just the text
+
+      The crew app should show *where* an answer came from. Ask for structure and parse it:
+
+      ```python
+      import json
+      system = SYSTEM + ' Reply in JSON with keys "answer" and "sources" (a list of document ids).'
+      reply = client.messages.create(model=MODEL, max_tokens=400, system=system, messages=[...])
+      data = json.loads(reply.content[0].text)
+      data["answer"], data["sources"]
+      ```
+
+      Sources give the crew a way to check, and give *you* a way to debug: a wrong answer with a wrong source is a
+      retrieval problem; a wrong answer with the right source is a generation problem (chapter 4).
+
+  - id: four-contexts
+    type: coding
+    title: No context, wrong context, right context
+    context: |
+      `hb` maps document ids to handbook docs. `client` is the grounded FakeClaude, and `MODEL` and `SYSTEM` are set.
+      You'll ask the same airlock question four times with different documents and compare.
+    instructions:
+      - "Write `ask(question, docs)`: wrap each doc as `<document id=\"ID\">TEXT</document>`, join them with newlines, add `<question>...</question>` after them, send it with `system=SYSTEM`, and return the reply text. It must also work when `docs` is empty."
+      - "Store the answers to `QUESTION` with no docs in `no_ctx`, with `[hb[\"galley-and-meals\"]]` in `unrelated_ctx`, with `[hb[\"docking-procedures\"]]` in `related_ctx`, and with `[hb[\"airlock-procedure\"]]` in `right_ctx`."
+      - Print all four.
+    hint: |
+      `context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in docs)` is an empty string when
+      `docs` is empty, so the same code handles all four cases.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import make_client, MODEL, SYSTEM
+      hb = {d["id"]: d for d in aikit.helios.handbook()}
+      client = make_client()
+      QUESTION = "How long is the leak-check hold when depressurising AL-1?"
+    sample_code: |
+      def ask(question, docs):
+          context = "\n".join(____ for d in docs)
+          response = client.messages.create(
+              model=MODEL, max_tokens=400, system=SYSTEM,
+              messages=[{"role": "user", "content": ____}],
+          )
+          return response.content[0].text
+
+      no_ctx = ask(QUESTION, ____)
+      unrelated_ctx = ask(QUESTION, ____)
+      related_ctx = ask(QUESTION, ____)
+      right_ctx = ask(QUESTION, ____)
+      for name, a in [("none", no_ctx), ("unrelated", unrelated_ctx), ("related", related_ctx), ("right", right_ctx)]:
+          print(f"{name:>9}: {a}")
+    solution: |
+      def ask(question, docs):
+          context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in docs)
+          response = client.messages.create(
+              model=MODEL, max_tokens=400, system=SYSTEM,
+              messages=[{"role": "user", "content": f"{context}\n<question>{question}</question>"}],
+          )
+          return response.content[0].text
+
+      no_ctx = ask(QUESTION, [])
+      unrelated_ctx = ask(QUESTION, [hb["galley-and-meals"]])
+      related_ctx = ask(QUESTION, [hb["docking-procedures"]])
+      right_ctx = ask(QUESTION, [hb["airlock-procedure"]])
+      for name, a in [("none", no_ctx), ("unrelated", unrelated_ctx), ("related", related_ctx), ("right", right_ctx)]:
+          print(f"{name:>9}: {a}")
+    tests: |
+      check_object("ask")
+      for name in ["no_ctx", "unrelated_ctx", "related_ctx", "right_ctx"]:
+          check_object(name)
+      assert "8 minutes" in user["right_ctx"], f"With the airlock doc the answer should mention 8 minutes; got {user['right_ctx']!r}. Check the document tags and that the question comes after them."
+      assert "don't know" in user["unrelated_ctx"], f"With only the galley doc ORBIT should say it doesn't know; got {user['unrelated_ctx']!r}. Pass `[hb[\"galley-and-meals\"]]`."
+      assert "2-hour" in user["related_ctx"], f"With the docking doc ORBIT quotes the wrong leak check; got {user['related_ctx']!r}. Pass `[hb[\"docking-procedures\"]]`."
+      assert "Meridian" in user["no_ctx"] and "8 minutes" not in user["no_ctx"], f"With no documents ORBIT should invent an answer; got {user['no_ctx']!r}. Pass an empty list."
+    success_msg: |
+      Four contexts, four behaviours. The no-context answer is invented, and the related-context answer is real text about
+      the wrong hatch. Both read as confidently as the right one, so the crew can't tell which to trust. Only better
+      retrieval fixes the related-context case.
+
+  - id: answer-with-sources
+    type: coding
+    title: Answer with sources
+    context: |
+      The crew app needs the answer and the ids of the documents it came from. `retrieve(question, k)` returns the top
+      handbook docs and `client` is the grounded FakeClaude. Like a real model, it replies in JSON when the system
+      prompt asks for JSON.
+    instructions:
+      - "Set `JSON_SYSTEM` to `SYSTEM` plus an instruction to reply in JSON with keys `answer` and `sources` (a list of document ids)."
+      - "Write `rag_json(question, k=3)`: retrieve, build the tagged prompt, call the model with `system=JSON_SYSTEM`, and return the parsed dict (`json.loads`)."
+      - "Store `rag_json(\"How often is lettuce harvested?\")` in `result` and print it."
+    hint: |
+      `JSON_SYSTEM = SYSTEM + ' Reply in JSON with keys "answer" and "sources" (a list of document ids).'`, then
+      `return json.loads(response.content[0].text)`.
+    pre_code: |
+      import json
+      import numpy as np
+      import aikit
+      from kits.rag_systems import make_client, MODEL, SYSTEM
+      docs = aikit.helios.handbook()
+      doc_vecs = aikit.embed([d["text"] for d in docs])
+      client = make_client()
+
+      def retrieve(question, k=3):
+          scores = doc_vecs @ aikit.embed(question)
+          return [docs[i] for i in np.argsort(-scores)[:k]]
+    sample_code: |
+      JSON_SYSTEM = ____
+
+      def rag_json(question, k=3):
+          context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in retrieve(question, k))
+          response = client.messages.create(
+              model=MODEL, max_tokens=400, system=____,
+              messages=[{"role": "user", "content": f"{context}\n<question>{question}</question>"}],
+          )
+          return ____
+
+      result = rag_json("How often is lettuce harvested?")
+      print(result)
+    solution: |
+      JSON_SYSTEM = SYSTEM + ' Reply in JSON with keys "answer" and "sources" (a list of document ids).'
+
+      def rag_json(question, k=3):
+          context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in retrieve(question, k))
+          response = client.messages.create(
+              model=MODEL, max_tokens=400, system=JSON_SYSTEM,
+              messages=[{"role": "user", "content": f"{context}\n<question>{question}</question>"}],
+          )
+          return json.loads(response.content[0].text)
+
+      result = rag_json("How often is lettuce harvested?")
+      print(result)
+    tests: |
+      check_object("rag_json")
+      r = check_object("result")
+      assert isinstance(r, dict), "`rag_json` should return a dict: parse the reply with `json.loads(...)`. If parsing fails, check that `JSON_SYSTEM` mentions JSON."
+      assert "28 days" in r.get("answer", ""), f"`result['answer']` should mention 28 days; got {r.get('answer')!r}."
+      assert r.get("sources") == ["hydroponics-schedule"], f"`result['sources']` should be ['hydroponics-schedule']; got {r.get('sources')!r}."
+      r2 = user["rag_json"]("Who is the flight engineer?")
+      assert "Tomas Lindqvist" in r2["answer"] and "crew-roster" in r2["sources"], "`rag_json` should work for any question: the flight engineer answer should cite crew-roster."
+    success_msg: |
+      The crew app can now show "Source: hydroponics-schedule" under the answer. The source is also your first debugging
+      clue when an answer is wrong.
+
+  - id: pack-context
+    type: coding
+    title: Fit the context into a token budget
+    context: |
+      ORBIT's prompt has room for at most `BUDGET = 200` tokens of documents. `ranked` holds the top 6 handbook docs for a
+      question, best first. `count_tokens(text)` returns the token count of a string.
+    instructions:
+      - "Write `pack(docs, budget)`: go through `docs` in order and keep each doc whose tokens still fit (running total plus this doc's `count_tokens(d[\"text\"])` is at most `budget`). Skip docs that don't fit and keep going. Return the kept docs."
+      - "Store `pack(ranked, BUDGET)` in `packed` and the total tokens of the kept docs in `used`."
+      - Print the ids in `packed` and `used`.
+    hint: |
+      Keep a running `total = 0`. For each doc, compute `n = count_tokens(d["text"])`; if `total + n <= budget`, append it and add `n` to `total`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from aikit import count_tokens
+      docs = aikit.helios.handbook()
+      doc_vecs = aikit.embed([d["text"] for d in docs])
+      BUDGET = 200
+      scores = doc_vecs @ aikit.embed("What should I check when hydroponics humidity is too high?")
+      ranked = [docs[i] for i in np.argsort(-scores)[:6]]
+      print([(d["id"], count_tokens(d["text"])) for d in ranked])
+    sample_code: |
+      def pack(docs, budget):
+          kept, total = [], 0
+          for d in docs:
+              n = ____
+              if ____:
+                  kept.append(d)
+                  total += n
+          return kept
+
+      packed = pack(ranked, BUDGET)
+      used = ____
+      print([d["id"] for d in packed], used)
+    solution: |
+      def pack(docs, budget):
+          kept, total = [], 0
+          for d in docs:
+              n = count_tokens(d["text"])
+              if total + n <= budget:
+                  kept.append(d)
+                  total += n
+          return kept
+
+      packed = pack(ranked, BUDGET)
+      used = sum(count_tokens(d["text"]) for d in packed)
+      print([d["id"] for d in packed], used)
+    tests: |
+      check_object("pack")
+      check_equal("used", msg="`used` should be the total `count_tokens` of the docs in `packed`.")
+      got = [d["id"] for d in user["packed"]]
+      want = [d["id"] for d in sol["packed"]]
+      assert got == want, f"Expected {want}, got {got}. Keep docs in rank order, skip a doc that would go over the budget, and keep checking the smaller ones after it."
+      f = user["pack"]
+      assert f(user["ranked"], 10) == [], "With a budget smaller than every doc, `pack` should return an empty list."
+      assert len(f(user["ranked"], 10_000)) == 6, "With a huge budget, `pack` should keep all docs."
+    success_msg: |
+      The long hydroponics troubleshooting doc (the one with the answer) is ranked first and fills most of the budget, so
+      the shorter docs after it are skipped. Whole documents are coarse units of context; chapter 2 cuts them into chunks
+      so you can spend the budget on the relevant sentences.
+
+  - id: predict-empty-retrieval
+    type: mc
+    title: What happens when retrieval finds nothing?
+    question: |
+      A bug in ORBIT's search returns an empty list for every question, so the prompt has instructions and a question
+      but no `<document>` blocks. The system prompt still says "Answer using only the documents. If they don't contain
+      the answer, say you don't know." What does the crew see?
+    context: |
+      The console has `client`, `MODEL` and `SYSTEM`. Try
+      `client.messages.create(model=MODEL, max_tokens=200, system=SYSTEM, messages=[{"role": "user", "content": "<question>How long can a spacewalk last?</question>"}]).content[0].text`.
+    pre_code: |
+      from kits.rag_systems import make_client, MODEL, SYSTEM
+      client = make_client()
+    options:
+      - text: "\"I don't know based on the provided documents.\" The grounding rule guarantees it."
+        feedback: "Not here, and not reliably with real models. With no documents to read, a model often falls back on what sounds plausible, despite the instruction. Run the call in the console."
+      - text: A confident, specific, invented answer.
+        correct: true
+        feedback: "Right. The instruction asks the model to judge something it can't see. Never rely on it: check `if not chunks:` in your code and return a refusal *without* calling the model. That is cheaper and always correct."
+      - text: An API error, because the prompt has no documents.
+        feedback: The API doesn't know or care that your prompt is supposed to contain documents. It's a valid request, so you get a normal reply.
+      - text: The question repeated back.
+        feedback: Models rarely echo the question. The real risk is a fluent answer that isn't grounded in anything. Try it in the console.
+    hint: The FakeClaude here behaves like a model with no grounding when it gets no documents. Run the call in the console.

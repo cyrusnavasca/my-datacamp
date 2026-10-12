@@ -1,0 +1,294 @@
+title: Chunk size, overlap and structure
+description: Fixed windows with overlap, sentence windows and heading-aware splitting, what each costs, and why doc-level recall stops telling the truth once you chunk.
+exercises:
+  - id: chunking-slides
+    type: video
+    title: Cutting documents into retrievable pieces
+    slides: |
+      # Why not retrieve whole documents?
+
+      Chapter 1 retrieved whole handbook docs. That works for 35 short docs. It breaks down as documents grow:
+
+      - **Blurry vectors.** One embedding for a long doc is roughly an average of all its topics, so it matches
+        many questions weakly and none strongly. The airlock doc covers who may operate it, preparation,
+        depressurisation *and* repressurisation.
+      - **Wasted context.** To answer "how long is the leak-check hold?" you send all ~270 tokens of the airlock doc,
+        when one sentence holds the answer. With a token budget, one long doc can crowd out everything else.
+      - **Vague citations.** "See airlock-procedure" is less useful than pointing to the paragraph.
+
+      **Chunking** splits each document into smaller pieces, embeds each piece, and retrieves pieces. Each chunk keeps
+      a pointer to its source document.
+
+      ---
+
+      ## Fixed-size windows and overlap
+
+      Cut every `size` characters. Each window starts `size - overlap` characters after the previous one (the **stride**):
+
+      ```text
+      text:      abcdefghij          size=4, overlap=1, stride=3
+      chunks:    abcd
+                    defg
+                       ghij          (stop once a chunk reaches the end)
+      ```
+
+      ```python
+      def chunk_fixed(text, size, overlap=0):
+          chunks, start = [], 0
+          while start < len(text):
+              chunks.append(text[start:start + size])
+              if start + size >= len(text):
+                  break
+              start += size - overlap
+          return chunks
+      ```
+
+      Fixed windows are simple and need no knowledge of the text, but they cut wherever the counter lands, often
+      mid-sentence. **Overlap** is insurance: a fact cut at one boundary appears whole in the next window. It costs
+      more chunks to embed and store, and near-duplicate chunks can fill several of your top-k slots.
+
+      ---
+
+      ## Respect the author's boundaries
+
+      Writers already split text into units of meaning. Use them:
+
+      - **Sentence windows**: `n` sentences per chunk, starting every `stride` sentences (stride < n overlaps).
+      - **Heading sections**: one chunk per `## ` section, heading included, so the chunk says what it's about.
+
+      ```text
+      # Airlock procedure for AL-1              <- document title: dropped (it goes in metadata, next lesson)
+      This procedure replaces the 2024 ...      <- chunk 0: text before the first section
+      ## Who may operate the airlock            <- chunk 1
+      Two crew members must be present ...
+      ## Depressurisation                       <- chunk 2 ...
+      ```
+
+      Structure-aware splitting depends on the format (markdown headings, HTML tags, PDF layout). Real pipelines
+      combine both: split on structure, then cap any section that is still too long with a fixed or sentence window.
+
+      ---
+
+      ## The chunk-size trade-off
+
+      | | small (a sentence, ~80 chars) | medium (2-3 sentences, a section) | large (whole doc, 1,000+ chars) |
+      | --- | --- | --- | --- |
+      | Retrieval precision | high: one idea per vector | good | low: the vector averages topics |
+      | Context completeness | fragments: a fact and its subject can land in different chunks | usually whole | complete |
+      | Tokens per question at fixed k | low | medium | high |
+      | Index size | many vectors | moderate | few vectors |
+      | Typical failure | "The cabinet needs a code." / "Only Dr. Raman has it." split apart | a long section still mixes topics | the right doc, buried in noise; high cost |
+
+      There is no universal best size. It depends on how long your facts are, how questions are phrased and your token
+      budget, so **measure it** on your labelled set.
+
+      ---
+
+      ## Doc-level recall lies once you chunk
+
+      Every chunk keeps its `doc_id`, even a fragment like `"needs a code. Only the medical officer, Dr. Priya Raman, and the commander have "`.
+      Recall@k only asks "did a chunk from the right doc come back?", so it stays high even when the chunk that
+      came back is useless. Measured on Helios, k=5:
+
+      | chunking | recall@5 | accuracy | context tokens |
+      | --- | --- | --- | --- |
+      | fixed 80 characters | 0.98 | **0.47** | 96 |
+      | one sentence per chunk | 0.98 | **0.89** | 81 |
+
+      Same recall, same cost, accuracy nearly doubled. When you tune chunking, also track **evidence recall** (are
+      the answer facts *inside* the retrieved chunks?) and answer accuracy, and **read the chunks** for failed questions.
+
+  - id: fixed-chunker
+    type: coding
+    title: A fixed-size chunker with overlap
+    context: |
+      `doc` is the airlock procedure (a dict with `id`, `title` and `text`). You'll write the fixed-window chunker and
+      check how overlap changes the number of chunks.
+    instructions:
+      - "Write `chunk_fixed(text, size, overlap=0)`: windows of `size` characters, each starting `size - overlap` after the previous one. Stop after the window that reaches the end of the text. Return the list of strings."
+      - "Store the chunk counts for `doc[\"text\"]` with `size=200` and overlap `0`, `50` and `100` in `counts` (a list of 3 ints) and print it."
+    hint: |
+      Use `start = 0` and `while start < len(text):`. Append `text[start:start + size]`, `break` if `start + size >= len(text)`,
+      otherwise `start += size - overlap`.
+    pre_code: |
+      import aikit
+      doc = next(d for d in aikit.helios.handbook() if d["id"] == "airlock-procedure")
+      print(len(doc["text"]), "characters")
+    sample_code: |
+      def chunk_fixed(text, size, overlap=0):
+          chunks, start = [], 0
+          while start < len(text):
+              chunks.append(____)
+              if ____:
+                  break
+              start += ____
+          return chunks
+
+      counts = [len(chunk_fixed(doc["text"], 200, o)) for o in ____]
+      print(counts)
+      print(chunk_fixed(doc["text"], 200, 50)[1])
+    solution: |
+      def chunk_fixed(text, size, overlap=0):
+          chunks, start = [], 0
+          while start < len(text):
+              chunks.append(text[start:start + size])
+              if start + size >= len(text):
+                  break
+              start += size - overlap
+          return chunks
+
+      counts = [len(chunk_fixed(doc["text"], 200, o)) for o in [0, 50, 100]]
+      print(counts)
+      print(chunk_fixed(doc["text"], 200, 50)[1])
+    tests: |
+      check_object("chunk_fixed")
+      f = user["chunk_fixed"]
+      assert f("abcdefghij", 4, 1) == ["abcd", "defg", "ghij"], f"chunk_fixed('abcdefghij', 4, 1) should be ['abcd', 'defg', 'ghij']; got {f('abcdefghij', 4, 1)}. Each window starts `size - overlap` after the previous one."
+      assert f("abcdefgh", 4) == ["abcd", "efgh"], f"With no overlap, 'abcdefgh' in windows of 4 should be ['abcd', 'efgh']; got {f('abcdefgh', 4)}. Stop once a window reaches the end."
+      assert f("abc", 10) == ["abc"], "A text shorter than `size` should give one chunk: the whole text."
+      from kits.rag_systems import chunk_fixed as ref
+      t = user["doc"]["text"]
+      for s, o in [(80, 0), (150, 30), (300, 75)]:
+          assert f(t, s, o) == ref(t, s, o), f"For size={s}, overlap={o} your chunks differ from the expected ones. Check where the loop stops."
+      check_equal("counts", msg="`counts` should hold the number of chunks for overlap 0, 50 and 100 (size 200).")
+    success_msg: |
+      Overlap 0 gives 6 chunks, 50 gives 7 and 100 gives 10. Overlap is paid for in index size: at 50% overlap you embed and
+      store almost twice as many chunks, and neighbouring chunks are near-duplicates competing for the same top-k slots.
+
+  - id: heading-chunker
+    type: coding
+    title: Split on headings
+    context: |
+      Some handbook docs are markdown with a `# ` title line and `## ` section headings. `long_docs` holds the four that
+      have sections; `docs` holds all 35.
+    instructions:
+      - "Write `chunk_headings(text)`: drop lines that start with `# ` (the document title). Start a new chunk at every line that starts with `## `, keeping that heading line in the chunk. Text before the first `## ` is a chunk of its own."
+      - "Strip whitespace from each chunk and leave out empty ones. A doc with no `## ` headings becomes one chunk."
+      - "Store the total number of chunks over all `docs` in `n_chunks` and print it."
+    hint: |
+      Loop over `text.split("\n")` with a `current` list of lines. Skip `# ` lines. On a `## ` line, if `current` has
+      lines, save `"\n".join(current).strip()` and start a new list. Append each line to `current`, and save the last one after the loop.
+    pre_code: |
+      import aikit
+      docs = aikit.helios.handbook()
+      long_docs = [d for d in docs if "\n## " in d["text"]]
+      print([d["id"] for d in long_docs])
+    sample_code: |
+      def chunk_headings(text):
+          chunks, current = [], []
+          for line in text.split("\n"):
+              if ____:
+                  continue
+              if ____ and current:
+                  chunks.append("\n".join(current).strip())
+                  current = []
+              current.append(line)
+          chunks.append("\n".join(current).strip())
+          return [c for c in chunks if c]
+
+      n_chunks = ____
+      print(n_chunks)
+      for c in chunk_headings(long_docs[0]["text"]):
+          print("---", c[:70])
+    solution: |
+      def chunk_headings(text):
+          chunks, current = [], []
+          for line in text.split("\n"):
+              if line.startswith("# "):
+                  continue
+              if line.startswith("## ") and current:
+                  chunks.append("\n".join(current).strip())
+                  current = []
+              current.append(line)
+          chunks.append("\n".join(current).strip())
+          return [c for c in chunks if c]
+
+      n_chunks = sum(len(chunk_headings(d["text"])) for d in docs)
+      print(n_chunks)
+      for c in chunk_headings(long_docs[0]["text"]):
+          print("---", c[:70])
+    tests: |
+      check_object("chunk_headings")
+      f = user["chunk_headings"]
+      from kits.rag_systems import chunk_headings as ref
+      for d in user["docs"]:
+          got, want = f(d["text"]), ref(d["text"])
+          assert got == want, f"For {d['id']} expected {len(want)} chunks starting {[w[:25] for w in want]}, got {len(got)} starting {[g[:25] for g in got]}. Drop `# ` lines, keep `## ` headings in their chunk, strip each chunk."
+      check_equal("n_chunks")
+    success_msg: |
+      The four long docs split into 5, 4, 3 and 3 chunks. Each section chunk starts with its heading, so
+      "## Depressurisation" tells both the embedder and the model what the chunk is about. The short docs with no
+      headings stay whole.
+
+  - id: recall-lies
+    type: coding
+    title: Same recall, very different answers
+    context: |
+      `index_for(chunker)` chunks every handbook doc with `chunker(text)`, embeds the chunks and returns a search
+      function. `evaluate(search, k=5)` returns `recall`, `evidence` (are the answer facts inside the retrieved
+      chunks?), `accuracy` and `context_tokens`. `chunk_fixed` and `chunk_sentences` are ready to use.
+    instructions:
+      - "Evaluate 80-character fixed chunks (`lambda t: chunk_fixed(t, 80)`) with `k=5` and store the result in `fixed80`."
+      - "Evaluate one-sentence chunks (`chunk_sentences`) with `k=5` and store it in `sentences`."
+      - "Print `recall`, `evidence`, `accuracy` and `context_tokens` for both."
+      - "Store the retrieved chunk **texts** for `\"Who can open the controlled medicines cabinet?\"` from the fixed-80 index (k=5) in `cabinet_chunks` and print them."
+    hint: |
+      `search80 = index_for(lambda t: chunk_fixed(t, 80))`, `fixed80 = evaluate(search80, k=5)`, then
+      `cabinet_chunks = [c["text"] for c in search80("Who can open the controlled medicines cabinet?", 5)]`.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import DenseIndex, make_chunks, evaluate, chunk_fixed, chunk_sentences
+      HANDBOOK = aikit.helios.handbook()
+
+      def index_for(chunker):
+          return DenseIndex(make_chunks(HANDBOOK, chunker, title=False)).search
+    sample_code: |
+      search80 = index_for(____)
+      search_sent = index_for(____)
+      fixed80 = evaluate(search80, k=5)
+      sentences = ____
+
+      for name, r in [("fixed 80", fixed80), ("sentences", sentences)]:
+          print(name, r["recall"], r["evidence"], r["accuracy"], r["context_tokens"])
+
+      cabinet_chunks = ____
+      for t in cabinet_chunks:
+          print(repr(t))
+    solution: |
+      search80 = index_for(lambda t: chunk_fixed(t, 80))
+      search_sent = index_for(chunk_sentences)
+      fixed80 = evaluate(search80, k=5)
+      sentences = evaluate(search_sent, k=5)
+
+      for name, r in [("fixed 80", fixed80), ("sentences", sentences)]:
+          print(name, r["recall"], r["evidence"], r["accuracy"], r["context_tokens"])
+
+      cabinet_chunks = [c["text"] for c in search80("Who can open the controlled medicines cabinet?", 5)]
+      for t in cabinet_chunks:
+          print(repr(t))
+    tests: |
+      for name in ["fixed80", "sentences"]:
+          r = check_object(name)
+          assert isinstance(r, dict) and "accuracy" in r, f"`{name}` should be the dict returned by `evaluate(..., k=5)`."
+      assert user["fixed80"]["accuracy"] == sol["fixed80"]["accuracy"], "`fixed80` should evaluate `lambda t: chunk_fixed(t, 80)` with k=5."
+      assert user["sentences"]["accuracy"] == sol["sentences"]["accuracy"], "`sentences` should evaluate `chunk_sentences` with k=5."
+      check_equal("cabinet_chunks", msg="`cabinet_chunks` should be the 5 chunk texts the fixed-80 index returns for the cabinet question, best first.")
+    success_msg: |
+      Both have recall 0.98, but accuracy is 0.47 against 0.89. Look at the cabinet chunks: the answer is cut into
+      "...and the commander have " and "it." in different chunks. Recall counted it as a hit because both pieces come
+      from med-bay-access. Evidence recall (0.80 against 0.98) and accuracy expose it.
+
+  - id: size-symptoms
+    type: classify
+    title: Too small or too large?
+    prompt: Each symptom comes from a RAG system whose chunks are the wrong size. Sort them by the likely cause.
+    hint: Small chunks lose context around a fact. Large chunks bring in too much around it.
+    zones: [Chunks too small, Chunks too large]
+    items:
+      - { text: "The retrieved chunk ends mid-sentence, just before the number the crew asked for", zone: Chunks too small }
+      - { text: "\"Only Dr. Raman has it\" is retrieved without the sentence saying what \"it\" is", zone: Chunks too small }
+      - { text: "Recall@5 is high, but the five chunks together still don't contain the answer", zone: Chunks too small }
+      - { text: "Context tokens per question tripled after re-indexing, and accuracy didn't move", zone: Chunks too large }
+      - { text: "A query for panel F-1 retrieves a 2,000-word manual where F-1 appears once", zone: Chunks too large }
+      - { text: "The right document comes back, but the model quotes a sentence about a different procedure in it", zone: Chunks too large }
+      - { text: "Every question about the airlock retrieves the same single long chunk, whatever the sub-topic", zone: Chunks too large }

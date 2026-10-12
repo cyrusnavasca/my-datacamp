@@ -1,0 +1,247 @@
+title: Metadata, titles and filters
+description: Give every chunk its context (source, title, section, date, status), use titles as contextual headers, and filter out superseded procedures before ranking.
+exercises:
+  - id: metadata-slides
+    type: video
+    title: A chunk is more than its text
+    slides: |
+      # A chunk is text plus metadata
+
+      ```python
+      {"id": "incident-2025-hydro-flood#2",
+       "doc_id": "incident-2025-hydro-flood",
+       "title": "Incident report: hydroponics flood, 2025",
+       "section": "incidents",
+       "updated": "2025-09-10",
+       "status": "current",
+       "text": "Incident report: hydroponics flood, 2025: Cause: mineral build-up in the valve."}
+      ```
+
+      Metadata costs a few bytes per chunk and enables:
+
+      - **Citations** and debugging: which doc, which version.
+      - **Filters**: only current procedures, only the incidents section, only docs this user may see.
+      - **Freshness**: prefer or require recent versions.
+      - **Small-to-big retrieval**: retrieve a small chunk, then send its parent section (via a `parent_id`), so you get precise matching *and* complete context.
+
+      ---
+
+      ## Contextual headers: put the title in the chunk
+
+      The 2025 flood report, split into sentences:
+
+      ```text
+      "On 2025-09-03 the outlet valve of root zone pump P-2 stuck open ..."
+      "Cause: mineral build-up in the valve."          <- the answer
+      ```
+
+      Ask *"What caused the 2025 hydroponics flood?"*. The answer chunk never says "hydroponics" or "flood". Only the
+      document **title** does. The chunk matches "caused" and nothing else, so the model can't tell it's the right one,
+      and ORBIT says it doesn't know.
+
+      Fix: prefix each chunk's text with its title (and section heading, if it has one) **before embedding and before
+      prompting**: `"Incident report: hydroponics flood, 2025: Cause: mineral build-up in the valve."`
+
+      | header | index-time cost | helps when |
+      | --- | --- | --- |
+      | doc title | a few tokens per chunk | chunks rely on the title for their topic |
+      | title + section path | a few more tokens | long docs with nested sections |
+      | LLM-written summary of the chunk in context | one LLM call per chunk, at index time | pronouns and implicit references ("it", "the valve") |
+
+      ---
+
+      ## Stale versions: the 2024 airlock procedure
+
+      The handbook keeps the replaced 2024 procedure "for the record": **5-minute** leak-check hold. The current one says
+      **8 minutes**. Both match "How long is the leak-check hold?", and the old one ranks *higher* (it's shorter, so
+      the airlock words carry more of its vector). ORBIT answers "5 minutes", or both. On an airlock, that's a
+      safety bug. Titles don't help here; the 2024 title still matches.
+
+      | option | quality | cost / complexity | failure mode |
+      | --- | --- | --- | --- |
+      | delete old versions from the index | correct by default | trivial | the history is gone; "what did the 2024 version say?" fails |
+      | `status` metadata + filter at query time | correct by default, history still queryable | small: tag at ingest, filter per query | someone forgets to tag a new replacement |
+      | recency boost in ranking | usually correct | tuning a weight | an old doc with a very strong match still wins |
+      | put dates in the prompt, let the model choose | sometimes correct | none | the model mixes versions; hard to test |
+
+      ---
+
+      ## Pre-filter, don't post-filter
+
+      ```python
+      def search(query, k=5, where=None):
+          where = where or {}
+          keep = [i for i, c in enumerate(chunks) if all(c.get(f) == v for f, v in where.items())]  # 1. filter
+          scores = vectors[keep] @ aikit.embed(query)                                               # 2. rank survivors
+          return [chunks[keep[j]] for j in np.argsort(-scores)[:k]]
+      ```
+
+      - **Pre-filter** (above): rank only the chunks that pass, so you always get k results if k exist. Vector databases expose this as a metadata `filter` / `where` argument.
+      - **Post-filter**: take the top k, then drop the ones that fail. If 4 of the top 5 are superseded, you're left with 1 chunk, or 0.
+
+      Post-filtering is only safe if you over-fetch (e.g. top 50, then filter, then keep 5).
+
+  - id: title-headers
+    type: coding
+    title: Contextual headers fix the flood question
+    context: |
+      `docs` is the handbook. `split_sentences(text)` returns a doc's sentences. `search_over(chunks)` embeds a list of chunk
+      dicts (each needs `doc_id` and `text`) and returns a `search(query, k)` function. `ask(question, chunks)` sends
+      chunks to the grounded FakeClaude and returns its answer. `FLOOD` is the flood question.
+    instructions:
+      - "Write `sentence_chunks(docs, with_title)`: one chunk dict per sentence with keys `doc_id`, `title`, `section`, `updated` and `text`. When `with_title` is True, `text` is `f\"{title}: {sentence}\"`; otherwise it's just the sentence."
+      - "For both settings, build the chunks, search for `FLOOD` with `k=5`, and ask. Store the answers in `plain_answer` and `titled_answer`."
+      - Print both answers.
+    hint: |
+      Loop over docs, then over `split_sentences(d["text"])`. Build
+      `{"doc_id": d["id"], "title": d["title"], "section": d["section"], "updated": d["updated"], "text": text}`.
+      Then `search = search_over(chunks)` and `ask(FLOOD, search(FLOOD, 5))`.
+    pre_code: |
+      import aikit
+      from kits.rag_systems import split_sentences, DenseIndex, make_client, generate
+      docs = aikit.helios.handbook()
+      client = make_client()
+      FLOOD = "What caused the 2025 hydroponics flood?"
+
+      def search_over(chunks):
+          return DenseIndex(chunks).search
+
+      def ask(question, chunks):
+          return generate(client, question, chunks)
+    sample_code: |
+      def sentence_chunks(docs, with_title):
+          chunks = []
+          for d in docs:
+              for s in split_sentences(d["text"]):
+                  text = ____ if with_title else s
+                  chunks.append({"doc_id": d["id"], "title": d["title"], "section": d["section"],
+                                 "updated": d["updated"], "text": text})
+          return chunks
+
+      plain_search = search_over(sentence_chunks(docs, ____))
+      titled_search = search_over(sentence_chunks(docs, ____))
+      plain_answer = ask(FLOOD, ____)
+      titled_answer = ask(FLOOD, ____)
+      print("without titles:", plain_answer)
+      print("with titles:   ", titled_answer)
+    solution: |
+      def sentence_chunks(docs, with_title):
+          chunks = []
+          for d in docs:
+              for s in split_sentences(d["text"]):
+                  text = f"{d['title']}: {s}" if with_title else s
+                  chunks.append({"doc_id": d["id"], "title": d["title"], "section": d["section"],
+                                 "updated": d["updated"], "text": text})
+          return chunks
+
+      plain_search = search_over(sentence_chunks(docs, False))
+      titled_search = search_over(sentence_chunks(docs, True))
+      plain_answer = ask(FLOOD, plain_search(FLOOD, 5))
+      titled_answer = ask(FLOOD, titled_search(FLOOD, 5))
+      print("without titles:", plain_answer)
+      print("with titles:   ", titled_answer)
+    tests: |
+      check_object("sentence_chunks")
+      ch = user["sentence_chunks"](user["docs"][:3], True)
+      assert all({"doc_id", "title", "section", "updated", "text"} <= set(c) for c in ch), "Every chunk dict needs the keys doc_id, title, section, updated and text."
+      d0 = user["docs"][0]
+      assert ch[0]["text"].startswith(d0["title"] + ": "), f"With titles, text should start with the doc title and ': '; got {ch[0]['text'][:60]!r}."
+      assert not user["sentence_chunks"](user["docs"][:1], False)[0]["text"].startswith(d0["title"]), "Without titles, text should be the plain sentence."
+      assert "don't know" in user["plain_answer"], f"Without titles ORBIT should fail to answer; got {user['plain_answer']!r}. Use `sentence_chunks(docs, False)` for the plain search."
+      assert "mineral build-up" in user["titled_answer"], f"With titles ORBIT should find the cause; got {user['titled_answer']!r}. Prefix each sentence with f\"{{title}}: \" and search the titled chunks."
+    success_msg: |
+      A few tokens of title per chunk turned "I don't know" into "mineral build-up in the valve". Over all 45 questions,
+      titles raise this setup's accuracy from 0.89 to 0.91. The header is in the text the model reads, too, so its
+      answer now says which incident it's about.
+
+  - id: filter-superseded
+    type: coding
+    title: Filter out superseded procedures
+    context: |
+      `chunks` are titled sentence chunks of the whole handbook (with `doc_id`, `title`, `section`, `updated`, `text`) and
+      `vectors` their embeddings, row for row. The 2024 airlock doc is still indexed, and its text contains
+      `SUPERSEDED`. `ask(question, chunks)` returns ORBIT's answer and `LEAK` is the leak-check question.
+    instructions:
+      - "Give every chunk a `status`: `\"superseded\"` if its **document's** text contains `\"SUPERSEDED\"`, else `\"current\"`. (`superseded_ids` holds the ids of such documents.)"
+      - "Write `search(query, k=5, where=None)` that **pre-filters**: keep only chunks whose metadata matches every key/value in `where`, score those with `vectors`, and return the top `k` chunk dicts."
+      - "Store `ask(LEAK, search(LEAK, 5))` in `unfiltered` and `ask(LEAK, search(LEAK, 5, where={\"status\": \"current\"}))` in `filtered`. Print both."
+    hint: |
+      `for c in chunks: c["status"] = "superseded" if c["doc_id"] in superseded_ids else "current"`. In `search`, build
+      `keep = [i for i, c in enumerate(chunks) if all(c.get(f) == v for f, v in where.items())]`, then
+      `scores = vectors[keep] @ aikit.embed(query)` and map positions back with `chunks[keep[j]]`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.rag_systems import make_chunks, chunk_sentences, make_client, generate
+      handbook = aikit.helios.handbook()
+      chunks = make_chunks(handbook, chunk_sentences, title=True)
+      vectors = aikit.embed([c["text"] for c in chunks])
+      superseded_ids = {d["id"] for d in handbook if "SUPERSEDED" in d["text"]}
+      client = make_client()
+      LEAK = "How long is the leak-check hold when depressurising AL-1?"
+
+      def ask(question, chunks):
+          return generate(client, question, chunks)
+    sample_code: |
+      for c in chunks:
+          c["status"] = ____
+
+      def search(query, k=5, where=None):
+          where = where or {}
+          keep = [i for i, c in enumerate(chunks) if ____]
+          scores = ____
+          return [chunks[keep[j]] for j in np.argsort(-scores)[:k]]
+
+      unfiltered = ask(LEAK, search(LEAK, 5))
+      filtered = ask(LEAK, ____)
+      print("unfiltered:", unfiltered)
+      print("filtered:  ", filtered)
+    solution: |
+      for c in chunks:
+          c["status"] = "superseded" if c["doc_id"] in superseded_ids else "current"
+
+      def search(query, k=5, where=None):
+          where = where or {}
+          keep = [i for i, c in enumerate(chunks) if all(c.get(f) == v for f, v in where.items())]
+          scores = vectors[keep] @ aikit.embed(query)
+          return [chunks[keep[j]] for j in np.argsort(-scores)[:k]]
+
+      unfiltered = ask(LEAK, search(LEAK, 5))
+      filtered = ask(LEAK, search(LEAK, 5, where={"status": "current"}))
+      print("unfiltered:", unfiltered)
+      print("filtered:  ", filtered)
+    tests: |
+      cs = user["chunks"]
+      assert all(c.get("status") in ("current", "superseded") for c in cs), "Every chunk needs a `status` of 'current' or 'superseded'."
+      n_sup = sum(c["status"] == "superseded" for c in cs)
+      want = sum(c["doc_id"] in user["superseded_ids"] for c in cs)
+      assert n_sup == want, f"{want} chunks come from superseded docs, but {n_sup} are tagged 'superseded'. Tag by the chunk's document (`doc_id in superseded_ids`), not by its own sentence."
+      f = check_object("search")
+      res = f("incident report", 4, where={"section": "incidents"})
+      assert len(res) == 4 and all(c["section"] == "incidents" for c in res), "`search(..., where={'section': 'incidents'})` should return k chunks, all from that section. Filter *before* ranking."
+      assert len(f("airlock", 5, where={"status": "superseded"})) == 5, "Pre-filtering should still return k chunks when enough match."
+      assert len(f("airlock", 3)) == 3, "With no `where`, search the whole index."
+      assert "5 minutes" in user["unfiltered"], f"Unfiltered, ORBIT should quote the stale 5-minute hold; got {user['unfiltered']!r}."
+      assert "8 minutes" in user["filtered"] and "5 minutes" not in user["filtered"], f"Filtered to current docs, ORBIT should say 8 minutes only; got {user['filtered']!r}."
+    success_msg: |
+      Unfiltered, ORBIT read out both holds, 8 and 5 minutes, and left the crew to guess. With a `status` filter it gives
+      only the current procedure, and the 2024 doc is still in the index for anyone who explicitly asks for it.
+
+  - id: version-strategy
+    type: mc
+    title: Choose a versioning strategy
+    question: |
+      Safety rules require that ORBIT **never** quotes a superseded procedure in a normal answer. The station auditor
+      also asks ORBIT about old versions a few times a month ("what was the 2024 leak-check hold?"). New procedure
+      versions arrive every couple of weeks. Which strategy fits?
+    options:
+      - text: Delete superseded documents from the index when a new version arrives.
+        feedback: That meets the safety rule but breaks the auditor's questions. The old procedures are gone from search.
+      - text: Tag each chunk with a `status` and pre-filter to `current` by default; let audit queries opt in to `superseded`.
+        correct: true
+        feedback: "Right. It's correct by default, keeps history queryable, and costs one metadata field plus a filter. Pair it with an ingest check so a new version can't be added without marking the old one superseded, because that's the step people forget."
+      - text: Add a recency boost so newer chunks rank higher.
+        feedback: A boost makes stale answers rarer, not impossible. A strongly matching old chunk can still outrank the new one, and "never" requires a hard filter.
+      - text: Put each document's date in the prompt and tell the model to prefer the newest.
+        feedback: You'd be trusting the model to resolve conflicts it often blends ("5 or 8 minutes"), and you can't prove it never fails. Keep safety rules out of the prompt and in code.
+    hint: '"Never" calls for a hard rule in code, and the audit use case needs the old documents to stay searchable.'

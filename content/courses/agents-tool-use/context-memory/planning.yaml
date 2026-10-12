@@ -1,0 +1,348 @@
+title: Plans, to-do lists and replanning
+description: Split long tasks into an explicit plan, execute it with a to-do list, replan when a step fails, and keep long runs inside the context budget.
+exercises:
+  - id: planning-slides
+    type: video
+    title: Plan, execute, replan
+    slides: |
+      # Long tasks drift
+
+      *"Morning rounds: check the last 6 hours of humidity and CO2 in every module, then message the commander."*
+
+      That's 12 readings, a judgement and a message. Left to choose one step at a time, a model can lose track of which
+      modules it has done, re-read some, skip others, or forget the message at the end. Each step only sees the
+      context, and the context is filling up with readings.
+
+      The fix is to make the plan **explicit**: a list you can see, check off, and repair.
+
+      ---
+
+      ## Three ways to structure a multi-step task
+
+      | pattern | how it works | model calls | flexibility | failure mode |
+      | --- | --- | --- | --- | --- |
+      | **interleaved** (ReAct-style) | the model picks each next step from the results so far | one per step | highest | drifts on long tasks; context grows |
+      | **plan-then-execute** | one call writes the plan; your code runs the steps | plan + final | low: the plan is fixed | breaks on the first failed step |
+      | **plan, execute, replan** | as above, but a failed step goes back to the planner with its error | plan + replans + final | medium | replan loops if not capped |
+
+      Plan-then-execute is cheaper and easier to debug: the steps are data you can log, check and approve **before**
+      anything runs. Interleaving wins when each step really depends on the last result.
+
+      ---
+
+      ## The to-do list is state
+
+      ```python
+      plan = json.loads(planner_reply)          # [{"tool": ..., "input": ...}, ...]
+      todo = [{**step, "status": "pending"} for step in plan]
+
+      i = 0
+      while i < len(todo):
+          item = todo[i]
+          try:
+              item["result"] = station.run_tool(item["tool"], item["input"])
+              item["status"] = "done"
+          except ToolError as e:
+              item["status"] = "failed"
+              todo[i + 1:i + 1] = replan(item, e)     # replacement steps run next
+          i += 1
+      ```
+
+      In an interleaved agent, keep the to-do list in the context (a short message near the end) and update it every
+      step. It's the cheapest way to keep the goal in view after old tool results have been cleared.
+
+      ---
+
+      ## Replanning
+
+      ```python
+      def replan(item, error):
+          msg = f"This step failed: {json.dumps(step_of(item))} Error: {error}. Reply with replacement steps as a JSON list."
+          return [{**s, "status": "pending"} for s in json.loads(ask_planner(msg))]
+      ```
+
+      - Send the **failed step and the error**, not the whole history. The error is what makes a better plan possible
+        ("bookings last 1 to 4 hours" → two bookings).
+      - **Cap replans** (say 2 per step), and accept `[]` as "can't be done": report it instead of looping.
+      - Steps that already ran stay done. Never replay side effects (a booking, a message) during a replan.
+
+      ---
+
+      ## Playbook: long tasks that go wrong
+
+      | symptom | check | usual cause | fix |
+      | --- | --- | --- | --- |
+      | some sub-goals silently skipped | is there an explicit plan? | interleaved agent drifted | plan first, check items off |
+      | `prompt is too long` midway | tokens per message | results piling up | digests, clearing old results (lesson 1) |
+      | gives up at the first failure | what happens after an error | plan-then-execute without replan | replan with the error |
+      | replans forever | replans per step | no cap, planner repeats the same step | cap replans; detect identical replacements |
+      | side effects happen twice | step statuses | re-running the whole plan after a failure | resume from the failed step |
+
+  - id: eva-plan
+    type: order
+    title: Plan the EVA
+    prompt: |
+      The commander asks ORBIT to "prepare an EVA for Tuesday". Put ORBIT's plan in an order where every step only
+      depends on steps before it.
+    hint: You can't book before the EVA is approved, or tell the spacewalkers a slot you haven't booked. The suit check is the evening before, the prebreathe on the day, and depressurising comes last.
+    items:
+      - Get the commander's approval for an EVA on Tuesday
+      - Book airlock module F for Tuesday morning
+      - Message both spacewalkers their booked slot
+      - "Monday evening: suit check (battery above 95%, CO2 cartridge, cooling, comms)"
+      - "Tuesday: 2-hour oxygen prebreathe"
+      - Commander approves the airlock cycle (logged)
+      - Depressurise AL-1, with the 8-minute leak check at 0.7 bar
+
+  - id: replan-on-failure
+    type: coding
+    title: Execute a plan, and replan when a step fails
+    context: |
+      Noor needs Module B for six hours, but bookings last at most 4. `planner` writes plans as JSON lists of
+      `{"tool", "input"}` steps; `ask_planner(text)` sends it one message and returns its text. When told
+      `"This step failed: <step JSON> Error: <error>. Reply with replacement steps as a JSON list."` it returns
+      replacement steps, or `[]` if it can't help.
+    instructions:
+      - "Get the plan with `ask_planner(\"Make a plan as a JSON list of steps. Task: \" + task)`, parse it, and build `todo`: each step plus `\"status\": \"pending\"`."
+      - "Run the items in order with `station.run_tool`. On success set `status` to `\"done\"`. On `ToolError`, set it to `\"failed\"`, ask the planner for replacements, and insert them (status pending) right after the failed item. Count replans in `replans`."
+      - "Stop asking for replacements after `MAX_REPLANS`. Print each item's tool, input hours (if any) and status."
+    hint: |
+      Use `while i < len(todo)` so inserted items get run. The step to send back is
+      `{"tool": item["tool"], "input": item["input"]}`; insert with `todo[i + 1:i + 1] = new_items`.
+    pre_code: |
+      import json
+      from kits.agents_tool_use import HeliosStation, FakeClaude, VirtualClock, planner_model, ToolError, MODEL
+      station = HeliosStation()
+      planner = FakeClaude(planner_model(), clock=VirtualClock())
+      MAX_REPLANS = 2
+      task = "Book the lab for Noor Haddad on 2026-10-08 from 09:00 to 15:00 and tell her when it is done."
+
+      def ask_planner(text):
+          r = planner.messages.create(model=MODEL, max_tokens=1000, messages=[{"role": "user", "content": text}])
+          return r.content[0].text
+    sample_code: |
+      plan = json.loads(ask_planner("Make a plan as a JSON list of steps. Task: " + task))
+      todo = [____ for step in plan]
+      replans = 0
+
+      i = 0
+      while i < len(todo):
+          item = todo[i]
+          try:
+              station.run_tool(item["tool"], item["input"])
+              item["status"] = ____
+          except ToolError as e:
+              item["status"] = ____
+              if replans < MAX_REPLANS:
+                  replans += 1
+                  step = {"tool": item["tool"], "input": item["input"]}
+                  reply = ask_planner(f"This step failed: {json.dumps(step)} Error: {e}. Reply with replacement steps as a JSON list.")
+                  new_items = ____
+                  todo[i + 1:i + 1] = new_items
+          i += 1
+
+      for item in todo:
+          print(item["tool"], item["input"].get("hours"), item["status"])
+      print(station.bookings)
+    solution: |
+      plan = json.loads(ask_planner("Make a plan as a JSON list of steps. Task: " + task))
+      todo = [{**step, "status": "pending"} for step in plan]
+      replans = 0
+
+      i = 0
+      while i < len(todo):
+          item = todo[i]
+          try:
+              station.run_tool(item["tool"], item["input"])
+              item["status"] = "done"
+          except ToolError as e:
+              item["status"] = "failed"
+              if replans < MAX_REPLANS:
+                  replans += 1
+                  step = {"tool": item["tool"], "input": item["input"]}
+                  reply = ask_planner(f"This step failed: {json.dumps(step)} Error: {e}. Reply with replacement steps as a JSON list.")
+                  new_items = [{**s, "status": "pending"} for s in json.loads(reply)]
+                  todo[i + 1:i + 1] = new_items
+          i += 1
+
+      for item in todo:
+          print(item["tool"], item["input"].get("hours"), item["status"])
+      print(station.bookings)
+    tests: |
+      todo = check_object("todo")
+      seq = [(t["tool"], t["input"].get("hours"), t["status"]) for t in todo]
+      want = [("book_module", 6, "failed"), ("book_module", 4, "done"), ("book_module", 2, "done"), ("send_message", None, "done")]
+      assert seq == want, f"Expected the to-do list {want}, got {seq}. The replacement bookings should be inserted right after the failed one, before the message."
+      b = user["station"].bookings
+      assert [(x["start"][-5:], x["hours"]) for x in b] == [("09:00", 4), ("13:00", 2)], f"Noor should have two bookings, 09:00 for 4 hours and 13:00 for 2; the station has {b}."
+      assert len(user["station"].outbox) == 1, "Noor should get exactly one message, after the bookings."
+      check_equal("replans", 1, msg="There should be exactly one replan.")
+    success_msg: |
+      The plan failed on its first step and recovered with one replan, because the error said why. The message went out
+      after both bookings, since the replacements ran in the failed step's place, not at the end.
+
+  - id: morning-rounds
+    type: sequential
+    title: "Mission: morning rounds"
+    context: |
+      The commander wants ORBIT to do the morning rounds unattended: `ROUNDS_TASK`. Run as a plain agent, it reads two 6-hour
+      histories per step (about 10,000 tokens each) against a 12,000-token window. And the CO2 history logger in docking
+      (F) is offline today, though its live sensor works. Rebuild it as plan, execute and report, keeping every request
+      small, then leave a note for the afternoon shift.
+    pre_code: |
+      import json, os, tempfile
+      from kits.agents_tool_use import (HeliosStation, ContextLimitClaude, FakeClaude, VirtualClock, rounds_agent,
+                                        planner_model, rounds_writer, run_agent, limit_for, ToolError,
+                                        ROUNDS_TASK, MODEL, count_tokens)
+      station = HeliosStation(history_offline=[("F", "co2")])
+      TOOLS = station.tools
+      agent = ContextLimitClaude(rounds_agent(), max_context=12_000, clock=VirtualClock())
+      planner = FakeClaude(planner_model(), clock=VirtualClock())
+      writer = ContextLimitClaude(rounds_writer(), max_context=12_000, clock=VirtualClock())
+      NOTES_PATH = os.path.join(tempfile.mkdtemp(), "shift_notes.json")
+
+      def ask(client, text):
+          r = client.messages.create(model=MODEL, max_tokens=1000, messages=[{"role": "user", "content": text}])
+          return r.content[0].text
+    steps:
+      - instructions:
+          - "Symptom: run `run_agent(agent, ROUNDS_TASK, TOOLS, station.run_tool)` inside `try`/`except Exception as e`. Store `str(e)` in `naive_error` and `agent.peak_input` in `naive_peak`."
+        hint: "The run fails on its second model call. `agent.peak_input` records the size of the request that was rejected."
+        sample_code: |
+          try:
+              run_agent(agent, ROUNDS_TASK, TOOLS, station.run_tool)
+              naive_error = None
+          except Exception as e:
+              naive_error = ____
+          naive_peak = ____
+          print(naive_error)
+          print(naive_peak)
+        solution: |
+          try:
+              run_agent(agent, ROUNDS_TASK, TOOLS, station.run_tool)
+              naive_error = None
+          except Exception as e:
+              naive_error = str(e)
+          naive_peak = agent.peak_input
+          print(naive_error)
+          print(naive_peak)
+        tests: |
+          e = check_object("naive_error")
+          assert isinstance(e, str) and "too long" in e, f"The plain agent should fail with 'prompt is too long'; got {e!r}."
+          check_equal("naive_peak", msg="`naive_peak` is `agent.peak_input` after the failed run.")
+      - instructions:
+          - "Plan: ask the `planner` for `\"Make a plan as a JSON list of steps. Task: \" + ROUNDS_TASK` and build `todo` (each step plus `\"status\": \"pending\"`)."
+          - "Write `digest(text, threshold)` that returns a **dict** with `module`, `metric`, `max`, `first_above` and `last_above` (as in lesson 1)."
+          - "Execute: for each item, run the tool. A `sensor_history` result goes into `findings` as `digest(text, limit_for(module, metric))`; a `get_sensor` result as `json.loads(text)`. On `ToolError`, mark the item failed, ask the planner for replacements (same message format as before) and insert them after it."
+        hint: |
+          Reuse your replanning loop. `limit_for(module, metric)` gives the out-of-range limit (75 for hydroponics humidity,
+          65 for other modules' humidity, 0.4 for CO2). Digest: `above = [r["t"] for r in d["readings"] if r["v"] > threshold]`.
+        sample_code: |
+          plan = json.loads(ask(planner, "Make a plan as a JSON list of steps. Task: " + ROUNDS_TASK))
+          todo = [{**s, "status": "pending"} for s in plan]
+
+          def digest(text, threshold):
+              d = json.loads(text)
+              above = ____
+              return {"module": d["module"], "metric": d["metric"], "max": max(r["v"] for r in d["readings"]),
+                      "first_above": above[0] if above else None, "last_above": above[-1] if above else None}
+
+          findings = []
+          i = 0
+          while i < len(todo):
+              item = todo[i]
+              try:
+                  text = station.run_tool(item["tool"], item["input"])
+                  if item["tool"] == "sensor_history":
+                      findings.append(____)
+                  else:
+                      findings.append(json.loads(text))
+                  item["status"] = "done"
+              except ToolError as e:
+                  item["status"] = "failed"
+                  step = {"tool": item["tool"], "input": item["input"]}
+                  reply = ask(planner, f"This step failed: {json.dumps(step)} Error: {e}. Reply with replacement steps as a JSON list.")
+                  todo[i + 1:i + 1] = ____
+              i += 1
+
+          print([(t["tool"], t["input"]["module"], t["input"]["metric"], t["status"]) for t in todo if t["status"] != "done"])
+          print(len(findings), "findings,", count_tokens(json.dumps(findings)), "tokens")
+        solution: |
+          plan = json.loads(ask(planner, "Make a plan as a JSON list of steps. Task: " + ROUNDS_TASK))
+          todo = [{**s, "status": "pending"} for s in plan]
+
+          def digest(text, threshold):
+              d = json.loads(text)
+              above = [r["t"] for r in d["readings"] if r["v"] > threshold]
+              return {"module": d["module"], "metric": d["metric"], "max": max(r["v"] for r in d["readings"]),
+                      "first_above": above[0] if above else None, "last_above": above[-1] if above else None}
+
+          findings = []
+          i = 0
+          while i < len(todo):
+              item = todo[i]
+              try:
+                  text = station.run_tool(item["tool"], item["input"])
+                  if item["tool"] == "sensor_history":
+                      findings.append(digest(text, limit_for(item["input"]["module"], item["input"]["metric"])))
+                  else:
+                      findings.append(json.loads(text))
+                  item["status"] = "done"
+              except ToolError as e:
+                  item["status"] = "failed"
+                  step = {"tool": item["tool"], "input": item["input"]}
+                  reply = ask(planner, f"This step failed: {json.dumps(step)} Error: {e}. Reply with replacement steps as a JSON list.")
+                  todo[i + 1:i + 1] = [{**s, "status": "pending"} for s in json.loads(reply)]
+              i += 1
+
+          print([(t["tool"], t["input"]["module"], t["input"]["metric"], t["status"]) for t in todo if t["status"] != "done"])
+          print(len(findings), "findings,", count_tokens(json.dumps(findings)), "tokens")
+        tests: |
+          todo = check_object("todo")
+          assert len(todo) == 13, f"The plan has 12 history reads; one fails and is replaced by a live read, so `todo` should end with 13 items. It has {len(todo)}."
+          failed = [(t["tool"], t["input"]["module"], t["input"]["metric"]) for t in todo if t["status"] == "failed"]
+          assert failed == [("sensor_history", "F", "co2")], f"Exactly one item should fail (the F CO2 history); failed: {failed}."
+          assert all(t["status"] == "done" for t in todo if t["status"] != "failed"), "Every other item, including the replacement, should end as done."
+          f = check_object("findings")
+          assert len(f) == 12, f"Expect 12 findings (11 digests and 1 live reading); got {len(f)}."
+          c = next((x for x in f if x.get("module") == "C" and x.get("metric") == "humidity"), {})
+          assert c.get("first_above") == "10-06 03:10" and c.get("last_above") == "10-06 04:40", f"The hydroponics humidity digest should show the 03:10-04:40 excursion above 75%; got {c}."
+          from kits.agents_tool_use import count_tokens as _ct
+          import json as _j
+          n = _ct(_j.dumps(f))
+          assert n < 2000, f"All findings together should be under 2,000 tokens (digests, not raw readings); they are {n}."
+      - instructions:
+          - "Report: send the findings to `writer` with `ask(writer, \"Write the morning summary from these findings: \" + json.dumps(findings))` and store the reply in `summary`."
+          - "Message the commander (`Amara Okafor`) the summary with `station.run_tool(\"send_message\", ...)`."
+          - "Save `{\"date\": \"10-06\", \"summary\": summary}` as a JSON list in `NOTES_PATH` for the afternoon shift. Store `writer.peak_input` in `report_peak`."
+        hint: '`station.run_tool("send_message", {"to": "Amara Okafor", "text": summary})`, then `json.dump([{"date": "10-06", "summary": summary}], open(NOTES_PATH, "w"))`.'
+        sample_code: |
+          summary = ____
+          station.run_tool("send_message", ____)
+          with open(NOTES_PATH, "w") as f:
+              json.dump(____, f)
+          report_peak = writer.peak_input
+          print(summary)
+          print(f"largest request: naive {naive_peak} tokens -> report {report_peak} tokens")
+        solution: |
+          summary = ask(writer, "Write the morning summary from these findings: " + json.dumps(findings))
+          station.run_tool("send_message", {"to": "Amara Okafor", "text": summary})
+          with open(NOTES_PATH, "w") as f:
+              json.dump([{"date": "10-06", "summary": summary}], f)
+          report_peak = writer.peak_input
+          print(summary)
+          print(f"largest request: naive {naive_peak} tokens -> report {report_peak} tokens")
+        tests: |
+          import json as _j
+          s = check_object("summary")
+          assert "C humidity" in s and "E co2" in s, f"The summary should flag hydroponics (C) humidity and engineering (E) CO2; got {s!r}."
+          assert "F co2" in s, "The summary should mention that the F CO2 history was unavailable (from the live reading finding)."
+          out = user["station"].outbox
+          assert out and out[-1]["to"] == "Amara Okafor" and out[-1]["text"] == s, "Send the summary itself to Amara Okafor with send_message."
+          notes = _j.load(open(user["NOTES_PATH"]))
+          assert isinstance(notes, list) and notes and notes[0].get("summary") == s, "NOTES_PATH should hold a JSON list with one {'date', 'summary'} entry."
+          assert user["report_peak"] < 2000, f"The report request should be small (under 2,000 tokens); it was {user['report_peak']}."
+    success_msg: |
+      From a run that died on its second call to a complete report built from about a thousand tokens of evidence. Each
+      piece did one job: the plan made the 12 checks explicit, the digests kept every request small, the replan routed
+      around the dead logger, and the note carries the result to the next shift.

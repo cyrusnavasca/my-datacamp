@@ -1,0 +1,239 @@
+title: Conversations are lists you resend
+description: The API has no memory. You keep the conversation, you resend it every turn, and you pay for it every turn.
+exercises:
+  - id: multi-turn-slides
+    type: video
+    title: Where a conversation lives
+    slides: |
+      # The model has no memory
+
+      Each `messages.create` call is independent. If ORBIT "remembers" your name, that's because **your code**
+      sent the earlier turns again in `messages`.
+
+      ```python
+      history = []
+
+      def chat(text):
+          history.append({"role": "user", "content": text})
+          response = client.messages.create(
+              model="claude-sonnet-5-5", max_tokens=300,
+              system=SYSTEM, messages=history,
+          )
+          history.append({"role": "assistant", "content": response.content})
+          return response.content[0].text
+      ```
+
+      Rules for `messages`: start with `user`, alternate `user` and `assistant`, and end with the turn the model
+      should answer. You can append `response.content` (the blocks) or just its text.
+
+      ---
+
+      ## What the model sees on turn 3
+
+      ```text
+      [system]    You are ORBIT ...
+      [user]      Hi, my name is Lucía.
+      [assistant] Nice to meet you, Lucía. ...
+      [user]      How long do spacewalkers prebreathe?
+      [assistant] Spacewalkers prebreathe 100% oxygen for 2 hours ...
+      [user]      What is my name?
+      [assistant] ▌
+      ```
+
+      The name is in the context, so the model can answer. Drop turn 1 from the list and the answer is gone.
+      This also means you can **edit history**: remove a failed turn, fix a typo, or replace old turns with a summary
+      (chapter 4).
+
+      ---
+
+      ## Memory has a price
+
+      Turn $n$ resends every earlier turn. If each exchange adds about $t$ tokens, request $n$ has about $n \cdot t$ input
+      tokens, and a whole conversation of $N$ turns costs about
+
+      $$\sum_{n=1}^{N} n \cdot t = t \cdot \frac{N(N+1)}{2}$$
+
+      Input tokens grow **quadratically** with conversation length. A 10-turn chat costs about 5.5 times as much as
+      10 separate one-off questions, and a 40-turn chat about 20 times as much.
+
+      | approach | cost per turn | remembers | catch |
+      | --- | --- | --- | --- |
+      | resend everything | grows each turn | everything | cost, then context overflow |
+      | keep the last k turns | flat | only recent turns | forgets early facts silently |
+      | summarise old turns | flat-ish, plus a summary call now and then | what the summary kept | summaries drop details |
+
+      Chapter 4 measures these trade-offs properly.
+
+      ---
+
+      ## Playbook: "ORBIT forgot what I just told it"
+
+      **First check:** print the exact `messages` list you sent on the failing turn. The model can only use what's in it.
+
+      Usual causes, most common first:
+
+      1. The assistant reply was never appended, or the user turn was appended twice.
+      2. The list is rebuilt inside the loop (`messages = [...]`), so it only ever holds one turn.
+      3. Each request handler starts a new list. Web apps have to store history per session somewhere.
+      4. Trimming code dropped the turn that held the fact.
+
+      If the fact **is** in the list and the model still misses it, the problem is attention, not memory: the
+      context is long and the fact is buried (chapter 4).
+
+  - id: chat-loop
+    type: coding
+    title: A three-turn chat
+    context: |
+      `client` is ORBIT's model and `SYSTEM` its system prompt. `turns` holds what Lucía types, in order. ORBIT can only
+      answer the last one if the first turn is still in the conversation you send.
+    instructions:
+      - Start an empty list `history`.
+      - "For each text in `turns`: append it as a `user` message, call the model with `messages=history`, append the reply text as an `assistant` message, and add the reply text to `replies`."
+      - Print the last reply.
+    hint: |
+      Inside the loop: `history.append({"role": "user", "content": text})`, then
+      `r = client.messages.create(model=MODEL, max_tokens=200, system=SYSTEM, messages=history)`, then
+      `history.append({"role": "assistant", "content": r.content[0].text})`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      client = aikit.FakeClaude(orbit_chat(), clock=aikit.VirtualClock())
+      SYSTEM = "You are ORBIT, the station assistant on research station Helios-7."
+      turns = ["Hi, my name is Lucía.", "How long do spacewalkers prebreathe?", "What is my name?"]
+    sample_code: |
+      history = ____
+      replies = []
+      for text in turns:
+          history.append(____)
+          r = client.messages.create(model=MODEL, max_tokens=200, system=SYSTEM, messages=____)
+          reply = r.content[0].text
+          history.append(____)
+          replies.append(reply)
+      print(replies[-1])
+    solution: |
+      history = []
+      replies = []
+      for text in turns:
+          history.append({"role": "user", "content": text})
+          r = client.messages.create(model=MODEL, max_tokens=200, system=SYSTEM, messages=history)
+          reply = r.content[0].text
+          history.append({"role": "assistant", "content": reply})
+          replies.append(reply)
+      print(replies[-1])
+    tests: |
+      check_object("history")
+      check_object("replies")
+      h = user["history"]
+      assert len(h) == 6, f"`history` should hold 6 messages (3 user + 3 assistant), but it has {len(h)}. Append both the user turn and the assistant reply on every pass."
+      roles = [m["role"] for m in h]
+      assert roles == ["user", "assistant"] * 3, f"Roles should alternate user, assistant, ...; got {roles}."
+      assert "Lucía" in user["replies"][-1], "ORBIT didn't remember the name. Is the first user turn still in `history` when you send the third?"
+      check_equal("replies")
+    success_msg: ORBIT "remembered" Lucía because your list still held turn 1. The memory lives in your code.
+
+  - id: why-forgot
+    type: mc
+    title: Why did ORBIT forget?
+    question: |
+      This loop runs the same three turns, but ORBIT answers the last one with "I don't know your name". Why?
+
+      ```python
+      for text in turns:
+          messages = [{"role": "user", "content": text}]
+          r = client.messages.create(model=MODEL, max_tokens=200,
+                                     system=SYSTEM, messages=messages)
+          print(r.content[0].text)
+      ```
+    context: The console has `client`, `MODEL`, `SYSTEM` and `turns` loaded, so you can run the loop and then fix it.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      client = aikit.FakeClaude(orbit_chat(), clock=aikit.VirtualClock())
+      SYSTEM = "You are ORBIT, the station assistant on research station Helios-7."
+      turns = ["Hi, my name is Lucía.", "How long do spacewalkers prebreathe?", "What is my name?"]
+    options:
+      - text: "`messages` is rebuilt on every pass, so each request holds only the current turn."
+        correct: true
+        feedback: "Right. Create the list once, before the loop, and append both the user turn and the reply. Printing `messages` on the failing turn would have shown this straight away."
+      - text: "`max_tokens=200` is too small to hold the conversation."
+        feedback: "`max_tokens` limits the reply, not the context. The conversation is in `messages`, and here it holds a single turn."
+      - text: The system prompt must say "remember the user's name".
+        feedback: No instruction can make the model remember text it never receives. Each call is stateless.
+      - text: The model needs a lower temperature to recall facts.
+        feedback: Temperature changes how tokens are sampled. It can't bring back information that isn't in the request.
+    hint: Print `messages` inside the loop. What does the third request contain?
+
+  - id: history-growth
+    type: coding
+    title: Measure what memory costs
+    context: |
+      A crew member has a 10-turn chat with ORBIT (`turns`). `client` meters every call in `client.calls`, a list of
+      dicts with an `"input_tokens"` key. You'll compare resending the full history with sending only a short window.
+    instructions:
+      - "Run the chat with the **full** history (as in the last exercise). Store each call's input tokens in `full_inputs` (a list) and their sum in `full_total`."
+      - "Run it again on a fresh history, but send only the last 5 messages each time (`messages=history[-5:]`). Store the sum of input tokens in `window_total`."
+      - Store `full_total / window_total` in `ratio`.
+    hint: |
+      Read the tokens after each run with `[c["input_tokens"] for c in client.calls]`. Call `client.reset()` between the two
+      runs so the second sum only counts the second run. `history[-5:]` always starts with a user turn here, because it ends
+      with the user turn you just appended.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      client = aikit.FakeClaude(orbit_chat(), clock=aikit.VirtualClock())
+      SYSTEM = "You are ORBIT, the station assistant on research station Helios-7."
+      turns = [
+          "Hi, my name is Kenji.", "How long do spacewalkers prebreathe?", "At what CO2 level do you raise an alert?",
+          "How much water does the station recover?", "What happens during the eclipse on each orbit?",
+          "Give me an overview of the hydroponics routine.", "What do we do if there is a fire?",
+          "Walk me through the airlock procedure for an EVA.", "What should I do in a medical emergency?",
+          "What is my name?",
+      ]
+
+      def run_chat(window=None):
+          history, last = [], None
+          for text in turns:
+              history.append({"role": "user", "content": text})
+              sent = history if window is None else history[-window:]
+              r = client.messages.create(model=MODEL, max_tokens=300, system=SYSTEM, messages=sent)
+              history.append({"role": "assistant", "content": r.content[0].text})
+              last = r.content[0].text
+          return last
+    sample_code: |
+      last_full = run_chat()
+      full_inputs = ____
+      full_total = ____
+
+      client.reset()
+      last_window = run_chat(window=____)
+      window_total = ____
+
+      ratio = ____
+      print(full_inputs)
+      print(full_total, window_total, round(ratio, 2))
+      print(last_full, "|", last_window)
+    solution: |
+      last_full = run_chat()
+      full_inputs = [c["input_tokens"] for c in client.calls]
+      full_total = sum(full_inputs)
+
+      client.reset()
+      last_window = run_chat(window=5)
+      window_total = sum(c["input_tokens"] for c in client.calls)
+
+      ratio = full_total / window_total
+      print(full_inputs)
+      print(full_total, window_total, round(ratio, 2))
+      print(last_full, "|", last_window)
+    tests: |
+      check_object("full_inputs")
+      fi = user["full_inputs"]
+      assert isinstance(fi, list) and len(fi) == 10, "`full_inputs` should list the input tokens of the 10 calls in the full-history run. Read it before `client.reset()`."
+      assert all(b > a for a, b in zip(fi, fi[1:])), "With the full history, every call should send more input tokens than the one before."
+      check_equal("full_inputs")
+      check_equal("full_total")
+      check_equal("window_total", msg="`window_total` should sum the input tokens of the windowed run only. Did you call `client.reset()` before it, and pass `window=5`?")
+      check_equal("ratio", tol=1e-6)
+    success_msg: |
+      The full history cost almost twice as much in input tokens after only 10 turns, and the gap widens with every extra turn. But look at the last line:
+      the windowed run has forgotten Kenji's name. Cheaper memory is lossy memory, and chapter 4 is about getting both.

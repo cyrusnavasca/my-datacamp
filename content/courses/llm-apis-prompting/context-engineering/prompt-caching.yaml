@@ -1,0 +1,254 @@
+title: Prompt caching
+description: What a cache hit actually skips, the exact-prefix rule, when caching pays off, and how to find out why your cache never hits.
+exercises:
+  - id: caching-slides
+    type: video
+    title: Reusing the work on a stable prefix
+    slides: |
+      # What a cache hit skips
+
+      During **prefill** the model computes internal state (attention keys and values) for every input token. ORBIT sends the
+      same 3,500-token handbook on every call, so it recomputes the same state every time.
+
+      With **prompt caching**, the provider stores that state for a prefix of your prompt. The next request that starts with the
+      **identical** prefix reuses it:
+
+      - cached tokens are billed at a fraction of the input price (illustrative: **0.1×**)
+      - prefill gets shorter, so time to first token drops
+      - writing the cache costs a little extra once (illustrative: **1.25×** the input price)
+
+      The tokens still count toward the context window. Caching saves money and time, not space.
+
+      ---
+
+      ## The rules
+
+      1. **Exact prefix match.** The cached prefix is everything up to a breakpoint, in order: `tools`, then `system`, then
+         `messages`. Change one character before the breakpoint and it's a different prefix: a miss and a new write.
+      2. **Breakpoints:** mark the last block of the stable part with `cache_control`.
+      3. **Minimum size:** prefixes below a minimum (often 1,024 tokens) aren't cached at all.
+      4. **Lifetime:** about 5 minutes, refreshed on every hit. Longer lifetimes exist at a higher write price.
+
+      ```python
+      system = [
+          {"type": "text", "text": HANDBOOK, "cache_control": {"type": "ephemeral"}},   # stable: cached
+          {"type": "text", "text": f"Station time: {now}"},                           # volatile: after the breakpoint
+      ]
+      r = client.messages.create(model="claude-sonnet-5-5", max_tokens=300, system=system, messages=messages)
+      r.usage.cache_creation_input_tokens   # written this call
+      r.usage.cache_read_input_tokens       # reused from the cache
+      ```
+
+      ---
+
+      ## When does it pay?
+
+      With write multiplier $w$ and read multiplier $r$, $n$ calls sharing a prefix of $T$ tokens within the lifetime cost
+
+      $$\underbrace{n \cdot T}_{\text{no cache}} \quad\text{vs}\quad \underbrace{w \cdot T + (n-1) \cdot r \cdot T}_{\text{cached}}$$
+
+      With $w = 1.25$ and $r = 0.1$, caching wins from the **second** call, and 10 calls cost 21.5% of the uncached price.
+      If calls are further apart than the lifetime, **every call is a write**, and you pay 1.25× for nothing.
+
+      | strategy | reuses | saves | catch |
+      | --- | --- | --- | --- |
+      | no caching | nothing | | full price, full prefill every call |
+      | prompt caching (static prefix) | model state for the prefix | most of the input cost, some TTFT | exact-prefix rule, lifetime, minimum size |
+      | caching the conversation as it grows | the history up to the last turn | grows with chat length | breakpoint must move each turn |
+      | response caching (your own) | whole answers to identical questions | the entire call | stale answers; exact-match only |
+
+      ---
+
+      ## Playbook: "`cache_read_input_tokens` is always 0"
+
+      Check, in this order:
+
+      1. **Something volatile before the breakpoint**: a timestamp, request id, user name, or randomly ordered tools or JSON keys.
+         Diff two consecutive prompts byte by byte.
+      2. **The prefix is too short**: under the minimum, nothing is cached (and `cache_creation_input_tokens` is 0 too).
+      3. **Calls are too far apart**: gaps longer than the lifetime turn every call into a write.
+      4. **A different model or different tools** between calls.
+
+      **Fix:** stable content first, volatile content last, breakpoint between them.
+      **Verify:** hit rate (calls with cache reads ÷ calls) and cost per call, on the same traffic.
+
+  - id: which-layout-caches
+    type: mc
+    title: Which layout caches?
+    question: |
+      ORBIT tells the model the station time on every call (it changes every minute). Which `system` layout gets cache hits
+      on consecutive calls a minute apart?
+
+      **A:** `[{"type": "text", "text": f"Station time: {t}\n" + HANDBOOK, "cache_control": {"type": "ephemeral"}}]`
+
+      **B:** `[{"type": "text", "text": HANDBOOK, "cache_control": {"type": "ephemeral"}}, {"type": "text", "text": f"Station time: {t}"}]`
+    context: The console has `try_layout(build)`, which makes two calls a minute apart and prints their usage. Try `try_layout(layout_a)` and `try_layout(layout_b)`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import time_echo, station_time, MODEL
+      HANDBOOK = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in aikit.helios.handbook(include_superseded=False))
+
+      def layout_a(t):
+          return [{"type": "text", "text": f"Station time: {t}\n" + HANDBOOK, "cache_control": {"type": "ephemeral"}}]
+
+      def layout_b(t):
+          return [{"type": "text", "text": HANDBOOK, "cache_control": {"type": "ephemeral"}},
+                  {"type": "text", "text": f"Station time: {t}"}]
+
+      def try_layout(build):
+          clk = aikit.VirtualClock()
+          client = aikit.FakeClaude(time_echo(), clock=clk)
+          for minute in range(2):
+              r = client.messages.create(model=MODEL, max_tokens=50, system=build(station_time(minute)),
+                                         messages=[{"role": "user", "content": "What time is it?"}])
+              print(minute, r.usage)
+              clk.sleep(60)
+    options:
+      - text: Only A, because the whole system prompt is inside the cached block.
+        feedback: The time is at the start of the cached block, so the prefix changes every minute. Every call writes a new cache entry and none ever reads one. Run `try_layout(layout_a)`.
+      - text: Only B.
+        correct: true
+        feedback: Right. The handbook prefix is byte-identical on every call; the time comes after the breakpoint, so it isn't part of the cache key. The second call reads the handbook from the cache.
+      - text: Both, because the handbook is the same in both.
+        feedback: Caching matches the exact prefix from the start of the prompt. In A the prefix starts with the time, so it differs on every call.
+      - text: Neither, because the time changes every minute.
+        feedback: Volatile content only breaks the cache when it comes **before** the breakpoint. Put it after, as in B.
+    hint: The cache key is everything from the start of the prompt up to the block marked with cache_control.
+
+  - id: break-even
+    type: coding
+    title: When does caching pay?
+    context: |
+      A cached prefix costs `write_mult` times the normal input price on the call that writes it, and `read_mult` times on each
+      call that reads it. Without caching, every call pays 1× for the prefix. Assume all `n` calls fall within the cache lifetime.
+    instructions:
+      - "Write `cost_ratio(n, write_mult, read_mult)`: the prefix cost of `n` calls with caching divided by the cost without caching."
+      - "Write `break_even(write_mult, read_mult)`: the smallest `n` for which `cost_ratio` is below 1."
+      - "Store `break_even(1.25, 0.1)` in `be_5min`, `break_even(2.0, 0.1)` in `be_1hour` (a longer lifetime with a pricier write), and the saving for 10 calls at 1.25/0.1 (`1 - cost_ratio(...)`) in `saving_10`."
+    hint: "Cached: `write_mult + (n - 1) * read_mult`. Uncached: `n`. For `break_even`, count up from `n = 1` until the ratio drops below 1."
+    pre_code: ""
+    sample_code: |
+      def cost_ratio(n, write_mult, read_mult):
+          return ____
+
+      def break_even(write_mult, read_mult):
+          n = 1
+          while ____:
+              n += 1
+          return n
+
+      be_5min = ____
+      be_1hour = ____
+      saving_10 = ____
+      print(be_5min, be_1hour, round(saving_10, 3))
+    solution: |
+      def cost_ratio(n, write_mult, read_mult):
+          return (write_mult + (n - 1) * read_mult) / n
+
+      def break_even(write_mult, read_mult):
+          n = 1
+          while cost_ratio(n, write_mult, read_mult) >= 1:
+              n += 1
+          return n
+
+      be_5min = break_even(1.25, 0.1)
+      be_1hour = break_even(2.0, 0.1)
+      saving_10 = 1 - cost_ratio(10, 1.25, 0.1)
+      print(be_5min, be_1hour, round(saving_10, 3))
+    tests: |
+      check_object("cost_ratio")
+      f = user["cost_ratio"]
+      assert abs(f(1, 1.25, 0.1) - 1.25) < 1e-9, "One call that writes the cache costs `write_mult` times the normal price: `cost_ratio(1, 1.25, 0.1)` should be 1.25."
+      assert abs(f(4, 1.25, 0.1) - 0.3875) < 1e-9, "`cost_ratio(4, 1.25, 0.1)` should be (1.25 + 3 * 0.1) / 4 = 0.3875."
+      check_equal("be_5min", 2, msg="With 1.25/0.1, caching already wins on the second call.")
+      check_equal("be_1hour", 3, msg="With a 2.0 write price, caching wins from the third call.")
+      check_equal("saving_10", 0.785, tol=1e-9)
+    success_msg: |
+      Caching a stable prefix pays from the second call and saves almost 80% over ten. The flip side: a prefix that's
+      written but never read costs 25% **more** than no caching at all.
+
+  - id: fix-cache-misses
+    type: coding
+    title: "Troubleshoot: the cache never hits"
+    context: |
+      ORBIT's team added caching to the 3,500-token handbook prompt, but the bill went **up**. `run_shift(build_system)` simulates
+      12 requests a minute apart and returns `(client, replies)`; `build_system(t)` must return the `system` blocks for station time `t`.
+      `broken_system` is the current layout. Each entry of `client.calls` has `cache_read_input_tokens` and `cost`.
+    instructions:
+      - "**Measure:** run `broken_system`. Store the share of calls with `cache_read_input_tokens > 0` in `broken_hit_rate` and the total cost in `broken_cost`."
+      - "**Fix:** write `fixed_system(t)` so the handbook prefix is identical on every call, while the model still receives the current station time (`Station time: HH:MM`)."
+      - "**Verify:** run it and store `fixed_hit_rate`, `fixed_cost` and `fixed_replies`. Also store the cost of a no-cache layout (a plain string with the time and handbook) in `nocache_cost`."
+    hint: |
+      Two blocks: the handbook with `"cache_control": {"type": "ephemeral"}` first, then `{"type": "text", "text": f"Station time: {t}"}`
+      without cache_control. The no-cache layout can be `lambda t: f"Station time: {t}\n" + HANDBOOK`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import time_echo, station_time, MODEL
+      HANDBOOK = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in aikit.helios.handbook(include_superseded=False))
+
+      def broken_system(t):
+          return [{"type": "text", "text": f"Station time: {t}\n\n" + HANDBOOK, "cache_control": {"type": "ephemeral"}}]
+
+      def run_shift(build_system):
+          clk = aikit.VirtualClock()
+          client = aikit.FakeClaude(time_echo(), clock=clk)
+          replies = []
+          for minute in range(12):
+              r = client.messages.create(model=MODEL, max_tokens=50, system=build_system(station_time(minute)),
+                                         messages=[{"role": "user", "content": "What time is it?"}])
+              replies.append(r.content[0].text)
+              clk.sleep(60)
+          return client, replies
+
+      def hit_rate(client):
+          return sum(c["cache_read_input_tokens"] > 0 for c in client.calls) / len(client.calls)
+    sample_code: |
+      broken_client, _ = run_shift(broken_system)
+      broken_hit_rate = ____
+      broken_cost = ____
+
+      def fixed_system(t):
+          return ____
+
+      fixed_client, fixed_replies = run_shift(fixed_system)
+      fixed_hit_rate = ____
+      fixed_cost = ____
+
+      nocache_client, _ = run_shift(____)
+      nocache_cost = ____
+      print(broken_hit_rate, fixed_hit_rate)
+      print(f"broken {broken_cost:.4f}  no cache {nocache_cost:.4f}  fixed {fixed_cost:.4f} USD")
+      print(fixed_replies[5])
+    solution: |
+      broken_client, _ = run_shift(broken_system)
+      broken_hit_rate = hit_rate(broken_client)
+      broken_cost = broken_client.total_cost()
+
+      def fixed_system(t):
+          return [
+              {"type": "text", "text": HANDBOOK, "cache_control": {"type": "ephemeral"}},
+              {"type": "text", "text": f"Station time: {t}"},
+          ]
+
+      fixed_client, fixed_replies = run_shift(fixed_system)
+      fixed_hit_rate = hit_rate(fixed_client)
+      fixed_cost = fixed_client.total_cost()
+
+      nocache_client, _ = run_shift(lambda t: f"Station time: {t}\n" + HANDBOOK)
+      nocache_cost = nocache_client.total_cost()
+      print(broken_hit_rate, fixed_hit_rate)
+      print(f"broken {broken_cost:.4f}  no cache {nocache_cost:.4f}  fixed {fixed_cost:.4f} USD")
+      print(fixed_replies[5])
+    tests: |
+      check_equal("broken_hit_rate", 0, msg="`broken_hit_rate` is the share of calls with cache reads in the broken run.")
+      check_equal("broken_cost", tol=1e-9)
+      check_object("fixed_replies")
+      from kits.llm_apis_prompting import station_time
+      wrong = [i for i, r in enumerate(user["fixed_replies"]) if station_time(i) not in r]
+      assert not wrong, f"ORBIT lost track of the time on calls {wrong[:3]}. Keep a `Station time: HH:MM` block in the system prompt, after the cached handbook."
+      assert user.get("fixed_hit_rate", 0) >= 0.9, f"`fixed_hit_rate` is {user.get('fixed_hit_rate')}; it should be at least 0.9. Is the handbook block byte-identical on every call, with the time after the breakpoint?"
+      assert user["fixed_cost"] < 0.5 * user["nocache_cost"], "The fixed layout should cost less than half of the no-cache layout."
+      assert user["broken_cost"] > user["nocache_cost"], "Compute `nocache_cost` from a run with a plain string system prompt (no cache_control)."
+    success_msg: |
+      The broken layout cost more than no caching at all: 12 cache writes at 1.25× and no reads. Moving one line after the
+      breakpoint gave 11 hits out of 12 and cut the bill by about 80%, and ORBIT still knows the time.

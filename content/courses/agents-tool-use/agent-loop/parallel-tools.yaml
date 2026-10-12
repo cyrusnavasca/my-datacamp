@@ -1,0 +1,180 @@
+title: Parallel tool calls
+description: Handle several tool calls in one turn, measure the round trips and tokens it saves, and know when to keep calls sequential.
+exercises:
+  - id: parallel-slides
+    type: video
+    title: Many calls, one turn
+    slides: |
+      # One turn, six calls
+
+      *"Check the CO2 level in every module."* The six readings don't depend on each other, so the model asks for all of them at once:
+
+      ```python
+      r.stop_reason      # "tool_use"
+      [b.name for b in r.content if b.type == "tool_use"]
+      # ['get_sensor', 'get_sensor', 'get_sensor', 'get_sensor', 'get_sensor', 'get_sensor']
+      ```
+
+      Each block has its own `id` and `input` (module A, B, ... F). The loop from the last lesson already handles this,
+      **if** it answers them all in one message.
+
+      ---
+
+      ## The rule: all results, one message
+
+      ```python
+      results = [execute(b) for b in r.content if b.type == "tool_use"]   # six tool_result blocks
+      messages.append({"role": "user", "content": results})               # one user message
+      ```
+
+      | what you send | what happens |
+      | --- | --- |
+      | one user message with all six results | ✓ |
+      | six user messages, one result each | `400`: the first message lacks five of the ids |
+      | five results (one call crashed and you skipped it) | `400`: a `tool_use` has no `tool_result` |
+      | six results, one with `is_error: True` | ✓ the model works with five readings and reports the sixth |
+
+      A partial failure is still a complete answer: every id gets a result.
+
+      ---
+
+      ## Why it matters: round trips
+
+      | | sequential (one call per turn) | parallel (all in one turn) |
+      | --- | --- | --- |
+      | model calls | 7 | 2 |
+      | input tokens | each of the 7 calls resends a growing history | 2 calls, so much less |
+      | latency | 7 model latencies + 6 tool latencies | 2 model latencies + the slowest tool |
+
+      The model asking in parallel doesn't make **your** code parallel. If the tools are slow I/O (network, database),
+      run them concurrently with a thread pool or `asyncio.gather`, or you keep the round-trip saving but lose the tool-time
+      saving.
+
+      ---
+
+      ## Trade-off: when to keep calls sequential
+
+      | situation | parallel? | why |
+      | --- | --- | --- |
+      | independent reads (six sensors) | yes | no ordering, no side effects |
+      | a call that needs another's output (book, then message the booking id) | no | the model can't know the id yet |
+      | writes whose order matters (cancel, then rebook the same slot) | no | concurrent execution may run them in the wrong order |
+      | many calls to a rate-limited service | limit it | a burst of 20 calls trips the limit; cap concurrency |
+      | writes that are hard to undo | think twice | one turn can fire several before a human sees any |
+
+      To stop the model batching calls, set `tool_choice={"type": "auto", "disable_parallel_tool_use": True}`. Your
+      harness can also run a batch one call at a time even when the model sent it in parallel.
+
+  - id: all-results-one-message
+    type: coding
+    title: Six readings, measured
+    context: |
+      `fast` is ORBIT's model when it batches independent calls, `slow` the same model when it makes one call per turn.
+      Each has its own `.calls` log, with `input_tokens` and `latency_ms` for every request. `execute(block)` returns a
+      `tool_result`. Complete the loop so it works with both models, then measure the difference.
+    instructions:
+      - "In `run_agent`, append **all** the `tool_result` blocks of a turn as a single user message."
+      - "Run `task` with `fast` and with `slow`. Store the number of model calls each made in `parallel_calls` and `sequential_calls`."
+      - "Store `token_ratio`: total input tokens of the slow run divided by those of the fast run."
+      - "Store `latency_saved_ms`: total `latency_ms` of the slow run minus that of the fast run."
+    hint: |
+      `results = [execute(b) for b in r.content if b.type == "tool_use"]`, then
+      `messages.append({"role": "user", "content": results})`. Totals come from the logs, for example
+      `sum(c["input_tokens"] for c in slow.calls)`.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, orbit_agent, tool_result, ToolError, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      fast = aikit.FakeClaude(orbit_agent(parallel=True), clock=aikit.VirtualClock())
+      slow = aikit.FakeClaude(orbit_agent(parallel=False), clock=aikit.VirtualClock())
+      task = "Check the CO2 level in every module."
+
+      def execute(block):
+          try:
+              return tool_result(block.id, station.run_tool(block.name, block.input))
+          except ToolError as e:
+              return tool_result(block.id, f"Error: {e}", is_error=True)
+    sample_code: |
+      def run_agent(client, task, max_steps=10):
+          messages = [{"role": "user", "content": task}]
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return r.content[0].text
+              for b in r.content:
+                  if b.type == "tool_use":
+                      messages.append({"role": "user", "content": [execute(b)]})
+          return None
+
+      print(run_agent(fast, task))
+      print(run_agent(slow, task))
+      parallel_calls = ____
+      sequential_calls = ____
+      token_ratio = ____
+      latency_saved_ms = ____
+      print(parallel_calls, sequential_calls, round(token_ratio, 2), round(latency_saved_ms))
+    solution: |
+      def run_agent(client, task, max_steps=10):
+          messages = [{"role": "user", "content": task}]
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return r.content[0].text
+              results = [execute(b) for b in r.content if b.type == "tool_use"]
+              messages.append({"role": "user", "content": results})
+          return None
+
+      print(run_agent(fast, task))
+      print(run_agent(slow, task))
+      parallel_calls = len(fast.calls)
+      sequential_calls = len(slow.calls)
+      token_ratio = sum(c["input_tokens"] for c in slow.calls) / sum(c["input_tokens"] for c in fast.calls)
+      latency_saved_ms = sum(c["latency_ms"] for c in slow.calls) - sum(c["latency_ms"] for c in fast.calls)
+      print(parallel_calls, sequential_calls, round(token_ratio, 2), round(latency_saved_ms))
+    tests: |
+      check_object("run_agent")
+      assert "CO2 by module" in output, "Both runs should print ORBIT's CO2 summary. If the fast run raised a 400, send all six results in one user message."
+      check_equal("parallel_calls", msg="`parallel_calls` is the number of entries in `fast.calls`.")
+      check_equal("sequential_calls", msg="`sequential_calls` is the number of entries in `slow.calls`.")
+      check_equal("token_ratio", tol=1e-6, msg="`token_ratio` is the slow run's total input tokens divided by the fast run's.")
+      check_equal("latency_saved_ms", tol=1e-6, msg="`latency_saved_ms` is the slow run's total `latency_ms` minus the fast run's.")
+    success_msg: |
+      Same answer, about a third of the model calls, and a fraction of the input tokens, because the sequential run resent
+      a growing history six times. In production, run the six reads concurrently too and the tool time shrinks as well.
+
+  - id: parallel-or-not
+    type: classify
+    title: Parallel or sequential?
+    prompt: ORBIT gets these batches of tool calls in one turn. Which can your harness run concurrently, and which must run one at a time, in order?
+    hint: Does one call need another's output, or could running them at the same time, or in another order, change the outcome?
+    zones: [Run concurrently, Keep sequential]
+    items:
+      - { text: "Read CO2 in all six modules", zone: Run concurrently }
+      - { text: "Search the handbook and read the hydroponics humidity", zone: Run concurrently }
+      - { text: "Look up the roster and read the lab temperature", zone: Run concurrently }
+      - { text: "Message three crew members about three unrelated topics", zone: Run concurrently }
+      - { text: "Book Module B, then message Noor the booking id", zone: Keep sequential }
+      - { text: "Cancel Priya's 09:00 slot, then book Tomas into it", zone: Keep sequential }
+      - { text: "Read a sensor, then decide which module to book based on it", zone: Keep sequential }
+      - { text: "Two bookings for the same glovebox slot", zone: Keep sequential }
+
+  - id: partial-failure
+    type: mc
+    title: One of six fails
+    question: |
+      ORBIT asked for six CO2 readings in one turn. Module E's sensor is offline and `run_tool` raises `ToolError` for it.
+      What should the next user message contain?
+    options:
+      - text: "Six `tool_result` blocks: five readings and one for module E with `is_error: True` and the reason."
+        correct: true
+        feedback: "Right. Every `tool_use` id gets a result, and the failure carries information the model can pass on (\"E is offline\"). The other five readings aren't wasted."
+      - text: Five `tool_result` blocks; leave module E out.
+        feedback: "The API rejects this with a 400: every `tool_use` id in the turn needs a result in the next message."
+      - text: "Nothing yet: retry module E until it works, then send all six."
+        feedback: "An offline sensor won't come back on its own, so this hangs the run. Retries are for transient errors, and they need a cap."
+      - text: "A single text block: \"one tool failed, please try again\"."
+        feedback: "That drops five good results and gives the model no ids to match, so the API rejects it."
+    hint: Count the ids the model is waiting for.

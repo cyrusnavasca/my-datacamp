@@ -1,0 +1,30 @@
+title: Unsupervised Learning
+description: 'Find structure in unlabelled data: clustering, dimensionality reduction and visualising
+  high-dimensional data.'
+level: intermediate
+est_hours: 4
+prerequisites:
+- supervised-learning
+objectives:
+- Cluster data with k-means and hierarchical clustering
+- Reduce dimensions with PCA
+- Visualise high-dimensional data with t-SNE
+- Decompose data with NMF
+requires: []
+chapters:
+- id: clustering
+  title: Clustering
+  description: k-means, inertia and choosing k.
+  lessons: []
+- id: hierarchical-tsne
+  title: Hierarchical clustering and t-SNE
+  description: Dendrograms and 2D maps of data.
+  lessons: []
+- id: pca
+  title: Dimension reduction with PCA
+  description: Decorrelation, explained variance and intrinsic dimension.
+  lessons: []
+- id: nmf
+  title: Non-negative matrix factorisation
+  description: Interpretable parts and simple recommenders.
+  lessons: []

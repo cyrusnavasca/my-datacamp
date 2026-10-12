@@ -1,0 +1,165 @@
+title: Orchestrator and workers
+description: A lead model splits a task into subtasks, workers solve them in separate contexts, and the lead merges the results. What it buys and what it costs.
+exercises:
+  - id: orchestrator-slides
+    type: video
+    title: Fan out, fan in
+    slides: |
+      # Fan out, fan in
+
+      ```text
+                       ┌─ worker: Module A ─┐
+      task ─→ lead ────┼─ worker: Module B ─┼──→ lead (merge) ─→ report
+             (plan)    │        ...         │
+                       └─ worker: Module F ─┘
+      ```
+
+      1. The **lead** turns the task into subtasks, as data (JSON) you can check.
+      2. Each **worker** is its own agent run: a fresh `messages` list, its own tools, perhaps its own model.
+      3. The lead **merges** the worker outputs into the answer.
+
+      Unlike a fixed parallel workflow, the lead decides the split at run time: six modules today, two tomorrow.
+
+      ---
+
+      ## What it buys
+
+      | benefit | mechanism |
+      | --- | --- |
+      | **context isolation** | each worker only sees its own subtask's results, so contexts stay small and on topic |
+      | **parallelism** | workers run at the same time: latency ≈ plan + slowest worker + merge |
+      | **specialisation** | different prompts, tools or models per worker (a cheap model for reading sensors) |
+      | **failure isolation** | one failed worker becomes one gap in the report, not a failed run |
+
+      ---
+
+      ## What it costs
+
+      - **Tokens:** every worker pays the system prompt and tool definitions again, and the lead pays for planning and
+        merging. Published multi-agent research systems report using several times the tokens of a single agent.
+      - **Coordination failures:** overlapping subtasks (duplicated work), gaps (a module nobody checked), workers that
+        answer in different formats.
+      - **Lost context:** a worker doesn't know what the others found. Subtasks that depend on each other don't fit this pattern.
+
+      | | single agent | orchestrator + workers |
+      | --- | --- | --- |
+      | total tokens | lower when context is shared | usually higher |
+      | peak context per call | grows with the whole task | one subtask's worth |
+      | latency | sum of all steps | plan + slowest worker + merge |
+      | best for | tightly coupled steps | broad, separable work |
+
+      ---
+
+      ## Making it reliable
+
+      ```python
+      subtasks = json.loads(ask(lead, "Plan subtasks as JSON. Task: " + task))
+      reports = [run_agent(new_worker(), s["task"], TOOLS, execute)["answer"] for s in subtasks]
+      final = ask(lead, "Merge these worker reports into one report:\n" + "\n".join(reports))
+      ```
+
+      - Give each worker a **precise brief and an output format** ("report one line: Module X: ...").
+      - Make subtasks **independent**, so workers can't step on each other.
+      - **Check coverage** in code before merging: did every module get a report? Re-run the missing ones.
+      - **Cap** the number of workers, and give each a step cap and budget.
+
+  - id: fan-out-fan-in
+    type: coding
+    title: Six workers, one report
+    context: |
+      The morning status report covers six modules. `single` is one agent that checks them all itself (`run_agent(single,
+      STATUS_TASK, TOOLS, station.run_tool)` works as is). Build the orchestrator version with `lead` and one fresh
+      `new_worker()` per subtask, then compare. `ask(client, text)` sends one message and returns the reply text; every
+      client logs `input_tokens` and `latency_ms` per call in `.calls`.
+    instructions:
+      - "Plan: `subtasks = json.loads(ask(lead, \"Plan subtasks as JSON. Task: \" + STATUS_TASK))`. For each, run `run_agent(w, s[\"task\"], TOOLS, station.run_tool)` on a new worker `w`; keep the workers in `workers` and the answers in `reports`."
+      - "Merge: `report = ask(lead, \"Merge these worker reports into one report:\\n\" + \"\\n\".join(reports))`."
+      - "Compare: store `single_peak` and `multi_peak` (largest `input_tokens` of any one call) and `single_latency`, `multi_latency` (multi = the lead's two calls + the slowest worker's total, as if workers ran in parallel)."
+      - "Store `token_ratio`: all multi-agent input tokens (lead + workers) divided by the single agent's."
+    hint: |
+      Worker latency is `sum(c["latency_ms"] for c in w.calls)`; take the `max` over workers. The lead made two calls:
+      `lead.calls[0]` (plan) and `lead.calls[1]` (merge).
+    pre_code: |
+      import json
+      from kits.agents_tool_use import (HeliosStation, FakeClaude, VirtualClock, status_agent, worker_model, lead_model,
+                                        run_agent, STATUS_TASK, STATUS_ANOMALIES, MODEL)
+      station = HeliosStation(anomalies=STATUS_ANOMALIES)
+      TOOLS = station.tools
+      single = FakeClaude(status_agent(), clock=VirtualClock())
+      lead = FakeClaude(lead_model(), clock=VirtualClock())
+
+      def new_worker():
+          return FakeClaude(worker_model(), clock=VirtualClock())
+
+      def ask(client, text):
+          r = client.messages.create(model=MODEL, max_tokens=1000, messages=[{"role": "user", "content": text}])
+          return r.content[0].text
+
+      single_report = run_agent(single, STATUS_TASK, TOOLS, station.run_tool)["answer"]
+    sample_code: |
+      subtasks = json.loads(ask(lead, "Plan subtasks as JSON. Task: " + STATUS_TASK))
+      workers, reports = [], []
+      for s in subtasks:
+          w = new_worker()
+          workers.append(w)
+          reports.append(____)
+      report = ____
+      print(report)
+
+      single_peak = max(c["input_tokens"] for c in single.calls)
+      multi_peak = ____
+      single_latency = sum(c["latency_ms"] for c in single.calls)
+      multi_latency = ____
+      multi_tokens = sum(c["input_tokens"] for c in lead.calls) + sum(c["input_tokens"] for w in workers for c in w.calls)
+      token_ratio = ____
+      print(single_peak, multi_peak, round(single_latency), round(multi_latency), round(token_ratio, 2))
+    solution: |
+      subtasks = json.loads(ask(lead, "Plan subtasks as JSON. Task: " + STATUS_TASK))
+      workers, reports = [], []
+      for s in subtasks:
+          w = new_worker()
+          workers.append(w)
+          reports.append(run_agent(w, s["task"], TOOLS, station.run_tool)["answer"])
+      report = ask(lead, "Merge these worker reports into one report:\n" + "\n".join(reports))
+      print(report)
+
+      single_peak = max(c["input_tokens"] for c in single.calls)
+      multi_peak = max(c["input_tokens"] for client in [lead] + workers for c in client.calls)
+      single_latency = sum(c["latency_ms"] for c in single.calls)
+      multi_latency = (lead.calls[0]["latency_ms"] + lead.calls[1]["latency_ms"]
+                       + max(sum(c["latency_ms"] for c in w.calls) for w in workers))
+      multi_tokens = sum(c["input_tokens"] for c in lead.calls) + sum(c["input_tokens"] for w in workers for c in w.calls)
+      token_ratio = multi_tokens / sum(c["input_tokens"] for c in single.calls)
+      print(single_peak, multi_peak, round(single_latency), round(multi_latency), round(token_ratio, 2))
+    tests: |
+      rep = check_object("report")
+      assert all(f"Module {m}" in rep for m in "ABCDEF"), "The report should cover all six modules. Did every worker's answer go into the merge message?"
+      first_two = rep.split("Module ")[1:3]
+      assert all("UNUSUAL" in x for x in first_two), "The merged report should list the two unusual modules (B and D) first."
+      assert len(user["workers"]) == 6, "Use one fresh worker per subtask (6)."
+      check_equal("multi_peak", msg="`multi_peak` is the largest `input_tokens` of any call by the lead or a worker.")
+      check_equal("multi_latency", msg="`multi_latency` = the lead's plan and merge latencies + the slowest worker's total latency.")
+      check_equal("token_ratio", msg="`token_ratio` = all lead and worker input tokens / the single agent's input tokens.")
+      assert user["multi_peak"] < user["single_peak"] and user["multi_latency"] < user["single_latency"], "With isolated, parallel workers both the peak context and the latency should be lower."
+    success_msg: |
+      Peak context fell by more than half and the report arrived sooner, because the workers ran side by side. Total
+      tokens came out about even here: the single agent's growing history cost roughly what the workers' repeated tool
+      definitions did. With a long system prompt or many tools, multi-agent costs more in total, often several times
+      more. Orchestrate for isolation and speed, not to save tokens.
+
+  - id: when-multi-agent
+    type: mc
+    title: Is orchestration worth it?
+    question: |
+      Which of these ORBIT jobs is the best fit for orchestrator-workers?
+    options:
+      - text: "A weekly audit: for each of 40 handbook procedures, check it against the latest incident reports and list contradictions. Results are needed by morning; the budget is generous."
+        correct: true
+        feedback: "Right. Forty independent, context-heavy subtasks: isolation keeps each check focused, workers run in parallel, and the budget covers the extra tokens. The lead's job is to split the work and merge the lists."
+      - text: "Answer \"What's the CO2 in engineering?\""
+        feedback: "One tool call. A lead and workers would multiply cost and latency for nothing; this is a lookup workflow."
+      - text: "Debug why pump P-2 keeps stopping, where each test depends on the result of the last."
+        feedback: "The steps are tightly coupled: what to check next depends on what was just found. Workers in separate contexts can't share findings as they go. A single agent fits better."
+      - text: "Book Module B for Noor, then message her the booking id."
+        feedback: "Two dependent steps with a known order: a tiny fixed workflow (or one short agent run). Splitting it across workers adds coordination and nothing else."
+    hint: Look for many independent subtasks, each with a lot of context, where time matters more than tokens.

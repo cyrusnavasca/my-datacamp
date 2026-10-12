@@ -1,0 +1,448 @@
+title: "Troubleshooting: agents that loop"
+description: Why agents don't stop, the stopping conditions every loop needs, and how to measure and fix a runaway agent.
+exercises:
+  - id: stopping-slides
+    type: video
+    title: "Playbook: the agent loops or wanders"
+    slides: |
+      # Symptom: the night log
+
+      ORBIT ran six crew requests overnight. In the morning:
+
+      - Module B was booked **25 times** for the same slot.
+      - Kenji had **25 identical messages**.
+      - Each of the six requests used **25 model calls**, and none got an answer.
+
+      Agents fail differently from ordinary code. Nothing crashed: every call succeeded, and the model kept asking for
+      tools. The loop has no notion of "this isn't going anywhere" unless you build one.
+
+      ---
+
+      ## Why agents don't stop
+
+      | cause | what the transcript shows | how common |
+      | --- | --- | --- |
+      | **broken history**: the model's turn or results are missing | the **first** call repeated, identical, from step 1 | very, in hand-written loops |
+      | **opaque errors**: "Error", "failed", `None` | the same call retried after each failure | very |
+      | **unhelpful results**: empty lists, truncated dumps | rephrased searches that never converge | common |
+      | **vague task or no done criterion** | lots of different reads, no answer | common with open-ended tasks |
+      | **genuinely long task** | steady progress, then the cap cuts it off | the cap is too low |
+
+      The first two are bugs **you** can fix in the harness. The last one means the cap is wrong, not the agent.
+
+      ---
+
+      ## Stopping conditions
+
+      ```python
+      for step in range(1, MAX_STEPS + 1):                     # 1. step cap
+          if client.total_cost() - start_cost > BUDGET:         # 2. cost or token budget
+              return stop("budget")
+          r = client.messages.create(...)
+          ...
+          for b in tool_uses(r):
+              key = (b.name, json.dumps(b.input, sort_keys=True))
+              if key in seen:                                   # 3. repeat detector
+                  return stop("repeat")
+              seen.add(key)
+      return stop("max_steps")
+      ```
+
+      Others: wall-clock time, a per-tool call limit (at most 3 `send_message` per task), and a no-progress check (no new
+      information in the last k results). Always return **why** the run stopped, so you can count the reasons.
+
+      ---
+
+      ## Trade-off: where to set the limits
+
+      | choice | completeness | cost of a runaway | crew experience |
+      | --- | --- | --- | --- |
+      | low step cap (4) | cuts off real multi-step tasks | small | frequent "I couldn't finish" |
+      | cap near the p99 of successful runs, plus headroom | almost every real task finishes | bounded | rare cut-offs |
+      | high cap (50) or none | everything finishes, eventually | large: loops burn money and repeat side effects | slow failures |
+      | hard stop on a repeat | safe | smallest | may stop a legitimate re-check |
+      | nudge on a repeat (an error result: "you already called this; here is the result") | the model can recover | one more call | best when repeats are honest mistakes |
+
+      Set caps from **data**: the step distribution of runs that succeeded. Repeat detection matters most for tools with
+      side effects (bookings, messages), where a loop does damage, not just waste.
+
+      ---
+
+      ## Measure, diagnose, fix, verify
+
+      **Measure** over a batch of tasks, not one: success rate, mean steps per task, **repeated-call rate**
+      (calls that duplicate an earlier call in the same task ÷ all calls) and cost.
+
+      **Diagnose**: open one runaway transcript. When did it start repeating, and what was the last result?
+
+      | you see | fix | cost |
+      | --- | --- | --- |
+      | repeats from step 1 | append the assistant turn, and send results as `tool_result` blocks | none |
+      | the same call after an error | informative `is_error` results (reason, valid values, "don't retry") | none |
+      | wandering reads | clearer task and tool descriptions, a plan step (chapter 3), or a fixed workflow (chapter 4) | design time |
+      | still occasional runaways | step cap, repeat detector, budget | the occasional cut-off |
+
+      **Verify** on the same batch: success up, repeats at 0, steps and cost down. A cap is a seatbelt, not a fix:
+      it limits the damage, but the bug is still there.
+
+  - id: guard-the-loop
+    type: coding
+    title: Put a seatbelt on the loop
+    context: |
+      Two misbehaving models: `stuck` asks for the same sensor reading forever; `wanderer` keeps asking for different
+      readings and never answers. Both are `aikit.scripted_agent` models. `execute(block)` returns a `tool_result`.
+      Add two guards to the loop so both runs end quickly and say why.
+    instructions:
+      - "Before running a tool, build `key = (b.name, json.dumps(b.input, sort_keys=True))`. If `key` is already in `seen`, return `{\"stop\": \"repeat\", \"steps\": step}` **without** running it; otherwise add it to `seen`."
+      - "If the loop runs out of steps, return `{\"stop\": \"max_steps\", \"steps\": max_steps}`."
+      - "Run `stuck` and `wanderer` with `max_steps=6`; store the results in `stuck_run` and `wander_run`."
+    hint: |
+      Inside `for b in r.content:` with `if b.type == "tool_use":`, check `if key in seen: return {...}`, then
+      `seen.add(key)` and `results.append(execute(b))`. The `max_steps` return goes after the `for step` loop.
+    pre_code: |
+      import json
+      import aikit
+      from kits.agents_tool_use import HeliosStation, tool_result, ToolError, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      stuck = aikit.FakeClaude(aikit.scripted_agent([
+          {"tool": "get_sensor", "input": {"module": "C", "metric": "humidity"}},
+      ]), clock=aikit.VirtualClock())
+      wanderer = aikit.FakeClaude(aikit.scripted_agent(
+          [{"tool": "get_sensor", "input": {"module": m, "metric": k}} for m in "ABCDEF" for k in ("co2", "o2")]
+      ), clock=aikit.VirtualClock())
+
+      def execute(block):
+          try:
+              return tool_result(block.id, station.run_tool(block.name, block.input))
+          except ToolError as e:
+              return tool_result(block.id, f"Error: {e}", is_error=True)
+    sample_code: |
+      def run_agent(client, task, max_steps=6):
+          messages = [{"role": "user", "content": task}]
+          seen = set()
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return {"stop": "end_turn", "steps": step, "answer": r.content[0].text}
+              results = []
+              for b in r.content:
+                  if b.type == "tool_use":
+                      key = (b.name, json.dumps(b.input, sort_keys=True))
+                      ____
+                      results.append(execute(b))
+              messages.append({"role": "user", "content": results})
+          return ____
+
+      stuck_run = run_agent(stuck, "How humid is hydroponics?")
+      wander_run = run_agent(wanderer, "Is the air OK everywhere?")
+      print(stuck_run, wander_run)
+      print(len(station.actions), "tool calls reached the station")
+    solution: |
+      def run_agent(client, task, max_steps=6):
+          messages = [{"role": "user", "content": task}]
+          seen = set()
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return {"stop": "end_turn", "steps": step, "answer": r.content[0].text}
+              results = []
+              for b in r.content:
+                  if b.type == "tool_use":
+                      key = (b.name, json.dumps(b.input, sort_keys=True))
+                      if key in seen:
+                          return {"stop": "repeat", "steps": step}
+                      seen.add(key)
+                      results.append(execute(b))
+              messages.append({"role": "user", "content": results})
+          return {"stop": "max_steps", "steps": max_steps}
+
+      stuck_run = run_agent(stuck, "How humid is hydroponics?")
+      wander_run = run_agent(wanderer, "Is the air OK everywhere?")
+      print(stuck_run, wander_run)
+      print(len(station.actions), "tool calls reached the station")
+    tests: |
+      s = check_object("stuck_run")
+      w = check_object("wander_run")
+      assert isinstance(s, dict) and s.get("stop") == "repeat", f"The stuck model repeats one call; your loop should stop with stop='repeat'. Got {s!r}."
+      assert s.get("steps") == 2, f"The repeat shows up on the second model call, so `steps` should be 2; got {s.get('steps')}."
+      assert isinstance(w, dict) and w.get("stop") == "max_steps" and w.get("steps") == 6, f"The wanderer never repeats exactly, so only the step cap stops it: expect {{'stop': 'max_steps', 'steps': 6}}; got {w!r}."
+      n = len(user["station"].actions)
+      assert n == 7, f"Expected 7 tool calls in total (1 from the stuck run, since the repeat must not run, plus 6 from the wanderer); the station saw {n}."
+    success_msg: |
+      The repeat detector caught the stuck model after one wasted call, before it could act twice. The wanderer never
+      repeated itself exactly, so only the cap stopped it. You need both, and the `stop` field tells you which one fired.
+
+  - id: pick-a-cap
+    type: mc
+    title: Choose the step cap
+    question: |
+      Over 500 logged ORBIT runs, successful ones took p50 = 3, p95 = 6, p99 = 9 and at most 11 model calls. Runaway runs
+      cost about 2 cents per extra step and can repeat bookings. Which `max_steps` do you ship?
+    options:
+      - text: "4: most tasks finish by then, and it keeps runaways cheap."
+        feedback: "Over 5% of real tasks need more than 4 steps (p95 is 6), so you'd cut off a lot of legitimate work to save a few cents."
+      - text: "12 to 15: above every successful run seen so far, with a little headroom, plus a repeat detector for the side effects."
+        correct: true
+        feedback: "Right. Set the cap from the distribution of successful runs, with headroom for the long tail. The repeat detector, not the cap, protects against repeated bookings. Revisit the cap when the logs change."
+      - text: "50: the cap should never get in the way."
+        feedback: "A runaway would then burn about 50 calls and could rebook a module dozens of times before stopping. Caps exist for runs that don't work."
+      - text: "No cap: the model always ends with end_turn eventually."
+        feedback: "The night log is the counterexample: with broken history or opaque errors, it never does."
+    hint: Look at the longest successful run, then add a little room.
+
+  - id: loop-doctor
+    type: sequential
+    title: "Mission: fix the night harness"
+    context: |
+      `run_v1` is the harness that ran last night's six crew requests (`TASKS`). Measure it, fix it in two rounds, and
+      prove each fix with numbers. `task_ok(task, answer)` checks an answer, and `client.total_cost()` meters spending.
+      Here is `run_v1`:
+
+      ```python
+      def run_v1(task, client=client, max_steps=25):
+          messages, calls = [{"role": "user", "content": task}], []
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+              if r.stop_reason != "tool_use":
+                  return {"answer": r.content[0].text, "steps": step, "calls": calls, "stop": "end_turn"}
+              for b in r.content:
+                  if b.type == "tool_use":
+                      calls.append((b.name, b.input))
+                      try:
+                          out = station.run_tool(b.name, b.input)
+                      except Exception:
+                          out = "Error"
+                      messages.append({"role": "user", "content": f"Result: {out}"})
+          return {"answer": None, "steps": max_steps, "calls": calls, "stop": "max_steps"}
+      ```
+    pre_code: |
+      import json
+      import aikit
+      from kits.agents_tool_use import HeliosStation, orbit_agent, tool_result, ToolError, task_ok, ORBIT_TASKS, MODEL
+      station = HeliosStation(offline=[("E", "co2")])
+      TOOLS = station.tools
+      client = aikit.FakeClaude(orbit_agent(), clock=aikit.VirtualClock())
+      TASKS = [t for t, _ in ORBIT_TASKS]
+
+      def run_v1(task, client=client, max_steps=25):
+          messages, calls = [{"role": "user", "content": task}], []
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+              if r.stop_reason != "tool_use":
+                  return {"answer": r.content[0].text, "steps": step, "calls": calls, "stop": "end_turn"}
+              for b in r.content:
+                  if b.type == "tool_use":
+                      calls.append((b.name, b.input))
+                      try:
+                          out = station.run_tool(b.name, b.input)
+                      except Exception:
+                          out = "Error"
+                      messages.append({"role": "user", "content": f"Result: {out}"})
+          return {"answer": None, "steps": max_steps, "calls": calls, "stop": "max_steps"}
+    steps:
+      - instructions:
+          - "Write `measure(runner)`: run `runner(task)` for every task in `TASKS` and return a dict with `success` (share of `task_ok` answers), `mean_steps`, `repeat_rate` (calls that duplicate an earlier call in the same task ÷ all calls) and `cost` (the change in `client.total_cost()` over the batch)."
+          - "Store `before = measure(run_v1)` and print it, then print the first 3 calls `run_v1` makes for `TASKS[2]`."
+        hint: |
+          For repeats, keep a `seen` set per task with keys `(name, json.dumps(input, sort_keys=True))`, and count a call as a
+          repeat when its key is already in the set. Read `client.total_cost()` before and after the loop.
+        sample_code: |
+          def measure(runner):
+              start = client.total_cost()
+              oks, steps, repeats, n_calls = [], [], 0, 0
+              for task in TASKS:
+                  out = runner(task)
+                  oks.append(task_ok(task, out["answer"]))
+                  steps.append(out["steps"])
+                  seen = set()
+                  for name, inp in out["calls"]:
+                      key = (name, json.dumps(inp, sort_keys=True))
+                      ____
+                  n_calls += len(out["calls"])
+              return {"success": ____, "mean_steps": sum(steps) / len(steps),
+                      "repeat_rate": ____, "cost": ____}
+
+          before = measure(run_v1)
+          print(before)
+          print(run_v1(TASKS[2])["calls"][:3])
+        solution: |
+          def measure(runner):
+              start = client.total_cost()
+              oks, steps, repeats, n_calls = [], [], 0, 0
+              for task in TASKS:
+                  out = runner(task)
+                  oks.append(task_ok(task, out["answer"]))
+                  steps.append(out["steps"])
+                  seen = set()
+                  for name, inp in out["calls"]:
+                      key = (name, json.dumps(inp, sort_keys=True))
+                      if key in seen:
+                          repeats += 1
+                      seen.add(key)
+                  n_calls += len(out["calls"])
+              return {"success": sum(oks) / len(oks), "mean_steps": sum(steps) / len(steps),
+                      "repeat_rate": repeats / max(1, n_calls), "cost": client.total_cost() - start}
+
+          before = measure(run_v1)
+          print(before)
+          print(run_v1(TASKS[2])["calls"][:3])
+        tests: |
+          b = check_object("before")
+          assert isinstance(b, dict) and set(b) >= {"success", "mean_steps", "repeat_rate", "cost"}, "`measure` should return a dict with success, mean_steps, repeat_rate and cost."
+          assert b["success"] == 0, f"run_v1 answers none of the tasks, so success should be 0; got {b['success']}."
+          assert abs(b["mean_steps"] - 25) < 1e-9, f"Every v1 run hits the 25-step cap; mean_steps should be 25, got {b['mean_steps']}."
+          assert abs(b["repeat_rate"] - sol["before"]["repeat_rate"]) < 1e-9, f"repeat_rate should be {sol['before']['repeat_rate']:.3f} (24 of every 25 calls repeat the first); got {b['repeat_rate']}."
+          assert abs(b["cost"] - sol["before"]["cost"]) < 1e-9, "`cost` should be the change in `client.total_cost()` across the batch."
+      - instructions:
+          - "The calls repeat from the very first step, so the model never sees its own turn. Write `run_v2`: append the assistant turn, and send the results as `tool_result` blocks, all in one user message. Keep `except Exception: out = \"Error\"` for now."
+          - "Store `after_fix1 = measure(run_v2)` and print it."
+        hint: |
+          After `create`, append `{"role": "assistant", "content": r.content}`. Collect
+          `{"type": "tool_result", "tool_use_id": b.id, "content": out}` blocks in a list and append them as one user message
+          after the `for b` loop.
+        sample_code: |
+          def run_v2(task, client=client, max_steps=25):
+              messages, calls = [{"role": "user", "content": task}], []
+              for step in range(1, max_steps + 1):
+                  r = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+                  ____
+                  if r.stop_reason != "tool_use":
+                      return {"answer": r.content[0].text, "steps": step, "calls": calls, "stop": "end_turn"}
+                  results = []
+                  for b in r.content:
+                      if b.type == "tool_use":
+                          calls.append((b.name, b.input))
+                          try:
+                              out = station.run_tool(b.name, b.input)
+                          except Exception:
+                              out = "Error"
+                          results.append(____)
+                  messages.append(____)
+              return {"answer": None, "steps": max_steps, "calls": calls, "stop": "max_steps"}
+
+          after_fix1 = measure(run_v2)
+          print(after_fix1)
+        solution: |
+          def run_v2(task, client=client, max_steps=25):
+              messages, calls = [{"role": "user", "content": task}], []
+              for step in range(1, max_steps + 1):
+                  r = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+                  messages.append({"role": "assistant", "content": r.content})
+                  if r.stop_reason != "tool_use":
+                      return {"answer": r.content[0].text, "steps": step, "calls": calls, "stop": "end_turn"}
+                  results = []
+                  for b in r.content:
+                      if b.type == "tool_use":
+                          calls.append((b.name, b.input))
+                          try:
+                              out = station.run_tool(b.name, b.input)
+                          except Exception:
+                              out = "Error"
+                          results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+                  messages.append({"role": "user", "content": results})
+              return {"answer": None, "steps": max_steps, "calls": calls, "stop": "max_steps"}
+
+          after_fix1 = measure(run_v2)
+          print(after_fix1)
+        tests: |
+          a = check_object("after_fix1")
+          assert abs(a["success"] - 4 / 6) < 1e-9, f"With the history fixed, 4 of the 6 tasks should succeed; success is {a['success']:.2f}. Is the assistant turn appended, and are results sent as tool_result blocks?"
+          assert a["repeat_rate"] > 0, "Two tasks should still loop: their tools fail, and the model only ever sees 'Error'. Keep the opaque error for this step."
+      - instructions:
+          - "Two tasks still loop: the model gets `\"Error\"` and retries the same call. Write `run_v3` from `run_v2` with two changes: catch `ToolError as e` and send `f\"Error: {e}\"` with `\"is_error\": True`; and add a repeat detector that returns `stop=\"repeat\"` (with `answer` None) instead of running a call already made in this task."
+          - "Lower the cap to `max_steps=8`. Store `after = measure(run_v3)` and print it."
+        hint: |
+          Keep a `seen` set in `run_v3`. For each `tool_use` block, build the key as in `measure`; if it is in `seen`, return
+          `{"answer": None, "steps": step, "calls": calls, "stop": "repeat"}`. The error result is
+          `{"type": "tool_result", "tool_use_id": b.id, "content": f"Error: {e}", "is_error": True}`.
+        sample_code: |
+          def run_v3(task, client=client, max_steps=8):
+              messages, calls, seen = [{"role": "user", "content": task}], [], set()
+              for step in range(1, max_steps + 1):
+                  r = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+                  messages.append({"role": "assistant", "content": r.content})
+                  if r.stop_reason != "tool_use":
+                      return {"answer": r.content[0].text, "steps": step, "calls": calls, "stop": "end_turn"}
+                  results = []
+                  for b in r.content:
+                      if b.type == "tool_use":
+                          key = (b.name, json.dumps(b.input, sort_keys=True))
+                          ____
+                          calls.append((b.name, b.input))
+                          try:
+                              out = station.run_tool(b.name, b.input)
+                              results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+                          except ToolError as e:
+                              results.append(____)
+                  messages.append({"role": "user", "content": results})
+              return {"answer": None, "steps": max_steps, "calls": calls, "stop": "max_steps"}
+
+          after = measure(run_v3)
+          print(after)
+        solution: |
+          def run_v3(task, client=client, max_steps=8):
+              messages, calls, seen = [{"role": "user", "content": task}], [], set()
+              for step in range(1, max_steps + 1):
+                  r = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+                  messages.append({"role": "assistant", "content": r.content})
+                  if r.stop_reason != "tool_use":
+                      return {"answer": r.content[0].text, "steps": step, "calls": calls, "stop": "end_turn"}
+                  results = []
+                  for b in r.content:
+                      if b.type == "tool_use":
+                          key = (b.name, json.dumps(b.input, sort_keys=True))
+                          if key in seen:
+                              return {"answer": None, "steps": step, "calls": calls, "stop": "repeat"}
+                          seen.add(key)
+                          calls.append((b.name, b.input))
+                          try:
+                              out = station.run_tool(b.name, b.input)
+                              results.append({"type": "tool_result", "tool_use_id": b.id, "content": out})
+                          except ToolError as e:
+                              results.append({"type": "tool_result", "tool_use_id": b.id, "content": f"Error: {e}", "is_error": True})
+                  messages.append({"role": "user", "content": results})
+              return {"answer": None, "steps": max_steps, "calls": calls, "stop": "max_steps"}
+
+          after = measure(run_v3)
+          print(after)
+        tests: |
+          a = check_object("after")
+          assert a["success"] == 1, f"All 6 tasks should now end with a correct answer (including 'sensor offline' and 'bookings last 1 to 4 hours'); success is {a['success']:.2f}. Do the error results include the ToolError message?"
+          assert a["repeat_rate"] == 0, f"repeat_rate should be 0; got {a['repeat_rate']:.3f}."
+          assert a["mean_steps"] <= 3, f"mean_steps should be at most 3; got {a['mean_steps']:.2f}."
+          assert a["cost"] < user["before"]["cost"] / 10, "The fixed harness should cost less than a tenth of v1 for the same batch."
+          import aikit as _a
+          _loop = _a.FakeClaude(_a.scripted_agent([{"tool": "crew_roster", "input": {}}]), clock=_a.VirtualClock())
+          _s = user["run_v3"](user["TASKS"][0], client=_loop)
+          assert _s.get("stop") == "repeat" and _s.get("steps") == 2, f"Your repeat detector didn't fire: against a model that repeats one call forever, run_v3 returned stop={_s.get('stop')!r} after {_s.get('steps')} steps. Return stop='repeat' before running a call already in `seen`."
+      - instructions:
+          - "Prove the seatbelt works even when the model misbehaves: run `run_v3` on `TASKS[0]` with `client=looper` (a model that repeats one call forever) and store the result in `seatbelt`."
+          - "Store `report = {\"v1\": before, \"v2\": after_fix1, \"v3\": after}` and print each row."
+        hint: "`seatbelt = run_v3(TASKS[0], client=looper)`. It should stop with `stop == \"repeat\"` on the second step."
+        sample_code: |
+          looper = aikit.FakeClaude(aikit.scripted_agent([{"tool": "crew_roster", "input": {}}]), clock=aikit.VirtualClock())
+          seatbelt = ____
+          report = ____
+          print(seatbelt["stop"], seatbelt["steps"])
+          for name, row in report.items():
+              print(name, {k: round(v, 3) for k, v in row.items()})
+        solution: |
+          looper = aikit.FakeClaude(aikit.scripted_agent([{"tool": "crew_roster", "input": {}}]), clock=aikit.VirtualClock())
+          seatbelt = run_v3(TASKS[0], client=looper)
+          report = {"v1": before, "v2": after_fix1, "v3": after}
+          print(seatbelt["stop"], seatbelt["steps"])
+          for name, row in report.items():
+              print(name, {k: round(v, 3) for k, v in row.items()})
+        tests: |
+          s = check_object("seatbelt")
+          assert s.get("stop") == "repeat" and s.get("steps") == 2, f"run_v3 should stop the looping model with stop='repeat' at step 2; got {s.get('stop')!r} at step {s.get('steps')}."
+          r = check_object("report")
+          assert list(r) == ["v1", "v2", "v3"], "`report` should have the keys v1, v2 and v3, in that order."
+          assert r["v3"]["success"] == 1 and r["v1"]["success"] == 0, "Use the three measurements you made: before, after_fix1 and after."
+    success_msg: |
+      Success went from 0 to 6/6, repeats to zero, and cost dropped by over 90%. Notice the order: first the history bug
+      that hid everything else, then the opaque errors, and the guards last, as a seatbelt. That's the usual order of
+      agent debugging.

@@ -1,0 +1,195 @@
+title: Semantic similarity and its traps
+description: Score answers by embedding similarity to the reference, see what embeddings capture and what they throw away, and measure how far a similarity threshold agrees with humans.
+exercises:
+  - id: similarity-slides
+    type: video
+    title: Similarity is about topic, not truth
+    slides: |
+      # Comparing meaning instead of words
+
+      Token metrics miss paraphrases. **Embedding similarity** embeds both texts and compares the vectors:
+
+      ```python
+      # a real embedding API (Voyage, OpenAI, a local sentence-transformer...) returns one vector per text
+      gold_vec, answer_vec = embed([gold, answer])
+      score = cosine(gold_vec, answer_vec)        # about 1 = same direction, 0 = unrelated
+      ```
+
+      In this course `aikit.embed` stands in for the API: 64-dimensional LSA vectors fitted on the Helios handbook,
+      already L2-normalised. Same interface, same habits.
+
+      ---
+
+      ## The mechanism
+
+      $$\cos(u, v) = \frac{u \cdot v}{\lVert u \rVert\,\lVert v \rVert}$$
+
+      When vectors are normalised to length 1 (most embedding APIs do this, and `aikit.embed` does), the cosine is just the
+      dot product, so you can score a whole batch at once with one matrix product.
+
+      What an embedding encodes is mostly **what the text is about**: humidity, airlocks, scrubbers. Two answers about
+      the same thing point the same way, whether they're right or wrong.
+
+      ---
+
+      ## The traps
+
+      | gold | answer | cosine | correct? |
+      | --- | --- | --- | --- |
+      | Hold the airlock at 0.7 bar for 8 minutes. | ...for **5** minutes. | 1.00 | no |
+      | ORBIT can **never** open the airlock. | ORBIT can open the airlock. | 1.00 | no |
+      | Gather in Module **D**. | Gather in Module **F**. | 1.00 | no |
+      | Between 60% and 75%. | I don't know based on the provided documents. | -0.19 | depends |
+      | Every week. | Weekly. | 0.00 | yes |
+
+      This stand-in drops numbers, single letters and stop words like *never* entirely. Real embedding models do better
+      on paraphrases ("weekly"), but they share the blind spot: a different number or a dropped negation barely moves the
+      vector. And a refusal is always "dissimilar", even when refusing is exactly right.
+
+      ---
+
+      ## When similarity is the right tool
+
+      | use it for | avoid it for |
+      | --- | --- |
+      | paraphrase-heavy, long-form answers (summaries, explanations) | answers that hinge on one number, name or "not" |
+      | clustering failures during error analysis | refusals and unanswerable questions |
+      | finding near-duplicate test cases | safety-critical facts |
+      | a cheap first-pass signal to sort outputs for review | the only metric on a dashboard |
+
+      Cost is low: one embedding call per text, and gold vectors can be cached. The hidden cost is false confidence:
+      a high similarity score looks like "correct", and it doesn't mean that.
+
+  - id: cosine-by-hand
+    type: coding
+    title: Cosine similarity by hand
+    context: |
+      `gold` is the reference for "What humidity range is normal in hydroponics?" and `answers` holds three ORBIT
+      answers: the right range, a refusal, and a **wrong** range. `embed` is `aikit.embed`.
+    instructions:
+      - "Write `cosine(u, v)`: the dot product divided by the product of the two norms (`np.linalg.norm`)."
+      - "Embed `[gold] + answers` into `vecs` with a single `embed` call."
+      - Store the cosine between the gold vector and each answer vector, in order, in the list `sims`.
+      - Store the norm of every row of `vecs` in `norms`. They're all 1, so `vecs[1:] @ vecs[0]` gives the same numbers as `sims`.
+    hint: |
+      `u @ v / (np.linalg.norm(u) * np.linalg.norm(v))`. Row norms: `np.linalg.norm(vecs, axis=1)`.
+    pre_code: |
+      import numpy as np
+      from aikit import embed
+      gold = "Between 60% and 75%."
+      answers = [
+          "Air humidity in Module C should stay between 60% and 75%.",
+          "I don't know based on the provided documents.",
+          "Air humidity in Module C should stay between 40% and 50%.",
+      ]
+    sample_code: |
+      def cosine(u, v):
+          return ____
+
+      vecs = ____
+      sims = [cosine(vecs[0], v) for v in ____]
+      norms = ____
+      print(np.round(sims, 3), np.round(norms, 3))
+    solution: |
+      def cosine(u, v):
+          return u @ v / (np.linalg.norm(u) * np.linalg.norm(v))
+
+      vecs = embed([gold] + answers)
+      sims = [cosine(vecs[0], v) for v in vecs[1:]]
+      norms = np.linalg.norm(vecs, axis=1)
+      print(np.round(sims, 3), np.round(norms, 3))
+    tests: |
+      import numpy as np
+      check_object("cosine")
+      assert abs(user["cosine"](np.array([3.0, 4.0]), np.array([6.0, 8.0])) - 1.0) < 1e-9, "cosine([3, 4], [6, 8]) should be 1.0: divide the dot product by both norms."
+      assert abs(user["cosine"](np.array([1.0, 0.0]), np.array([0.0, 2.0]))) < 1e-9, "Perpendicular vectors should have cosine 0."
+      check_object("vecs")
+      assert np.shape(user["vecs"]) == (4, 64), "`vecs` should hold 4 vectors of 64 dimensions: embed `[gold] + answers` in one call."
+      check_equal("sims", msg="`sims` should list the cosine between `vecs[0]` and each of the 3 answer vectors, in order.")
+      check_equal("norms", msg="`norms` should be `np.linalg.norm(vecs, axis=1)`.")
+    success_msg: |
+      The wrong range (40-50%) scores 0.90, almost as high as the right one (0.96), and the refusal scores below zero.
+      The embedding sees "humidity range in Module C" in both answers and ignores the digits.
+
+  - id: similarity-trap
+    type: mc
+    title: Predict the highest similarity
+    question: |
+      Which pair gets the **highest** cosine similarity from `aikit.embed`?
+    context: The console has `sim(a, b)` loaded. Predict first, then check.
+    pre_code: |
+      from aikit import embed
+      def sim(a, b):
+          return float(embed(a) @ embed(b))
+    options:
+      - text: "`Hold the airlock at 0.7 bar for 8 minutes.` vs `Hold the airlock at 0.7 bar for 5 minutes.`"
+        correct: true
+        feedback: |
+          Right: 1.00, a perfect match for a dangerous mistake. The tokenizer keeps only words of two or more
+          characters, so "8" and "5" vanish and the two texts become identical. Real embedding models keep the digits
+          but still give this pair a very high score: the sentence is 95% the same.
+      - text: "`Between 60% and 75%.` vs `Air humidity in Module C should stay between 60% and 75%.`"
+        feedback: |
+          High (0.96), and here it's deserved, but not the highest. The longer answer adds words the gold doesn't
+          have, which pulls the vectors slightly apart. Check with `sim(...)`.
+      - text: "`Every week.` vs `Recalibrate the pH probe every week.`"
+        feedback: |
+          0.85: the extra topic words (pH, probe, recalibrate) move the answer's vector away from the bare gold answer.
+      - text: "`Every week.` vs `Weekly.`"
+        feedback: |
+          0.00 with this stand-in: "weekly" and "every week" share no tokens, and LSA learned no link between them from
+          the handbook. A modern embedding model would rate this pair highly. Paraphrase is what they're good at.
+    hint: Think about which tokens survive tokenisation. Single characters and digits don't.
+
+  - id: similarity-threshold
+    type: coding
+    title: Does a similarity threshold agree with humans?
+    context: |
+      `answerable` has 82 ORBIT outputs with `gold`, `answer` and the crew's verdict `human` (1 = acceptable). Turn
+      similarity into pass/fail with a threshold and measure how often it agrees with the crew.
+    instructions:
+      - "Embed all gold answers and all answers (two batched `embed` calls) and store the row-wise cosine in `answerable['sim']`."
+      - "Store a dict `agreement` mapping each threshold in `[0.3, 0.5, 0.7]` to the share of rows where `(sim >= t)` equals `human`."
+      - Store the threshold with the highest agreement in `best_t`.
+      - "Store in `false_passes` the number of rows with `sim >= best_t` but `human == 0`: wrong answers that similarity would accept."
+    hint: |
+      Vectors are normalised, so the row-wise cosine is `(G * A).sum(axis=1)` where `G = embed(list(answerable["gold"]))`
+      and `A = embed(list(answerable["answer"]))`. Use `max(agreement, key=agreement.get)` for the best threshold.
+    pre_code: |
+      import numpy as np
+      from aikit import embed
+      from kits.llm_evaluation import orbit_log
+      log = orbit_log()
+      answerable = log[log["type"] != "unanswerable"].reset_index(drop=True)
+    sample_code: |
+      G = embed(list(answerable["gold"]))
+      A = embed(list(answerable["answer"]))
+      answerable["sim"] = ____
+
+      agreement = {t: ____ for t in [0.3, 0.5, 0.7]}
+      best_t = ____
+      false_passes = ____
+      print(agreement, best_t, false_passes)
+    solution: |
+      G = embed(list(answerable["gold"]))
+      A = embed(list(answerable["answer"]))
+      answerable["sim"] = (G * A).sum(axis=1)
+
+      agreement = {t: ((answerable["sim"] >= t).astype(int) == answerable["human"]).mean() for t in [0.3, 0.5, 0.7]}
+      best_t = max(agreement, key=agreement.get)
+      false_passes = int(((answerable["sim"] >= best_t) & (answerable["human"] == 0)).sum())
+      print(agreement, best_t, false_passes)
+    tests: |
+      check_object("answerable")
+      assert "sim" in user["answerable"].columns, "Add a `sim` column to `answerable`."
+      import numpy as np
+      assert np.allclose(user["answerable"]["sim"].values, sol["answerable"]["sim"].values, atol=1e-6), "`sim` should be the cosine between each gold answer and its answer: `(G * A).sum(axis=1)`."
+      check_object("agreement")
+      for t, v in sol["agreement"].items():
+          assert t in user["agreement"] and abs(user["agreement"][t] - v) < 1e-9, f"agreement[{t}] should be the share of rows where (sim >= {t}) equals `human`; expected {v:.3f}."
+      check_equal("best_t", msg="`best_t` should be the threshold with the highest agreement.")
+      check_equal("false_passes", msg="Count the rows with `sim >= best_t` and `human == 0`.")
+    success_msg: |
+      The best threshold agrees with the crew 85% of the time, which sounds fine until you look at the 7 false passes:
+      wrong numbers and stale procedures that read just like the right answer. Raising the threshold doesn't remove them;
+      it only adds false fails. Similarity can't see the error, so no threshold will catch it.

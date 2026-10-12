@@ -1,0 +1,373 @@
+title: Bridging MCP into an agent
+description: The host turns MCP tools into model tools and model tool calls into MCP requests. Build that bridge, decide how to split servers, and fix name collisions.
+exercises:
+  - id: bridge-slides
+    type: video
+    title: The host is the bridge
+    slides: |
+      # Two vocabularies, one host in the middle
+
+      | | MCP side (server) | host does | model side (Messages API) |
+      | --- | --- | --- | --- |
+      | definitions | `tools/list` → `name`, `description`, **`inputSchema`** | rename, namespace | `tools=[{name, description, **input_schema**}]` |
+      | a call | `tools/call {name, arguments}` | look up which client owns it | `tool_use {id, name, input}` |
+      | the result | `{content: [...], isError}` | copy content, map the flag | `tool_result {tool_use_id, content, is_error}` |
+
+      The model never sees MCP. It sees ordinary tools. Everything that makes MCP work for the model
+      happens in this translation layer, and so do most bugs.
+
+      ---
+
+      ## Converting definitions
+
+      ```python
+      def to_anthropic(tool, prefix=""):
+          return {"name": prefix + tool["name"],             # e.g. "helios-sensors__get_sensor"
+                  "description": tool.get("description", ""), # untouched: it's the model's only guide
+                  "input_schema": tool["inputSchema"]}        # camelCase -> snake_case key
+
+      tools, routes = [], {}
+      for client in clients:                                  # one client per server
+          prefix = client.server_info["name"] + "__"
+          for t in client.list_tools():
+              api_tool = to_anthropic(t, prefix)
+              tools.append(api_tool)
+              routes[api_tool["name"]] = (client, t["name"])  # model name -> (who, MCP name)
+      ```
+
+      API tool names must be **unique** and match `^[a-zA-Z0-9_-]{1,64}$`. So `server__tool` works,
+      but `server/tool` or `server.tool` is rejected.
+
+      ---
+
+      ## Routing calls and results
+
+      ```python
+      import anthropic
+      llm = anthropic.Anthropic()
+      messages = [{"role": "user", "content": question}]
+      while True:
+          r = llm.messages.create(model="claude-sonnet-5-5", max_tokens=1000, tools=tools, messages=messages)
+          messages.append({"role": "assistant", "content": r.content})
+          if r.stop_reason != "tool_use":
+              break
+          results = []
+          for b in r.content:
+              if b.type == "tool_use":
+                  client, mcp_name = routes[b.name]
+                  out = client.call_tool(mcp_name, b.input)       # with the SDK: await session.call_tool(...)
+                  results.append({"type": "tool_result", "tool_use_id": b.id,
+                                  "content": out["content"], "is_error": out.get("isError", False)})
+          messages.append({"role": "user", "content": results})
+      ```
+
+      Text blocks pass straight through. MCP image content (`data` + `mimeType`) becomes an API image
+      block with a base64 `source`. Always cap the steps.
+
+      ---
+
+      ## One big server or many small ones?
+
+      | | one big `helios-station` server | servers per domain (sensors, crew, ops) | one server per tool |
+      | --- | --- | --- | --- |
+      | processes and handshakes | 1 | 3 | many |
+      | blast radius of a crash or compromise | everything | one domain | one tool |
+      | permissions per host | filter tool by tool in every host | connect only the domains a host needs | very fine, very tedious |
+      | team ownership and deploys | one shared release | each team ships its own | fragmented |
+      | tools in the model's context | all of them, unless filtered | only connected domains | only connected tools |
+
+      More tools in context cost tokens on **every** call and make the right tool harder to pick.
+      Split along **ownership and permission boundaries**, and connect each host only to what it needs.
+
+      ---
+
+      ## Playbook: the wrong tool after adding a server
+
+      **Symptom:** after connecting `helios-galley`, sensor questions get answers about ovens.
+
+      **Measure:** a labelled set of requests with the server that *should* handle each. Run them, record
+      which server actually received the call, and compute **routing accuracy**.
+
+      **Diagnose, usual causes in order:**
+      1. **Name collision**: two servers both expose `get_status`. A dict keyed by name keeps only one of them; a
+         list sends duplicates, which the API rejects.
+      2. **Overlapping descriptions**: two tools both claim "status".
+      3. **Too many tools**: the right one is drowned out.
+
+      **Fix:** namespace every tool with its server, sharpen descriptions, and connect fewer servers.
+      **Verify** routing accuracy on the same labelled set.
+
+  - id: convert-tools
+    type: coding
+    title: MCP tools to model tools
+    context: |
+      ORBIT's host is connected to two servers; `clients` holds an initialised `MCPClient` for each, and
+      `client.server_info["name"]` is the server's name. `llm` is a fake Messages API client that checks
+      tool definitions like the real API (unique names, `^[a-zA-Z0-9_-]{1,64}$`).
+    instructions:
+      - "Write `to_anthropic(tool, prefix=\"\")` returning `name` (prefix + MCP name), `description` and `input_schema` (from `inputSchema`)."
+      - "Loop over `clients`: use `prefix = client.server_info[\"name\"] + \"__\"`, append each converted tool to `tools`, and set `routes[api_name] = (client, mcp_name)`."
+      - "Print the tool names, and check the API accepts them: `llm.messages.create(model=MODEL, max_tokens=50, tools=tools, messages=[{\"role\": \"user\", \"content\": \"hi\"}])`."
+    hint: "`{\"name\": prefix + tool[\"name\"], \"description\": tool.get(\"description\", \"\"), \"input_schema\": tool[\"inputSchema\"]}`"
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import MCPClient, sensor_server, crew_server, StrictClaude, MODEL
+      station = aikit.helios.Station()
+      clients = []
+      for server in (sensor_server(station), crew_server(station)):
+          client = MCPClient(server)
+          client.initialize()
+          clients.append(client)
+      llm = StrictClaude("Hello from ORBIT.", clock=aikit.VirtualClock())
+    sample_code: |
+      def to_anthropic(tool, prefix=""):
+          return ____
+
+      tools, routes = [], {}
+      for client in clients:
+          prefix = ____
+          for t in client.list_tools():
+              api_tool = to_anthropic(t, prefix)
+              tools.append(api_tool)
+              routes[api_tool["name"]] = ____
+
+      print([t["name"] for t in tools])
+      llm.messages.create(model=MODEL, max_tokens=50, tools=tools, messages=[{"role": "user", "content": "hi"}])
+    solution: |
+      def to_anthropic(tool, prefix=""):
+          return {"name": prefix + tool["name"], "description": tool.get("description", ""),
+                  "input_schema": tool["inputSchema"]}
+
+      tools, routes = [], {}
+      for client in clients:
+          prefix = client.server_info["name"] + "__"
+          for t in client.list_tools():
+              api_tool = to_anthropic(t, prefix)
+              tools.append(api_tool)
+              routes[api_tool["name"]] = (client, t["name"])
+
+      print([t["name"] for t in tools])
+      llm.messages.create(model=MODEL, max_tokens=50, tools=tools, messages=[{"role": "user", "content": "hi"}])
+    tests: |
+      check_object("tools")
+      names = [t.get("name") for t in user["tools"]]
+      assert names == ["helios-sensors__get_sensor", "helios-crew__crew_roster", "helios-crew__send_message"], f"Tool names should be '<server>__<tool>', got {names}."
+      for t in user["tools"]:
+          assert set(t) == {"name", "description", "input_schema"}, f"Each API tool has exactly name, description and input_schema; got keys {sorted(t)}."
+          assert t["input_schema"].get("type") == "object" and t["description"], "Copy `inputSchema` into `input_schema`, and keep the description."
+      r = user["routes"]
+      assert set(r) == set(names), "`routes` needs one entry per API tool name."
+      c, mcp_name = r["helios-crew__send_message"]
+      assert mcp_name == "send_message" and c is user["clients"][1], "`routes[api_name]` should be `(client, mcp_name)`, the original MCP name without the prefix."
+    success_msg: |
+      The model sees three ordinary tools, and the host knows which connection owns each one. Prefixes
+      also help the model: "helios-sensors" in a name is one more hint about what the tool is for.
+
+  - id: bridge-loop
+    type: coding
+    title: Close the loop
+    context: |
+      `tools` and `routes` are built as in the last exercise. `llm` is ORBIT's model (a fake that picks a
+      tool from its description, then answers with the result). The E/co2 sensor is offline. Write the
+      agent loop that uses MCP tools.
+    instructions:
+      - "Write `ask(question)`: start `messages` with the user's question and loop at most 5 times: call `llm.messages.create(model=MODEL, max_tokens=500, tools=tools, messages=messages)` and append the assistant turn."
+      - "If `stop_reason` isn't `\"tool_use\"`, return `(r.text, messages)`. Otherwise, for each `tool_use` block, route it with `routes[block.name]`, call `client.call_tool(mcp_name, block.input)`, and collect a `tool_result` with `tool_use_id`, the MCP `content` and `is_error` taken from `isError`."
+      - "Append all results as one user message, and loop."
+      - "Store `answer, _ = ask(\"What is the humidity in hydroponics module C?\")` and `_, co2_messages = ask(\"What is the CO2 in engineering module E?\")`. Print both."
+    hint: |
+      `{"type": "tool_result", "tool_use_id": block.id, "content": out["content"], "is_error": out.get("isError", False)}`.
+      All results of one turn go in a single `{"role": "user", "content": results}` message.
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import MCPClient, sensor_server, crew_server, StrictClaude, anthropic_tool, MODEL
+      station = aikit.helios.Station(offline=[("E", "co2")])
+      tools, routes = [], {}
+      for server in (sensor_server(station), crew_server(station)):
+          client = MCPClient(server)
+          client.initialize()
+          for t in client.list_tools():
+              api_tool = anthropic_tool(t, prefix=client.server_info["name"] + "__")
+              tools.append(api_tool)
+              routes[api_tool["name"]] = (client, t["name"])
+      llm = StrictClaude(aikit.tool_chooser("ORBIT: {result}"), clock=aikit.VirtualClock())
+    sample_code: |
+      def ask(question):
+          messages = [{"role": "user", "content": question}]
+          for _ in range(5):
+              r = llm.messages.create(model=MODEL, max_tokens=500, tools=tools, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return r.text, messages
+              results = []
+              for block in r.content:
+                  if block.type == "tool_use":
+                      client, mcp_name = ____
+                      out = ____
+                      results.append(____)
+              messages.append({"role": "user", "content": results})
+          return "step limit reached", messages
+
+      answer, _ = ask("What is the humidity in hydroponics module C?")
+      _, co2_messages = ask("What is the CO2 in engineering module E?")
+      print(answer)
+      print(co2_messages[-1])
+    solution: |
+      def ask(question):
+          messages = [{"role": "user", "content": question}]
+          for _ in range(5):
+              r = llm.messages.create(model=MODEL, max_tokens=500, tools=tools, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return r.text, messages
+              results = []
+              for block in r.content:
+                  if block.type == "tool_use":
+                      client, mcp_name = routes[block.name]
+                      out = client.call_tool(mcp_name, block.input)
+                      results.append({"type": "tool_result", "tool_use_id": block.id,
+                                      "content": out["content"], "is_error": out.get("isError", False)})
+              messages.append({"role": "user", "content": results})
+          return "step limit reached", messages
+
+      answer, _ = ask("What is the humidity in hydroponics module C?")
+      _, co2_messages = ask("What is the CO2 in engineering module E?")
+      print(answer)
+      print(co2_messages[-1])
+    tests: |
+      check_object("answer")
+      assert "68" in user["answer"], f"The hydroponics answer should include the reading (68.0). Got: {user['answer']!r}"
+      calls = [m for c, _ in user["routes"].values() for d, m in c.wire if d == "->" and m.get("method") == "tools/call"]
+      assert calls, "Route each tool_use through MCP: `client.call_tool(mcp_name, block.input)`."
+      assert all(not m["params"]["name"].startswith("helios") for m in calls), "Call the server with the original MCP name (the second item in `routes[...]`), not the prefixed API name."
+      check_object("co2_messages")
+      results = [b for m in user["co2_messages"] if m["role"] == "user" and isinstance(m["content"], list) for b in m["content"] if isinstance(b, dict) and b.get("type") == "tool_result"]
+      assert results, "`co2_messages` should contain a tool_result block for the CO2 call."
+      assert results[0].get("is_error") is True, "The E/co2 sensor is offline, so its tool_result needs `is_error: True`, mapped from the MCP result's `isError`."
+    success_msg: |
+      That's the complete bridge: discover, convert, route, map the result back. The offline sensor
+      reached the model as `is_error: True`, so the model knows the call failed instead of reading the
+      error text as a reading.
+
+  - id: server-split
+    type: mc
+    title: How should Helios split its servers?
+    question: |
+      Five tools exist: `get_sensor` (environment team), `crew_roster` and `send_message` (crew-support
+      team), `book_module` and `open_airlock` (operations team). The night-shift monitor host should only
+      read sensors; ORBIT for the crew needs sensors and messaging; the commander's console needs all
+      five. Each team wants to deploy on its own schedule. How do you package the servers?
+    options:
+      - text: One helios-station server with all five tools, and every host filters out the tools it shouldn't use
+        feedback: It works if every host filters correctly forever. One mistake gives the night shift open_airlock, and every deploy needs all three teams to agree.
+      - text: Three servers along team lines (sensors, crew, ops); each host connects only to the servers it needs
+        correct: true
+        feedback: Right. The boundaries match ownership and permissions. The night shift connects to sensors only, ORBIT to sensors and crew, the console to all three, and the dangerous tools live where only the console reaches them.
+      - text: Five servers, one per tool, for the finest control
+        feedback: That's five processes and five handshakes for the console, and splits within teams that nobody asked for. Fine-grained control can come from host allowlists without one server per tool.
+      - text: Two servers, read-only and write, regardless of team
+        feedback: Read/write is a sensible permission line, but it puts send_message, book_module and open_airlock in one server owned by two teams, and ORBIT would get open_airlock just to send messages.
+    hint: Which split lines up with who owns the code and with who is allowed to use it?
+
+  - id: collision-fix
+    type: coding
+    title: "Troubleshoot: sensor questions answered by the galley"
+    context: |
+      Since `helios-galley` was connected, some crew questions get the wrong server. Both servers expose a
+      tool called `get_status`. `clients` maps server name to client. `measure(tools, routes)` runs the 8
+      labelled requests in `REQUESTS` through ORBIT and returns the **routing accuracy**: the share handled by
+      the right server. `routes` maps API tool name to `(client, mcp_name)`. `build_naive()` is the
+      host's current code.
+    instructions:
+      - "**Measure:** `baseline = measure(*build_naive())`. Print it."
+      - "**Diagnose:** store `tool_names`, the sorted list of every MCP tool name across `clients` (with duplicates)."
+      - "**Fix:** write `build_namespaced()` returning `(tools, routes)` with names `<server>__<tool>`, using `anthropic_tool(t, prefix)`."
+      - "**Verify:** `fixed = measure(*build_namespaced())` must be at least 0.9."
+    hint: |
+      The naive code keys a dict by the bare tool name, so the second `get_status` silently replaces the
+      first. In the fix: `prefix = name + "__"`, `api = anthropic_tool(t, prefix)`, `routes[api["name"]] = (client, t["name"])`.
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import MCPServer, MCPClient, StrictClaude, anthropic_tool, run_agent
+
+      sensors = MCPServer("helios-sensors", tools=[{
+          "name": "get_status", "description": "Environment status of one station module: temperature, humidity, CO2, oxygen and pressure.",
+          "inputSchema": {"type": "object", "properties": {"module": {"type": "string", "enum": list("ABCDEF"),
+              "description": "Module letter: A habitat, B lab, C hydroponics, D storage, E engineering, F docking."}}, "required": ["module"]},
+          "fn": lambda a: {"module": a["module"], "status": "nominal"}}])
+      galley = MCPServer("helios-galley", tools=[{
+          "name": "get_status", "description": "Status of a galley appliance (oven, water heater or freezer).",
+          "inputSchema": {"type": "object", "properties": {"appliance": {"type": "string", "enum": ["oven", "water heater", "freezer"]}}, "required": ["appliance"]},
+          "fn": lambda a: {"appliance": a["appliance"], "status": "on"}}])
+      clients = {}
+      for server in (sensors, galley):
+          clients[server.name] = MCPClient(server)
+          clients[server.name].initialize()
+
+      REQUESTS = [("Is the hydroponics module environment OK?", "helios-sensors"), ("Is the galley oven on?", "helios-galley"),
+                  ("What is the status of the engineering module?", "helios-sensors"), ("Is the freezer working?", "helios-galley"),
+                  ("Check the docking module status.", "helios-sensors"), ("Is the water heater on?", "helios-galley"),
+                  ("Status of the lab module please.", "helios-sensors"), ("Has the galley freezer failed?", "helios-galley")]
+
+      def measure(tools, routes):
+          hits = 0
+          for question, want in REQUESTS:
+              before = {name: len(c.wire) for name, c in clients.items()}
+              llm = StrictClaude(aikit.tool_chooser(), clock=aikit.VirtualClock())
+              run_agent(llm, tools, lambda n, a: routes[n][0].call_tool(routes[n][1], a), question)
+              got = [name for name, c in clients.items() if len(c.wire) > before[name]]
+              hits += got == [want]
+          return hits / len(REQUESTS)
+
+      def build_naive():
+          tools, routes = {}, {}
+          for name, client in clients.items():
+              for t in client.list_tools():
+                  tools[t["name"]] = anthropic_tool(t)
+                  routes[t["name"]] = (client, t["name"])
+          return list(tools.values()), routes
+    sample_code: |
+      baseline = measure(*build_naive())
+      print("baseline:", baseline)
+
+      tool_names = ____
+      print(tool_names)
+
+      def build_namespaced():
+          tools, routes = [], {}
+          for name, client in clients.items():
+              for t in client.list_tools():
+                  api = ____
+                  tools.append(api)
+                  routes[api["name"]] = ____
+          return tools, routes
+
+      fixed = measure(*build_namespaced())
+      print("fixed:", fixed)
+    solution: |
+      baseline = measure(*build_naive())
+      print("baseline:", baseline)
+
+      tool_names = sorted(t["name"] for c in clients.values() for t in c.list_tools())
+      print(tool_names)
+
+      def build_namespaced():
+          tools, routes = [], {}
+          for name, client in clients.items():
+              for t in client.list_tools():
+                  api = anthropic_tool(t, name + "__")
+                  tools.append(api)
+                  routes[api["name"]] = (client, t["name"])
+          return tools, routes
+
+      fixed = measure(*build_namespaced())
+      print("fixed:", fixed)
+    tests: |
+      check_equal("baseline", 0.5, msg="`baseline` should be `measure(*build_naive())`.")
+      check_equal("tool_names", ["get_status", "get_status"], msg="`tool_names` should list every MCP tool name across both clients, sorted: the duplicate is the clue.")
+      check_object("fixed")
+      assert user["fixed"] >= 0.9, f"Routing accuracy is {user['fixed']:.2f}; it should reach 0.9. Give each tool a unique '<server>__<tool>' name and route it to its own client."
+    success_msg: |
+      From 0.5 to 1.0. The naive host never raised an error: a dict quietly kept one `get_status`
+      and sent half the questions to the wrong server. Collisions only show up when you **measure
+      routing**, which is why a labelled request set belongs in a host's tests.

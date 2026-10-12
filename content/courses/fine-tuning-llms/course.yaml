@@ -1,0 +1,44 @@
+title: Fine-Tuning and Model Adaptation
+description: 'Decide when to fine-tune instead of prompting or retrieving, prepare training data,
+  implement and train LoRA adapters, and understand preference tuning and distillation.'
+level: advanced
+est_hours: 4
+prerequisites:
+- nlp-transformers
+- llm-evaluation
+objectives:
+- Choose between prompting, RAG and fine-tuning for a given problem
+- Prepare instruction data and mask the loss correctly
+- Implement LoRA from scratch and train adapters
+- Explain DPO and distillation, and detect overfitting and forgetting
+requires:
+- torch
+chapters:
+- id: when-to-tune
+  title: When to fine-tune
+  description: Prompt vs RAG vs fine-tune, costs and risks.
+  lessons:
+  - prompt-rag-or-tune
+  - costs-risks
+  - try-prompting-first
+- id: data-prep
+  title: Preparing data
+  description: Instruction datasets, chat formats and loss masking.
+  lessons:
+  - instruction-data
+  - splits-leakage
+  - loss-masking
+- id: lora
+  title: LoRA
+  description: Low-rank adapters from scratch, training and tuning rank.
+  lessons:
+  - lora-from-scratch
+  - train-lora
+  - rank-overfit-forget
+- id: alignment-distillation
+  title: Preferences and distillation
+  description: DPO and distilling a large model into a small one.
+  lessons:
+  - preference-dpo
+  - dpo-in-practice
+  - distillation

@@ -1,0 +1,43 @@
+title: 'LLMOps: Shipping LLM Apps'
+description: 'Run LLM applications in production: tracing and dashboards, diagnosing latency and cost,
+  caching and model routing, reliability under failures and rate limits, and safe releases.'
+level: advanced
+est_hours: 4
+prerequisites:
+- llm-evaluation
+objectives:
+- Instrument an LLM app with traces and find bottlenecks
+- Diagnose and fix high latency and high cost, measuring the trade-offs
+- Make calls reliable with retries, timeouts, fallbacks and rate limiting
+- Release prompt and model changes safely and watch for drift
+requires: []
+chapters:
+- id: observability
+  title: Observability
+  description: Traces and spans, structured logs and latency dashboards.
+  lessons:
+  - traces-spans
+  - structured-logs
+  - dashboards
+- id: cost-latency
+  title: Cost and latency
+  description: Token economics, the latency playbook, caching, model routing and concurrency.
+  lessons:
+  - token-economics
+  - latency-playbook
+  - caching-routing
+  - batching-async
+- id: reliability
+  title: Reliability
+  description: Retries with backoff, timeouts, fallbacks, circuit breakers and rate limits.
+  lessons:
+  - retries-backoff
+  - timeouts-fallbacks
+  - rate-limits
+- id: release
+  title: Releasing changes
+  description: Prompt versioning, canary and shadow releases, and online signals and drift.
+  lessons:
+  - prompt-versioning
+  - canary-shadow
+  - online-signals

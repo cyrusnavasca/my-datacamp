@@ -1,0 +1,275 @@
+title: Schemas and validation with pydantic
+description: Valid JSON isn't valid data. Define a schema, validate every reply with field-level errors, and use tool use as a schema.
+exercises:
+  - id: schema-slides
+    type: video
+    title: From parseable to correct
+    slides: |
+      # Valid JSON, wrong data
+
+      `json.loads` succeeding only means the **syntax** is right. These all parse:
+
+      ```json
+      {"crew": "Priya Raman", "module": "Module E", "severity": "urgent", "summary": "Leak"}
+      {"crew": "Priya Raman", "severity": "high"}
+      {"crew": "Priya Raman", "module": "E", "severity": "high", "summary": "...400 characters..."}
+      ```
+
+      The maintenance system expects `module` to be one letter, `severity` one of three values, and every field present.
+      Pass any of these along and something downstream breaks quietly: a ticket filed under no module, an alert rule that
+      never fires on `"urgent"`.
+
+      **Validate at the boundary**: check every model reply against a schema before anything else uses it.
+
+      ---
+
+      ## A schema in pydantic
+
+      ```python
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field, ValidationError
+
+      class IncidentReport(BaseModel):
+          crew: str
+          module: Optional[Literal["A", "B", "C", "D", "E", "F"]]   # required key, may be null
+          severity: Literal["low", "normal", "high"]
+          summary: str = Field(max_length=120)
+
+      try:
+          report = IncidentReport.model_validate(data)                # data: the parsed dict
+      except ValidationError as e:
+          for err in e.errors():
+              print(err["loc"], err["msg"])                           # ('severity',) Input should be 'low', 'normal' or 'high'
+      ```
+
+      `e.errors()` gives **field-level** errors: which field, what was wrong, and what the input was. That's exactly what
+      you'll feed back to the model in the next lesson.
+
+      ---
+
+      ## One schema, three uses
+
+      ```python
+      schema = IncidentReport.model_json_schema()    # standard JSON Schema, generated from the class
+      ```
+
+      1. **In the prompt**: paste the schema, or a plain-language version, so the model knows the rules.
+      2. **As a tool's `input_schema`**: the model "calls" a tool whose arguments are your record.
+      3. **To validate** the reply: the same class checks what came back.
+
+      One source of truth means the prompt, the API call and the validator can't drift apart.
+
+      ---
+
+      ## Tool use as a schema
+
+      ```python
+      tool = {"name": "record_incident",
+              "description": "Record an incident report for the maintenance system.",
+              "input_schema": IncidentReport.model_json_schema()}
+
+      r = client.messages.create(
+          model="claude-sonnet-5-5", max_tokens=500, messages=[{"role": "user", "content": ticket}],
+          tools=[tool], tool_choice={"type": "tool", "name": "record_incident"},   # force this tool
+      )
+      block = next(b for b in r.content if b.type == "tool_use")
+      report = IncidentReport.model_validate(block.input)    # block.input is already a dict
+      ```
+
+      No fences, no preamble and no `json.loads`. But the model still chooses the **values**. Unless the API enforces the
+      schema strictly, an enum can still be violated, so validate anyway. **Descriptions are prompts too**: a `description` on a
+      field ("single letter A-F") steers the values.
+
+      ---
+
+      ## Which approach?
+
+      | approach | syntax errors | wrong values | tokens per call | portability |
+      | --- | --- | --- | --- | --- |
+      | prompt + parse + validate | possible | caught by the validator | lowest | any model |
+      | tool use as schema | essentially none | still possible; validate | + schema size | models with tool use |
+      | constrained decoding (structured outputs) | none | rarer, since the schema is enforced | + schema size | APIs that support it |
+
+      All three end with the same validator. They differ in how often it fails, and so in how many retries you pay for.
+
+  - id: incident-model
+    type: coding
+    title: Validate ORBIT's incident reports
+    context: |
+      `raw_reports` holds 8 parsed replies from ORBIT's extractor. Some are fine; others have values the maintenance system
+      would choke on. Write the schema and sort them out.
+    instructions:
+      - "Define `IncidentReport(BaseModel)`: `crew` a string; `module` one of `A`-`F` or `None` (the key is required); `severity` one of `low`, `normal`, `high`; `summary` a string of at most 120 characters."
+      - "Validate every dict. Put the indexes of the valid ones in `valid_ids` (a list)."
+      - "Store `problems`: a dict mapping each invalid index to the **sorted list** of field names that failed, taken from `e.errors()`."
+    hint: |
+      `module: Optional[Literal["A", "B", "C", "D", "E", "F"]]` and `summary: str = Field(max_length=120)`.
+      The field name is `err["loc"][0]` for each `err` in `e.errors()`; use `sorted({...})` to dedupe and sort.
+    pre_code: |
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field, ValidationError
+      raw_reports = [
+          {"crew": "Kenji Watanabe", "module": "C", "severity": "normal", "summary": "Pump in Module C is making a grinding noise"},
+          {"crew": "Noor Haddad", "module": None, "severity": "high", "summary": "Odd message asking for a password"},
+          {"crew": "Priya Raman", "module": "Module B", "severity": "low", "summary": "Printer in Module B says offline"},
+          {"crew": "Tomas Lindqvist", "module": "E", "severity": "urgent", "summary": "Leak near the valve in Module E"},
+          {"crew": "Lucía Ferreira", "module": "F", "summary": "Fan in Module F is stuck"},
+          {"crew": "Amara Okafor", "module": "A", "severity": "normal", "summary": "The heater keeps clicking. " * 6},
+          {"crew": "Kenji Watanabe", "module": "G", "severity": "critical", "summary": "Heater grinding"},
+          {"crew": "Noor Haddad", "module": "D", "severity": "low", "summary": "Running low on gloves in Module D"},
+      ]
+    sample_code: |
+      class IncidentReport(BaseModel):
+          crew: str
+          module: ____
+          severity: ____
+          summary: str = ____
+
+      valid_ids, problems = [], {}
+      for i, data in enumerate(raw_reports):
+          try:
+              IncidentReport.model_validate(data)
+              valid_ids.append(i)
+          except ValidationError as e:
+              problems[i] = ____
+      print(valid_ids)
+      print(problems)
+    solution: |
+      class IncidentReport(BaseModel):
+          crew: str
+          module: Optional[Literal["A", "B", "C", "D", "E", "F"]]
+          severity: Literal["low", "normal", "high"]
+          summary: str = Field(max_length=120)
+
+      valid_ids, problems = [], {}
+      for i, data in enumerate(raw_reports):
+          try:
+              IncidentReport.model_validate(data)
+              valid_ids.append(i)
+          except ValidationError as e:
+              problems[i] = sorted({err["loc"][0] for err in e.errors()})
+      print(valid_ids)
+      print(problems)
+    tests: |
+      check_object("IncidentReport")
+      M = user["IncidentReport"]
+      try:
+          M.model_validate({"crew": "x", "severity": "low", "summary": "s"})
+          raise AssertionError("A report without a `module` key should fail: declare `module` without a default, so it's required even though it may be None.")
+      except Exception as ex:
+          if isinstance(ex, AssertionError):
+              raise
+      check_equal("valid_ids", [0, 1, 7], msg="`valid_ids` should be [0, 1, 7]. Check that `module` accepts None and that `severity` accepts only low/normal/high.")
+      check_equal("problems", {2: ["module"], 3: ["severity"], 4: ["severity"], 5: ["summary"], 6: ["module", "severity"]},
+                  msg="`problems` should map each invalid index to the sorted field names from `e.errors()` (use `err['loc'][0]`). Did you set `max_length=120` on summary?")
+    success_msg: |
+      Five of eight replies parsed fine but would have corrupted the maintenance log. You now know which field failed and
+      why, which is exactly what a repair prompt needs.
+
+  - id: tool-as-schema
+    type: coding
+    title: Tool use as a schema
+    context: |
+      Instead of asking for JSON text, ORBIT will "call" a `record_incident` tool whose input is the report. `client` is the
+      extractor model, `IncidentReport` the schema from the last exercise, and `TICKET` a crew ticket.
+    instructions:
+      - "Build `tool`: name `record_incident`, a short description, and `input_schema` from `IncidentReport.model_json_schema()`."
+      - "Call the model with `tools=[tool]` and `tool_choice={\"type\": \"tool\", \"name\": \"record_incident\"}`. Store the `tool_use` block's `.input` in `first_input`."
+      - "Validating `first_input` fails. Store the sorted failing field names in `first_errors`."
+      - "Fix the schema, not the data: give `tool[\"input_schema\"][\"properties\"][\"module\"]` a `description` saying it is a single letter A-F (or null). Call again and store the validated model in `report`."
+    hint: |
+      `block = next(b for b in r.content if b.type == "tool_use")`. For the fix, e.g.
+      `tool["input_schema"]["properties"]["module"]["description"] = "Module as a single letter A-F, or null if none."`
+    pre_code: |
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field, ValidationError
+      import aikit
+      from kits.llm_apis_prompting import incident_extractor, MODEL
+      client = aikit.FakeClaude(incident_extractor(), clock=aikit.VirtualClock())
+
+      class IncidentReport(BaseModel):
+          crew: str
+          module: Optional[Literal["A", "B", "C", "D", "E", "F"]]
+          severity: Literal["low", "normal", "high"]
+          summary: str = Field(max_length=120)
+
+      TICKET = "Ticket from Priya Raman: Leak near the hatch seal in Module E, small puddle on the floor."
+
+      def call(tool):
+          return client.messages.create(model=MODEL, max_tokens=500, tools=[tool],
+                                        tool_choice={"type": "tool", "name": tool["name"]},
+                                        messages=[{"role": "user", "content": TICKET}])
+    sample_code: |
+      tool = {
+          "name": "record_incident",
+          "description": "Record an incident report for the maintenance system.",
+          "input_schema": ____,
+      }
+      r = call(tool)
+      block = next(b for b in r.content if b.type == ____)
+      first_input = ____
+      print(first_input)
+
+      try:
+          IncidentReport.model_validate(first_input)
+          first_errors = []
+      except ValidationError as e:
+          first_errors = ____
+      print(first_errors)
+
+      tool["input_schema"]["properties"]["module"]["description"] = ____
+      r = call(tool)
+      block = next(b for b in r.content if b.type == "tool_use")
+      report = ____
+      print(report)
+    solution: |
+      tool = {
+          "name": "record_incident",
+          "description": "Record an incident report for the maintenance system.",
+          "input_schema": IncidentReport.model_json_schema(),
+      }
+      r = call(tool)
+      block = next(b for b in r.content if b.type == "tool_use")
+      first_input = block.input
+      print(first_input)
+
+      try:
+          IncidentReport.model_validate(first_input)
+          first_errors = []
+      except ValidationError as e:
+          first_errors = sorted({err["loc"][0] for err in e.errors()})
+      print(first_errors)
+
+      tool["input_schema"]["properties"]["module"]["description"] = "Module as a single letter A-F, or null if none."
+      r = call(tool)
+      block = next(b for b in r.content if b.type == "tool_use")
+      report = IncidentReport.model_validate(block.input)
+      print(report)
+    tests: |
+      check_object("tool")
+      assert user["tool"].get("input_schema", {}).get("properties", {}).get("severity"), "`input_schema` should be `IncidentReport.model_json_schema()`."
+      check_equal("first_input", msg="`first_input` should be the `.input` dict of the tool_use block from the first call.")
+      check_equal("first_errors", ["module"], msg="`first_errors` should hold the sorted field names that failed validation on the first call.")
+      check_object("report")
+      r = user["report"]
+      assert getattr(r, "module", None) == "E" and getattr(r, "severity", None) == "high", "`report` should be a validated IncidentReport with module 'E'. Did the module description say it's a single letter?"
+    success_msg: |
+      Tool use removed every syntax problem, but the model still wrote "Module E", because the schema said "string from
+      this list" without saying what a module looks like. One description fixed it. Field descriptions are part of your prompt.
+
+  - id: which-check-catches
+    type: classify
+    title: Which layer catches it?
+    prompt: Each problem appears in a reply. Sort it by the first check that catches it.
+    hint: Parsing catches broken syntax. The schema catches wrong types, values and missing fields. Business rules need facts the schema doesn't know.
+    zones: [JSON parsing, Schema validation, Business-rule check]
+    items:
+      - { text: "Reply ends with a trailing comma before the closing brace", zone: JSON parsing }
+      - { text: "Reply was cut off by max_tokens in the middle of a string", zone: JSON parsing }
+      - { text: "Keys are wrapped in single quotes", zone: JSON parsing }
+      - { text: "severity is \"urgent\"", zone: Schema validation }
+      - { text: "module is \"Module E\" instead of \"E\"", zone: Schema validation }
+      - { text: "The summary field is missing", zone: Schema validation }
+      - { text: "crew names someone who isn't on the station roster", zone: Business-rule check }
+      - { text: "A leak in a life-support module is filed with severity low", zone: Business-rule check }
+      - { text: "Two reports for the same ticket id within one minute", zone: Business-rule check }

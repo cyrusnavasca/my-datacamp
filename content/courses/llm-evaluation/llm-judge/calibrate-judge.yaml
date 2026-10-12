@@ -1,0 +1,293 @@
+title: "Lab: calibrate the judge"
+description: A judge is a model with an error rate. Measure its agreement with human labels using Cohen's kappa, diagnose its disagreements, fix the rubric, and verify on held-out labels.
+exercises:
+  - id: calibrate-slides
+    type: video
+    title: Trust the judge only as far as you've measured it
+    slides: |
+      # Symptom: the judge is more generous than the crew
+
+      ORBIT's eval runs a 1-10 judge and counts 7+ as a pass. The judge says **68%** of answers pass. On the same 40
+      outputs, the crew passed **48%**.
+
+      Every number the judge produces inherits its errors. Before you report a judge's numbers, measure the judge
+      itself against human labels, exactly as you did for metrics.
+
+      ---
+
+      ## Measure: agreement beyond chance
+
+      Raw agreement flatters a judge when labels are imbalanced. **Cohen's kappa** subtracts the agreement you'd get
+      by chance from the two raters' pass rates:
+
+      $$\kappa = \frac{p_o - p_e}{1 - p_e}, \qquad p_e = p^{h}_{pass}\,p^{j}_{pass} + p^{h}_{fail}\,p^{j}_{fail}$$
+
+      $p_o$ is observed agreement. If humans pass 50% and the judge passes 70%, chance alone gives
+      $p_e = 0.5 \cdot 0.7 + 0.5 \cdot 0.3 = 0.5$. A judge with $p_o = 0.75$ then has $\kappa = 0.5$.
+
+      ```python
+      from sklearn.metrics import cohen_kappa_score
+      cohen_kappa_score(human, judge)     # 1 = perfect, 0 = chance level, < 0 = worse than chance
+      ```
+
+      Rough reading: below 0.4 poor, 0.4-0.6 moderate, **0.6-0.8 substantial** (a common bar for an eval judge), above
+      0.8 near-perfect.
+
+      ---
+
+      ## Diagnose: read the disagreements
+
+      Split them into **false passes** (judge passes, humans fail) and **false fails**, then group by where the outputs
+      came from or by taxonomy category:
+
+      | pattern | usual cause | fix |
+      | --- | --- | --- |
+      | confident hallucinations and wrong numbers pass | judge isn't comparing to the reference | add the reference and a "contains the key facts" criterion |
+      | correct refusals fail | no rule for unanswerable questions | "If the reference says UNANSWERABLE, a refusal passes" |
+      | padded answers score higher | verbosity bias | binary criteria; "length doesn't matter" |
+      | right number plus a stale one passes | no contradiction rule | "fails if it states a different value" |
+      | random-looking misses | noise; a small judge model | examples in the prompt, then a bigger model |
+
+      Moving the pass threshold on a 1-10 scale doesn't fix any of these. It trades false passes for false fails.
+
+      ---
+
+      ## Fix in order of cost, then verify
+
+      1. Binary criteria instead of a scale. Free.
+      2. Include the reference and say how to use it. Free.
+      3. Explicit rules for refusals and contradictions. Free.
+      4. Two or three worked examples from your disagreements. More tokens per call.
+      5. A stronger judge model. About 3× (sonnet over haiku) to 5× (opus over haiku) the cost.
+      6. One judge per criterion. k calls per output.
+
+      Tune on the **dev** labels, then report κ on **test** labels you never looked at. A rubric tuned until it matches 40
+      labels can memorise them.
+
+      ---
+
+      ## How many labels, and when to recalibrate
+
+      κ from 40 labels is uncertain, roughly ±0.2. 100-200 labels make it trustworthy. Labels cost expert time, but a
+      miscalibrated judge costs more: every decision made from its numbers.
+
+      **Recalibrate** whenever the judge model, the rubric, or the app's output style changes. A new ORBIT version that
+      writes longer answers can push a judge's verbosity bias into play, even though nothing about the judge changed.
+
+  - id: kappa-by-hand
+    type: coding
+    title: Cohen's kappa by hand
+    context: |
+      `human` and `judge` are pass (1) / fail (0) labels for the same 40 ORBIT outputs: the crew's, and a draft judge's.
+    instructions:
+      - Store the observed agreement (share of positions where the lists match) in `p_o`.
+      - "Store the chance agreement in `p_e`: P(human passes) × P(judge passes) + P(human fails) × P(judge fails)."
+      - Store `(p_o - p_e) / (1 - p_e)` in `kappa`, and sklearn's `cohen_kappa_score(human, judge)` in `kappa_sklearn`.
+    hint: |
+      With numpy arrays: `p_o = (h == j).mean()`, `ph, pj = h.mean(), j.mean()`, `p_e = ph * pj + (1 - ph) * (1 - pj)`.
+    pre_code: |
+      import numpy as np
+      from sklearn.metrics import cohen_kappa_score
+      human = [1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0]
+      judge = [1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    sample_code: |
+      h, j = np.array(human), np.array(judge)
+      p_o = ____
+      p_e = ____
+      kappa = ____
+      kappa_sklearn = ____
+      print(round(p_o, 3), round(p_e, 3), round(kappa, 3), round(kappa_sklearn, 3))
+    solution: |
+      h, j = np.array(human), np.array(judge)
+      p_o = (h == j).mean()
+      p_e = h.mean() * j.mean() + (1 - h.mean()) * (1 - j.mean())
+      kappa = (p_o - p_e) / (1 - p_e)
+      kappa_sklearn = cohen_kappa_score(human, judge)
+      print(round(p_o, 3), round(p_e, 3), round(kappa, 3), round(kappa_sklearn, 3))
+    tests: |
+      check_equal("p_o", msg="`p_o` is the share of positions where `human` and `judge` agree.")
+      check_equal("p_e", msg="`p_e` = P(h=1)·P(j=1) + P(h=0)·P(j=0), using each list's own pass rate.")
+      check_equal("kappa", msg="`kappa` = (p_o - p_e) / (1 - p_e).")
+      check_equal("kappa_sklearn", msg="Use `cohen_kappa_score(human, judge)` from sklearn.metrics.")
+      assert abs(user["kappa"] - user["kappa_sklearn"]) < 1e-9, "Your hand-computed kappa should equal sklearn's."
+    success_msg: |
+      65% raw agreement sounds passable, but half of it is chance: κ is about 0.3. This draft judge is closer to a coin
+      flip than to the crew.
+
+  - id: kappa-vs-accuracy
+    type: mc
+    title: Which judge would you keep?
+    question: |
+      On 200 labelled outputs, the crew passes 90%. **Judge A** says PASS to everything. **Judge B** agrees with the crew on
+      85% of outputs and catches most of the failures, with κ = 0.45. Which is the better judge?
+    options:
+      - text: Judge A, because 90% agreement beats 85%.
+        feedback: |
+          Judge A agrees 90% of the time by never reading anything. Its κ is exactly 0: no better than chance. It would
+          report every regression as a pass.
+      - text: Judge B, because its kappa shows real agreement beyond chance while A's is 0.
+        correct: true
+        feedback: |
+          Right. With a 90% base rate, accuracy rewards always saying pass. κ corrects for that: A sits at 0, B at 0.45.
+          B is still only moderate, so calibrate it further, but it carries signal and A carries none.
+      - text: Neither can be judged without more data.
+        feedback: |
+          200 labels is plenty to see that a judge which always says PASS has κ = 0. You don't need more data to rule it out.
+      - text: They're equivalent, since both are above 80% accuracy.
+        feedback: |
+          Accuracy hides the difference that matters: whether the judge ever catches a failure. A never does.
+    hint: What is the kappa of a rater who gives the same answer every time?
+
+  - id: calibrate-boss
+    type: sequential
+    title: "Mission: calibrate the judge"
+    context: |
+      `dev` and `test` each hold 40 ORBIT outputs labelled by the crew (`human`), with `question`, `reference`, `answer`
+      and `source` (`v1`, `v2`, `v3`, `v4`, `outage`, `padded` or `wrong number`). `ask_judge(rubric, rows)` returns the
+      judge's raw reply for every row; the question, reference and response are already in tags. `BASELINE` is the
+      current 1-10 rubric. `cohen_kappa_score` is imported.
+    pre_code: |
+      import re
+      import aikit
+      import pandas as pd
+      from sklearn.metrics import cohen_kappa_score
+      from kits.llm_evaluation import judge_model, judge_set, JUDGE_MODEL
+      judge = aikit.FakeClaude(judge_model(), clock=aikit.VirtualClock())
+      _labels = judge_set()
+      dev = _labels[_labels["split"] == "dev"].reset_index(drop=True)
+      test = _labels[_labels["split"] == "test"].reset_index(drop=True)
+      BASELINE = ("You are grading ORBIT's answer. Rate its quality on a scale of 1 to 10, where 10 is excellent. "
+                  "End with Score: N/10.")
+
+      def ask_judge(rubric, rows):
+          """The judge's raw reply for every row of `rows`."""
+          out = []
+          for _, r in rows.iterrows():
+              content = (f"{rubric}\n\n<question>{r.question}</question>\n<reference>{r.reference}</reference>\n"
+                         f"<response>{r.answer}</response>")
+              msg = judge.messages.create(model=JUDGE_MODEL, max_tokens=300, messages=[{"role": "user", "content": content}])
+              out.append(msg.content[0].text)
+          return out
+    steps:
+      - instructions:
+          - "**Measure.** Run `ask_judge(BASELINE, dev)` and parse the integer after `Score: ` from each reply into the list `scores`."
+          - "Store `[int(s >= 7) for s in scores]` in `baseline_pass`, and `cohen_kappa_score(dev['human'], baseline_pass)` in `baseline_kappa`."
+          - "Is the threshold the problem? Store a dict `kappa_by_threshold` mapping each threshold in `[5, 6, 7, 8]` to its kappa."
+        hint: "`int(re.search(r'Score: (\\d+)', t).group(1))` for each reply `t`."
+        sample_code: |
+          texts = ask_judge(BASELINE, dev)
+          scores = ____
+          baseline_pass = [int(s >= 7) for s in scores]
+          baseline_kappa = ____
+          kappa_by_threshold = {t: ____ for t in [5, 6, 7, 8]}
+          print(round(baseline_kappa, 3), {t: round(k, 3) for t, k in kappa_by_threshold.items()})
+        solution: |
+          texts = ask_judge(BASELINE, dev)
+          scores = [int(re.search(r"Score: (\d+)", t).group(1)) for t in texts]
+          baseline_pass = [int(s >= 7) for s in scores]
+          baseline_kappa = cohen_kappa_score(dev["human"], baseline_pass)
+          kappa_by_threshold = {t: cohen_kappa_score(dev["human"], [int(s >= t) for s in scores]) for t in [5, 6, 7, 8]}
+          print(round(baseline_kappa, 3), {t: round(k, 3) for t, k in kappa_by_threshold.items()})
+        tests: |
+          check_equal("scores", msg="`scores` should hold the integer after 'Score: ' in each reply, in row order.")
+          check_equal("baseline_kappa", msg="`baseline_kappa` is `cohen_kappa_score(dev['human'], baseline_pass)`.")
+          check_object("kappa_by_threshold")
+          for t, k in sol["kappa_by_threshold"].items():
+              assert t in user["kappa_by_threshold"] and abs(user["kappa_by_threshold"][t] - k) < 1e-9, f"kappa_by_threshold[{t}] should be the kappa when scores >= {t} count as pass."
+      - instructions:
+          - "**Diagnose.** Add `baseline_pass` to `dev` as a column `judge`."
+          - "Store the rows where the judge passes but the crew fails in `false_pass`, and the reverse in `false_fail`."
+          - "Store `false_pass['source'].value_counts()` in `fp_sources` and `false_fail['source'].value_counts()` in `ff_sources`. Print a few `false_fail` answers: what are they?"
+        hint: "`dev[(dev['judge'] == 1) & (dev['human'] == 0)]`"
+        sample_code: |
+          dev["judge"] = baseline_pass
+          false_pass = ____
+          false_fail = ____
+          fp_sources = ____
+          ff_sources = ____
+          print(fp_sources, ff_sources, sep="\n\n")
+          print(false_fail[["reference", "answer"]].to_string())
+        solution: |
+          dev["judge"] = baseline_pass
+          false_pass = dev[(dev["judge"] == 1) & (dev["human"] == 0)]
+          false_fail = dev[(dev["judge"] == 0) & (dev["human"] == 1)]
+          fp_sources = false_pass["source"].value_counts()
+          ff_sources = false_fail["source"].value_counts()
+          print(fp_sources, ff_sources, sep="\n\n")
+          print(false_fail[["reference", "answer"]].to_string())
+        tests: |
+          check_object("false_pass")
+          assert len(user["false_pass"]) == len(sol["false_pass"]), f"`false_pass` should have {len(sol['false_pass'])} rows: judge == 1 and human == 0."
+          check_object("false_fail")
+          assert len(user["false_fail"]) == len(sol["false_fail"]), f"`false_fail` should have {len(sol['false_fail'])} rows: judge == 0 and human == 1."
+          check_object("fp_sources")
+          assert dict(user["fp_sources"]) == dict(sol["fp_sources"]), "`fp_sources` should be `false_pass['source'].value_counts()`."
+          check_object("ff_sources")
+          assert dict(user["ff_sources"]) == dict(sol["ff_sources"]), "`ff_sources` should be `false_fail['source'].value_counts()`."
+      - instructions:
+          - "**Fix.** Write a new `RUBRIC` that asks for PASS or FAIL against specific criteria, aimed at the disagreements you just read (made-up answers, wrong numbers, refusals to unanswerable questions)."
+          - "Parse each reply of `ask_judge(RUBRIC, dev)` into `dev_verdicts` (1 for PASS, 0 for FAIL) and store `cohen_kappa_score(dev['human'], dev_verdicts)` in `dev_kappa`. It must reach **0.6**."
+        hint: |
+          Use the reference: "PASS only if the response contains the key facts of the reference answer and does not
+          contradict it. If the reference says UNANSWERABLE, PASS only if the response says it doesn't know; a refusal to
+          a question that has a reference answer is a FAIL." Parse with `re.search(r"\b(PASS|FAIL)\b", t).group(1) == "PASS"`.
+        sample_code: |
+          RUBRIC = """____"""
+
+          dev_verdicts = [____ for t in ask_judge(RUBRIC, dev)]
+          dev_kappa = ____
+          print(round(dev_kappa, 3))
+        solution: |
+          RUBRIC = """You are grading an answer from ORBIT, the Helios-7 station assistant, against a reference answer.
+          Answer PASS only if every criterion holds, otherwise FAIL:
+          1. The response contains the key facts of the reference answer.
+          2. The response does not contradict the reference: no different number for the same thing.
+          3. If the reference says UNANSWERABLE, the response must refuse (say it doesn't know).
+             If the reference has an answer, a refusal is a FAIL.
+          Write one sentence of reasoning, then the verdict as PASS or FAIL."""
+
+          dev_verdicts = [int(re.search(r"\b(PASS|FAIL)\b", t).group(1) == "PASS") for t in ask_judge(RUBRIC, dev)]
+          dev_kappa = cohen_kappa_score(dev["human"], dev_verdicts)
+          print(round(dev_kappa, 3))
+        tests: |
+          from sklearn.metrics import cohen_kappa_score
+          check_object("RUBRIC")
+          check_object("dev_verdicts")
+          v = list(user["dev_verdicts"])
+          assert len(v) == 40 and all(x in (0, 1, True, False) for x in v), "`dev_verdicts` should hold one 1 or 0 per dev row."
+          check_object("dev_kappa")
+          assert abs(user["dev_kappa"] - cohen_kappa_score(user["dev"]["human"], v)) < 1e-9, "`dev_kappa` should be `cohen_kappa_score(dev['human'], dev_verdicts)`."
+          assert user["dev_kappa"] >= 0.6, (f"Kappa on dev is {user['dev_kappa']:.2f}; it needs 0.6. Check the rows that still disagree. "
+                                            "Does the rubric ask the judge to compare with the reference? Does it say what to do when the reference is UNANSWERABLE, and with refusals?")
+      - instructions:
+          - "**Verify.** Run the same `RUBRIC` on `test`, which you haven't looked at. Store the parsed verdicts in `test_verdicts` and the kappa in `test_kappa`. It must also reach **0.6**."
+          - "Store the judge's pass rate on `test` in `judge_rate` and the crew's in `human_rate`. They should be within 10 points of each other."
+        hint: Same parsing as the previous step, with `test` instead of `dev`.
+        sample_code: |
+          test_verdicts = ____
+          test_kappa = ____
+          judge_rate = ____
+          human_rate = test["human"].mean()
+          print(round(test_kappa, 3), round(judge_rate, 3), round(human_rate, 3))
+        solution: |
+          test_verdicts = [int(re.search(r"\b(PASS|FAIL)\b", t).group(1) == "PASS") for t in ask_judge(RUBRIC, test)]
+          test_kappa = cohen_kappa_score(test["human"], test_verdicts)
+          judge_rate = sum(test_verdicts) / len(test_verdicts)
+          human_rate = test["human"].mean()
+          print(round(test_kappa, 3), round(judge_rate, 3), round(human_rate, 3))
+        tests: |
+          from sklearn.metrics import cohen_kappa_score
+          check_object("test_verdicts")
+          v = list(user["test_verdicts"])
+          assert len(v) == 40, "`test_verdicts` should hold one verdict per row of `test`."
+          check_object("test_kappa")
+          assert abs(user["test_kappa"] - cohen_kappa_score(user["test"]["human"], v)) < 1e-9, "`test_kappa` should be `cohen_kappa_score(test['human'], test_verdicts)`."
+          assert user["test_kappa"] >= 0.6, (f"Kappa on the held-out labels is {user['test_kappa']:.2f}; it needs 0.6. If dev passed but test didn't, "
+                                             "the rubric may be fitted to dev. Make the criteria general (facts, contradictions, refusals) rather than case by case.")
+          check_object("judge_rate")
+          assert abs(user["judge_rate"] - sum(v) / len(v)) < 1e-9, "`judge_rate` is the share of PASS verdicts on test."
+          assert abs(user["judge_rate"] - user["human_rate"]) <= 0.1, f"The judge passes {user['judge_rate']:.0%} of test outputs against the crew's {user['human_rate']:.0%}; they should be within 10 points."
+    success_msg: |
+      From κ ≈ 0.1 to above 0.6 on labels the rubric never saw, with the same judge model at the same price. The fixes were
+      the reference, binary criteria and two explicit rules. Now the judge's pass rate is a number you can report, with
+      "κ = … on 40 held-out labels" next to it.

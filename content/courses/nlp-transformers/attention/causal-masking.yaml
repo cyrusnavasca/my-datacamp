@@ -1,0 +1,269 @@
+title: Causal masks and debugging attention
+description: Stop tokens from seeing the future, then find and fix the classic attention bugs with two measurements.
+exercises:
+  - id: intro
+    type: video
+    title: No peeking at the future
+    slides: |
+      # Why a language model needs a mask
+
+      A decoder like GPT predicts token $t+1$ from tokens $1..t$. In training, all positions are
+      computed **in parallel** in one forward pass, so without a mask position 3 can attend to position 4,
+      the very token it is supposed to predict.
+
+      The model learns to copy instead of predict:
+
+      - training loss drops suspiciously fast, often near zero;
+      - at generation time there is no future to copy, and output is garbage.
+
+      A **causal mask** makes position $i$ attend only to positions $j \le i$.
+
+      ---
+
+      ## The mask goes in **before** the softmax
+
+      ```python
+      n = scores.shape[-1]
+      future = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)   # True above the diagonal
+      scores = scores.masked_fill(future, float("-inf"))
+      weights = torch.softmax(scores, dim=-1)
+      ```
+
+      ```
+      weights for n = 4      j=0   j=1   j=2   j=3
+                     i=0    1.00   0     0     0
+                     i=1    0.38  0.62   0     0
+                     i=2    0.21  0.45  0.34   0
+                     i=3    0.10  0.30  0.25  0.35
+      ```
+
+      $e^{-\infty} = 0$, and the softmax renormalises over the allowed positions, so every row still sums
+      to 1. `F.scaled_dot_product_attention(q, k, v, is_causal=True)` does the same.
+
+      ---
+
+      ## Padding masks
+
+      Batches pad short messages to the same length. Padding tokens must not be attended to, so mask the
+      **key** columns where `attention_mask == 0`, combined with the causal mask:
+
+      ```python
+      pad = attention_mask[:, None, :] == 0            # (batch, 1, n): broadcast over queries
+      scores = scores.masked_fill(future | pad, float("-inf"))
+      ```
+
+      If a whole row is masked, every entry is $-\infty$ and the softmax returns **NaN**. Guard against
+      empty sequences, or use a large negative number such as `torch.finfo(scores.dtype).min`.
+
+      ---
+
+      ## Troubleshooting attention: symptom, check, cause
+
+      | symptom | check first | usual cause | fix |
+      | --- | --- | --- | --- |
+      | rows of `weights` do not sum to 1 | `weights.sum(-1)` | mask multiplied in **after** softmax, or softmax on the wrong `dim` | mask scores with $-\infty$ before softmax; `dim=-1` |
+      | loss too good to be true; garbage generation | leakage test (below), `weights.triu(1).abs().max()` | no mask, wrong triangle, or masked with `0` instead of $-\infty$ | `torch.triu(..., diagonal=1)` filled with `-inf` |
+      | NaN in outputs or loss | `torch.isnan(weights).any(-1)` | fully masked rows | handle empty sequences; finite fill value |
+      | mask "works" for batch 1 only | print `mask.shape` | broadcast over the wrong axis (masking queries, not keys) | shape `(batch, 1, n)` or `(n, n)` |
+
+      ---
+
+      ## The leakage test: check behaviour, not code
+
+      Weights can look fine and still leak. A test that cannot be fooled: change the **future** and check
+      the **past** does not move.
+
+      ```python
+      def leak_test(attn, t=2):
+          x = torch.randn(1, 6, 8)
+          x2 = x.clone()
+          x2[:, t + 1:] = torch.randn(1, 6 - t - 1, 8)   # rewrite everything after position t
+          out1, _ = attn(x, x, x)
+          out2, _ = attn(x2, x2, x2)
+          return (out1[:, :t + 1] - out2[:, :t + 1]).abs().max().item()   # must be 0
+      ```
+
+      Put this in your test suite. It catches every mask bug in the table above, including ones you have
+      not thought of yet.
+
+  - id: apply-mask
+    type: coding
+    title: Apply a causal mask
+    context: |
+      `q`, `k` and `v` have shape `(1, 6, 8)`. `torch`, `math` and `F` are imported. Build causal attention
+      by hand and check it against PyTorch.
+    instructions:
+      - "Compute the scaled scores `q @ k.transpose(-2, -1) / math.sqrt(8)`."
+      - "Store a boolean `(6, 6)` mask that is `True` strictly above the diagonal in `future`, and fill those scores with `float(\"-inf\")`."
+      - "Store the row-wise softmax in `weights` and `weights @ v` in `out`."
+    hint: "`future = torch.triu(torch.ones(6, 6, dtype=torch.bool), diagonal=1)` and `scores.masked_fill(future, float(\"-inf\"))`."
+    pre_code: |
+      import math
+      import torch
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      q, k, v = torch.randn(3, 1, 6, 8).unbind(0)
+    sample_code: |
+      scores = q @ k.transpose(-2, -1) / math.sqrt(8)
+      future = ____
+      scores = scores.masked_fill(____, ____)
+      weights = torch.softmax(scores, dim=-1)
+      out = ____
+
+      print(weights[0].round(decimals=2))
+      print(torch.allclose(out, F.scaled_dot_product_attention(q, k, v, is_causal=True), atol=1e-6))
+    solution: |
+      scores = q @ k.transpose(-2, -1) / math.sqrt(8)
+      future = torch.triu(torch.ones(6, 6, dtype=torch.bool), diagonal=1)
+      scores = scores.masked_fill(future, float("-inf"))
+      weights = torch.softmax(scores, dim=-1)
+      out = weights @ v
+
+      print(weights[0].round(decimals=2))
+      print(torch.allclose(out, F.scaled_dot_product_attention(q, k, v, is_causal=True), atol=1e-6))
+    tests: |
+      import torch, torch.nn.functional as F
+      w = check_object("weights")
+      assert tuple(w.shape) == (1, 6, 6), f"`weights` should have shape (1, 6, 6); got {tuple(w.shape)}."
+      assert torch.triu(w[0], diagonal=1).abs().max().item() == 0, "Weights above the diagonal (the future) must be exactly 0. Mask with `diagonal=1` and fill with -inf **before** the softmax."
+      assert torch.allclose(w.sum(-1), torch.ones(1, 6), atol=1e-6), "Each row of `weights` should still sum to 1."
+      assert w[0, 0, 0].item() > 0.999, "Token 0 can only see itself, so weights[0, 0, 0] should be 1. Did you mask the diagonal too? Use `diagonal=1`."
+      o = check_object("out")
+      assert torch.allclose(o, F.scaled_dot_product_attention(user["q"], user["k"], user["v"], is_causal=True), atol=1e-5), "`out` should be `weights @ v` and match `F.scaled_dot_product_attention(q, k, v, is_causal=True)`."
+    success_msg: Upper triangle zero, rows sum to 1, and identical to PyTorch's `is_causal=True`.
+
+  - id: mask-bugs
+    type: classify
+    title: Match the symptom to the bug
+    prompt: Each symptom was seen in a buggy attention layer. Sort it by the most likely cause.
+    hint: "Ask two questions: do the **rows** sum to 1, and do masked positions get exactly 0? Then: is anything NaN?"
+    zones: [Mask applied after the softmax, Softmax over the wrong dimension, Masked with 0 instead of -inf, Every position in a row masked]
+    items:
+      - { text: "Row sums are 1.0 for the last token but smaller and smaller for earlier tokens", zone: Mask applied after the softmax }
+      - { text: "weights = torch.softmax(scores, -1) * torch.tril(ones) appears in the code", zone: Mask applied after the softmax }
+      - { text: "Columns of the weight matrix sum to 1, but rows do not", zone: Softmax over the wrong dimension }
+      - { text: "The last token always puts weight 1.0 on itself, whatever the input", zone: Softmax over the wrong dimension }
+      - { text: "Future positions get small but non-zero weights, and training loss is suspiciously low", zone: Masked with 0 instead of -inf }
+      - { text: "Upper-triangle scores are exactly 0.0 before the softmax", zone: Masked with 0 instead of -inf }
+      - { text: "Loss turns into NaN on the first batch that contains an empty message", zone: Every position in a row masked }
+      - { text: "Outputs are NaN only for sequences that are all padding", zone: Every position in a row masked }
+
+  - id: debug-attention
+    type: sequential
+    title: "Debug ORBIT's autocomplete attention"
+    context: |
+      ORBIT's message autocomplete trains to a loss near zero and then suggests nonsense. The attention
+      function `buggy_attention(q, k, v)` returns `(out, weights)`. Measure what is wrong, then fix it.
+      `torch`, `math` and `F` are imported; `q`, `k`, `v` are a test batch of shape `(1, 6, 8)`.
+    pre_code: |
+      import math
+      import torch
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      q, k, v = torch.randn(3, 1, 6, 8).unbind(0)
+      def buggy_attention(q, k, v):
+          n = q.shape[-2]
+          scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+          future = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+          scores = scores.masked_fill(future, 0.0)
+          weights = torch.softmax(scores, dim=-2)
+          return weights @ v, weights
+    steps:
+      - instructions:
+          - "**Measure the weights.** Run `buggy_attention(q, k, v)`. Store the largest absolute deviation of any row sum from 1 in `row_err`."
+          - "Store the largest weight strictly above the diagonal (a weight on the future) in `future_weight`."
+        hint: "`(w.sum(-1) - 1).abs().max().item()` and `torch.triu(w[0], diagonal=1).max().item()`."
+        sample_code: |
+          _, w = buggy_attention(q, k, v)
+          row_err = ____
+          future_weight = ____
+          print(f"row sum error {row_err:.3f}, max future weight {future_weight:.3f}")
+        solution: |
+          _, w = buggy_attention(q, k, v)
+          row_err = (w.sum(-1) - 1).abs().max().item()
+          future_weight = torch.triu(w[0], diagonal=1).max().item()
+          print(f"row sum error {row_err:.3f}, max future weight {future_weight:.3f}")
+        tests: |
+          check_equal("row_err", tol=1e-5, msg="`row_err` is the max of |weights.sum(-1) - 1| for the buggy function.")
+          check_equal("future_weight", tol=1e-5, msg="`future_weight` is the largest entry of `torch.triu(w[0], diagonal=1)`.")
+      - instructions:
+          - "**Measure the behaviour.** Write `leak_test(attn, t=2)` as in the slides: run `attn` on a random `x` of shape `(1, 6, 8)` and on a copy whose positions after `t` are replaced, and return the largest change in the outputs at positions `0..t`."
+          - "Store `leak_test(buggy_attention)` in `buggy_leak`."
+        hint: "`x2 = x.clone(); x2[:, t + 1:] = torch.randn(1, 6 - t - 1, 8)`, then compare `out1[:, :t + 1]` with `out2[:, :t + 1]`."
+        sample_code: |
+          def leak_test(attn, t=2):
+              x = torch.randn(1, 6, 8)
+              x2 = x.clone()
+              x2[:, t + 1:] = ____
+              out1, _ = attn(x, x, x)
+              out2, _ = attn(x2, x2, x2)
+              return ____
+
+          buggy_leak = leak_test(buggy_attention)
+          print(f"past outputs moved by {buggy_leak:.3f} when only the future changed")
+        solution: |
+          def leak_test(attn, t=2):
+              x = torch.randn(1, 6, 8)
+              x2 = x.clone()
+              x2[:, t + 1:] = torch.randn(1, 6 - t - 1, 8)
+              out1, _ = attn(x, x, x)
+              out2, _ = attn(x2, x2, x2)
+              return (out1[:, :t + 1] - out2[:, :t + 1]).abs().max().item()
+
+          buggy_leak = leak_test(buggy_attention)
+          print(f"past outputs moved by {buggy_leak:.3f} when only the future changed")
+        tests: |
+          import torch, math
+          lt = check_object("leak_test")
+          def good(q, k, v):
+              n = q.shape[-2]
+              s = (q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])).masked_fill(torch.triu(torch.ones(n, n, dtype=torch.bool), 1), float("-inf"))
+              w = torch.softmax(s, -1)
+              return w @ v, w
+          assert lt(good) < 1e-6, "`leak_test` reports a leak for a correct causal attention. Compare only positions 0..t (`[:, :t + 1]`) and change only positions after t."
+          bl = check_object("buggy_leak")
+          assert bl > 1e-3, "`buggy_leak` should be clearly above 0: the buggy function lets the future change the past."
+          assert lt(user["buggy_attention"]) > 1e-3, "`leak_test(buggy_attention)` should detect the leak."
+      - instructions:
+          - "**Diagnose and fix.** Compare `buggy_attention` with the slides: two lines are wrong. Write `fixed_attention(q, k, v)` returning `(out, weights)` with both bugs fixed."
+          - "**Verify.** Store `fixed_attention`'s row sum error on `q, k, v` in `fixed_row_err` and `leak_test(fixed_attention)` in `fixed_leak`."
+        hint: "Masked scores need `float(\"-inf\")`, not `0.0`, and the softmax must normalise over keys: `dim=-1`."
+        sample_code: |
+          def fixed_attention(q, k, v):
+              n = q.shape[-2]
+              scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+              future = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+              scores = scores.masked_fill(future, ____)
+              weights = torch.softmax(scores, dim=____)
+              return weights @ v, weights
+
+          _, w_fixed = fixed_attention(q, k, v)
+          fixed_row_err = (w_fixed.sum(-1) - 1).abs().max().item()
+          fixed_leak = leak_test(fixed_attention)
+          print(f"row error {row_err:.3f} -> {fixed_row_err:.1e}; leak {buggy_leak:.3f} -> {fixed_leak:.1e}")
+        solution: |
+          def fixed_attention(q, k, v):
+              n = q.shape[-2]
+              scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+              future = torch.triu(torch.ones(n, n, dtype=torch.bool), diagonal=1)
+              scores = scores.masked_fill(future, float("-inf"))
+              weights = torch.softmax(scores, dim=-1)
+              return weights @ v, weights
+
+          _, w_fixed = fixed_attention(q, k, v)
+          fixed_row_err = (w_fixed.sum(-1) - 1).abs().max().item()
+          fixed_leak = leak_test(fixed_attention)
+          print(f"row error {row_err:.3f} -> {fixed_row_err:.1e}; leak {buggy_leak:.3f} -> {fixed_leak:.1e}")
+        tests: |
+          import torch, torch.nn.functional as F
+          f = check_object("fixed_attention")
+          torch.manual_seed(3)
+          a, b, c = torch.randn(3, 2, 7, 4).unbind(0)
+          o, w = f(a, b, c)
+          assert torch.allclose(w.sum(-1), torch.ones(2, 7), atol=1e-5), "Rows of the fixed weights must sum to 1: softmax over the keys (`dim=-1`)."
+          assert torch.triu(w, diagonal=1).abs().max().item() == 0, "The fixed weights still put mass on the future. Fill masked scores with float('-inf')."
+          assert torch.allclose(o, F.scaled_dot_product_attention(a, b, c, is_causal=True), atol=1e-5), "`fixed_attention` should match `F.scaled_dot_product_attention(..., is_causal=True)`."
+          assert user["leak_test"](f) < 1e-6, "The leak test still fails for `fixed_attention`."
+          assert check_object("fixed_row_err") < 1e-5, "`fixed_row_err` should be essentially 0."
+          assert check_object("fixed_leak") < 1e-6, "`fixed_leak` should be essentially 0."
+    success_msg: Both metrics went to zero. The fill value let the future in, and the wrong softmax axis let future queries reshape past weights. Keep `leak_test` in the test suite.

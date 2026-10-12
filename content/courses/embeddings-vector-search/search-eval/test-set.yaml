@@ -1,0 +1,333 @@
+title: Building a search test set
+description: Where labelled queries come from, how many you need, how to handle unanswerable and multi-hop questions, a reusable evaluation harness, and a report you can defend.
+exercises:
+  - id: test-set-slides
+    type: video
+    title: A test set you can trust
+    slides: |
+      # A test set is a list of (query, relevant docs)
+
+      Where the queries come from matters more than how many there are:
+
+      | source | realism | cost | trap |
+      | --- | --- | --- | --- |
+      | **real user queries** from logs, labelled by hand | best | labelling time | needs traffic first; privacy review |
+      | written by domain experts | good | expert time | experts write tidier queries than users do |
+      | LLM-generated from each chunk | poor to ok | cheap | the question reuses the chunk's own words, so recall looks inflated |
+      | pooling: label the union of several systems' top results | good for finding all relevant docs | labelling time | only finds what some system retrieved |
+
+      Start with 50-100 real or expert queries; add the failures you see in production every week.
+
+      ---
+
+      ## Coverage beats size
+
+      - Cover the **types** of query the system really gets: factual, multi-hop, codes, paraphrases, slang, unanswerable.
+      - Cover the **sections** of the corpus, not just the popular ones.
+      - Know your noise: with $n$ queries, one query flipping moves a metric by $1/n$. With 41 queries that's
+        2.4 points, so a "2-point improvement" is one query. Report $n$, and treat small differences as ties
+        (the *llm-evaluation* course adds bootstrap confidence intervals).
+
+      ---
+
+      ## Unanswerable and multi-hop queries
+
+      - **Unanswerable** queries (nothing in the corpus answers them) have no relevant docs, so recall is undefined. Keep
+        them in a separate list and test that the **answering** step refuses (see *rag-systems*). Don't drop them from the
+        project.
+      - **Multi-hop** queries need several docs. Report **recall@k** for them (the share of needed docs found), not just hit@k.
+      - Store `type` with every query so every report can be broken down by it.
+
+      ---
+
+      ## Dev and test
+
+      Every time you look at failures and change the system, you fit it a little to the queries you looked at.
+
+      - **Dev set:** read its failures, tune k, alpha, prompts and glossaries on it.
+      - **Test set:** run it once per decision, and don't read its individual failures while tuning.
+      - Refresh both when the query mix drifts (a new crew rotation, a new product feature).
+
+      ---
+
+      ## The harness
+
+      ```python
+      def evaluate(search, testset, k=3):
+          rows = []
+          for t in testset:
+              ranked = search(t["query"])
+              rr = reciprocal_rank(ranked, t["doc_ids"])
+              rows.append({"id": t["id"], "type": t["type"], "rank": 1 / rr if rr else np.nan,
+                           "hit": hit_at_k(ranked, t["doc_ids"], k),
+                           "recall": recall_at_k(ranked, t["doc_ids"], k), "rr": rr})
+          return pd.DataFrame(rows)
+
+      df = evaluate(search, testset)
+      df[["hit", "recall", "rr"]].mean()                    # overall
+      df.groupby("type")[["hit", "recall", "rr"]].mean()    # per type
+      ```
+
+      One row per query means you can always go from a number back to the queries behind it.
+
+  - id: build-qrels
+    type: coding
+    title: Labels from questions.jsonl
+    context: |
+      `questions` is the list of 45 Helios crew questions (`aikit.helios.questions()`): dicts with `id`, `question`,
+      `doc_ids` (empty for unanswerable questions) and `type`. Turn it into retrieval labels.
+    instructions:
+      - "Store a dict `qrels` mapping each **answerable** question id to the `set` of its doc ids."
+      - "Store the ids of the unanswerable questions in a list `unanswerable` (in file order). They belong to a separate refusal test."
+      - "Store a dict `n_by_type` with the number of answerable questions per `type`."
+      - "Store how many percentage points one query moves a metric averaged over `qrels`, `100 / len(qrels)`, in `points_per_query`."
+    hint: "`{q['id']: set(q['doc_ids']) for q in questions if q['doc_ids']}`. Count types with `collections.Counter` and convert to a `dict`."
+    pre_code: |
+      import collections
+      import aikit
+      questions = aikit.helios.questions()
+    sample_code: |
+      qrels = ____
+      unanswerable = ____
+      n_by_type = ____
+      points_per_query = ____
+      print(len(qrels), unanswerable, n_by_type, round(points_per_query, 2))
+    solution: |
+      qrels = {q["id"]: set(q["doc_ids"]) for q in questions if q["doc_ids"]}
+      unanswerable = [q["id"] for q in questions if not q["doc_ids"]]
+      n_by_type = dict(collections.Counter(q["type"] for q in questions if q["doc_ids"]))
+      points_per_query = 100 / len(qrels)
+      print(len(qrels), unanswerable, n_by_type, round(points_per_query, 2))
+    tests: |
+      qr = check_object("qrels")
+      assert isinstance(qr, dict) and len(qr) == 41, f"`qrels` should have the 41 answerable questions; got {len(qr) if hasattr(qr, '__len__') else qr}."
+      assert all(isinstance(v, set) for v in qr.values()), "Each value in `qrels` should be a set of doc ids."
+      check_equal("qrels")
+      check_equal("unanswerable", msg="`unanswerable` should list the ids whose `doc_ids` is empty, in file order.")
+      check_equal("n_by_type", msg="`n_by_type` should count answerable questions per type, as a plain dict.")
+      check_equal("points_per_query", msg="`points_per_query` should be `100 / len(qrels)`.")
+    success_msg: "41 retrieval labels, 4 unanswerables set aside for refusal tests, and a sense of scale: with only 4 multi-hop questions, one of them flipping moves that type's score by 25 points. Small slices are noisy."
+
+  - id: eval-harness
+    type: coding
+    title: An evaluation harness
+    context: |
+      `testset` is a list of labelled queries (dicts with `id`, `query`, `doc_ids` and `type`). `hit_at_k`,
+      `recall_at_k` and `reciprocal_rank` are imported, with `np` and `pd`. `search(query)` returns ranked doc ids.
+    instructions:
+      - "Write `evaluate(search, testset, k=3)` that returns a DataFrame with **one row per query** and the columns `id`, `type`, `rank` (rank of the first relevant doc, `np.nan` if none), `hit` (hit@k), `recall` (recall@k) and `rr` (reciprocal rank)."
+      - "Store `evaluate(search, testset)` in `df`, and the per-type means of `hit`, `recall` and `rr` in `by_type` (`groupby(\"type\")`)."
+    hint: |
+      Collect a list of dicts, one per query, then `pd.DataFrame(rows)`. `rank` is `1 / rr` when `rr > 0`.
+      `by_type = df.groupby("type")[["hit", "recall", "rr"]].mean()`.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      import aikit
+      from kits.embeddings_vector_search import (HybridSearch, build_testset, hit_at_k,
+                                                 recall_at_k, reciprocal_rank)
+      testset = build_testset()
+      _h = HybridSearch(alpha=1.0, embed=aikit.embed)
+      def search(query):
+          return _h.search(query, k=10)
+    sample_code: |
+      def evaluate(search, testset, k=3):
+          rows = []
+          for t in testset:
+              ranked = search(t["query"])
+              rr = ____
+              rows.append({"id": t["id"], "type": t["type"],
+                           "rank": ____,
+                           "hit": ____,
+                           "recall": ____,
+                           "rr": rr})
+          return pd.DataFrame(rows)
+
+      df = evaluate(search, testset)
+      by_type = ____
+      print(df.head())
+      print(by_type.round(2))
+    solution: |
+      def evaluate(search, testset, k=3):
+          rows = []
+          for t in testset:
+              ranked = search(t["query"])
+              rr = reciprocal_rank(ranked, t["doc_ids"])
+              rows.append({"id": t["id"], "type": t["type"],
+                           "rank": 1 / rr if rr else np.nan,
+                           "hit": hit_at_k(ranked, t["doc_ids"], k),
+                           "recall": recall_at_k(ranked, t["doc_ids"], k),
+                           "rr": rr})
+          return pd.DataFrame(rows)
+
+      df = evaluate(search, testset)
+      by_type = df.groupby("type")[["hit", "recall", "rr"]].mean()
+      print(df.head())
+      print(by_type.round(2))
+    tests: |
+      import numpy as np
+      from kits.embeddings_vector_search import evaluate as ref_eval
+      f = check_object("evaluate")
+      ts = [{"id": "t1", "query": "a", "doc_ids": ["x", "y"], "type": "multi"},
+            {"id": "t2", "query": "b", "doc_ids": ["z"], "type": "single"},
+            {"id": "t3", "query": "c", "doc_ids": ["q"], "type": "single"}]
+      fake = {"a": ["w", "y", "v", "x"], "b": ["z", "w"], "c": ["w", "v"]}.get
+      for k in [1, 3]:
+          got = f(fake, ts, k)
+          want = ref_eval(fake, ts, k)
+          for col in ["id", "type", "rank", "hit", "recall", "rr"]:
+              assert col in got.columns, f"`evaluate` should return a column {col!r}."
+          assert len(got) == 3, "`evaluate` should return one row per test query."
+          for col in ["hit", "recall", "rr"]:
+              assert np.allclose(got[col].astype(float).values, want[col].values), f"Column {col!r} is wrong for k={k}. Expected {list(want[col])}, got {list(got[col])}."
+          assert np.allclose(got["rank"].astype(float).values, want["rank"].values, equal_nan=True), f"`rank` should be the rank of the first relevant doc, NaN when none is found. Expected {list(want['rank'])}."
+      bt = check_object("by_type")
+      st = sol["by_type"]
+      for ty in st.index:
+          for col in ["hit", "recall", "rr"]:
+              assert abs(float(bt.loc[ty, col]) - float(st.loc[ty, col])) < 1e-9, f"`by_type` should hold the mean of {col!r} per type (row {ty!r})."
+    success_msg: This harness is the most reusable code in the course. Every later change (a model, a chunking scheme, a fusion weight) gets judged by running it, overall and per type.
+
+  - id: synthetic-bias
+    type: mc
+    title: Too good to be true
+    question: |
+      To save labelling time, you asked an LLM to write one question per handbook chunk and used that chunk as the
+      relevant doc. Your retriever scores recall@3 = 0.97 on these 171 generated questions, but only 0.71 on 40 real
+      crew queries. What's the most likely explanation?
+    options:
+      - text: The real crew queries are mislabelled.
+        feedback: "Possible for a few, but a 26-point gap across 40 queries points to the generated set, not the labels. Look at how the generated questions were made."
+      - text: The generated questions reuse their source chunk's wording, so they're far easier than real queries, which use paraphrases, codes and slang.
+        correct: true
+        feedback: "Right. A question written while looking at the chunk shares its distinctive words, so retrieval is almost guaranteed. Real crew say 'veg bay' and 'the bird'. Keep generated questions for smoke tests and coverage, but make decisions on real or expert-written queries, and ask the generator to paraphrase if you use one."
+      - text: 171 questions is a bigger sample, so 0.97 is the more accurate number.
+        feedback: "Sample size only reduces noise. It doesn't fix bias. A large biased set gives a precise estimate of the wrong quantity."
+      - text: The retriever overfits to generated text.
+        feedback: "The retriever wasn't trained on these questions. The gap comes from how the questions were written."
+    hint: What words does a question share with the chunk it was written from?
+
+  - id: report-recall
+    type: sequential
+    title: "Mission: report ORBIT's search quality"
+    context: |
+      Before the next crew rotation, the commander wants a defensible number for ORBIT's search. ORBIT passes the top
+      3 docs to the model, so the headline metric is **recall@3**. `testset` holds 81 labelled queries (41 handbook
+      questions plus 40 crew queries; `type` is factual, multi-hop, exact, paraphrase or jargon). `current(query)` is
+      today's search (small model, sentence chunks) and `candidate(query)` a proposed one (general model, chunks prefixed
+      with their doc title). `evaluate(search, testset, k)` is your harness.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      import aikit
+      from kits.embeddings_vector_search import HybridSearch, build_testset, evaluate
+      testset = build_testset()
+      _cur = HybridSearch(alpha=1.0, embed=aikit.embed)
+      _cand = HybridSearch(alpha=1.0, title_prefix=True)
+      def current(query):
+          return _cur.search(query, k=10)
+      def candidate(query):
+          return _cand.search(query, k=10)
+    steps:
+      - instructions:
+          - "Store `evaluate(current, testset, k=3)` in `df_cur` and `evaluate(candidate, testset, k=3)` in `df_cand`."
+          - "Store a DataFrame `overall` with one row per system (index `\"current\"`, `\"candidate\"`) and the columns `hit`, `recall` and `rr`, holding the means over all queries."
+        hint: "`pd.DataFrame({\"current\": df_cur[[\"hit\", \"recall\", \"rr\"]].mean(), \"candidate\": df_cand[[\"hit\", \"recall\", \"rr\"]].mean()}).T`"
+        sample_code: |
+          df_cur = ____
+          df_cand = ____
+          overall = ____
+          print(overall.round(3))
+        solution: |
+          df_cur = evaluate(current, testset, k=3)
+          df_cand = evaluate(candidate, testset, k=3)
+          overall = pd.DataFrame({"current": df_cur[["hit", "recall", "rr"]].mean(),
+                                  "candidate": df_cand[["hit", "recall", "rr"]].mean()}).T
+          print(overall.round(3))
+        tests: |
+          o = check_object("overall")
+          s = sol["overall"]
+          for r in ["current", "candidate"]:
+              assert r in o.index, f"`overall` should have a row {r!r}; its index is {list(o.index)}."
+              for c in ["hit", "recall", "rr"]:
+                  assert abs(float(o.loc[r, c]) - float(s.loc[r, c])) < 1e-9, f"overall.loc[{r!r}, {c!r}] should be {s.loc[r, c]:.3f}. Use k=3 and average over all 81 queries."
+      - instructions:
+          - "Break recall@3 down by type. Store a DataFrame `by_type` with one row per type and the columns `current` and `candidate`."
+          - "Store the list of types where the candidate is **worse** than current in `regressions`."
+        hint: "`pd.DataFrame({\"current\": df_cur.groupby(\"type\")[\"recall\"].mean(), \"candidate\": df_cand.groupby(\"type\")[\"recall\"].mean()})`"
+        sample_code: |
+          by_type = ____
+          regressions = ____
+          print(by_type.round(2))
+          print("regressions:", regressions)
+        solution: |
+          by_type = pd.DataFrame({"current": df_cur.groupby("type")["recall"].mean(),
+                                  "candidate": df_cand.groupby("type")["recall"].mean()})
+          regressions = [t for t in by_type.index if by_type.loc[t, "candidate"] < by_type.loc[t, "current"]]
+          print(by_type.round(2))
+          print("regressions:", regressions)
+        tests: |
+          b = check_object("by_type")
+          s = sol["by_type"]
+          for t in s.index:
+              for c in ["current", "candidate"]:
+                  assert abs(float(b.loc[t, c]) - float(s.loc[t, c])) < 1e-9, f"by_type.loc[{t!r}, {c!r}] should be the mean recall@3 for that type."
+          assert sorted(check_object("regressions")) == sorted(sol["regressions"]), f"`regressions` should list the types where candidate < current: {sol['regressions']}."
+      - instructions:
+          - "Is the change bigger than noise? Store the number of `exact` queries in `n_exact`, and how many of them the candidate gets **worse** on (lower `recall` than current, query by query) in `exact_worse`."
+          - "Store the overall recall@3 gain (`candidate - current`) in `gain`, and the gain measured in queries, `gain * len(testset)`, in `gain_in_queries`."
+        hint: "Compare `df_cand[\"recall\"].values` with `df_cur[\"recall\"].values` for rows where `df_cur[\"type\"] == \"exact\"`."
+        sample_code: |
+          mask = (df_cur["type"] == "exact").values
+          n_exact = ____
+          exact_worse = ____
+          gain = ____
+          gain_in_queries = ____
+          print(n_exact, exact_worse, round(gain, 3), round(gain_in_queries, 1))
+        solution: |
+          mask = (df_cur["type"] == "exact").values
+          n_exact = int(mask.sum())
+          exact_worse = int((df_cand["recall"].values[mask] < df_cur["recall"].values[mask]).sum())
+          gain = float(overall.loc["candidate", "recall"] - overall.loc["current", "recall"])
+          gain_in_queries = gain * len(testset)
+          print(n_exact, exact_worse, round(gain, 3), round(gain_in_queries, 1))
+        tests: |
+          check_equal("n_exact")
+          check_equal("exact_worse", msg="`exact_worse` should count the exact-type queries where the candidate's recall is lower than current's.")
+          check_equal("gain", msg="`gain` should be candidate recall@3 minus current recall@3, overall.")
+          check_equal("gain_in_queries", msg="`gain_in_queries` should be `gain * len(testset)`.")
+      - instructions:
+          - "Write the report as a dict `report` with these keys. `\"n_queries\"`: 81. `\"recall_at_3\"`: the candidate's overall recall@3. `\"mrr\"`: the candidate's MRR. `\"adopt\"`: `True` if the gain is worth at least 3 queries **and** no type regresses by more than one query's worth (`1 / n` of that type)."
+          - "Print the report. Its numbers, its sample size and its caveats are what you'd hand the commander."
+        hint: |
+          Per type, a regression of one query is `1 / count` of that type: compute `n = df_cur.groupby("type").size()`, and
+          check `(by_type["current"] - by_type["candidate"]) <= 1 / n` for every type (allow a tiny tolerance).
+        sample_code: |
+          n = df_cur.groupby("type").size()
+          small_regressions = ____
+          report = {
+              "n_queries": len(testset),
+              "recall_at_3": ____,
+              "mrr": ____,
+              "adopt": ____,
+          }
+          print(report)
+        solution: |
+          n = df_cur.groupby("type").size()
+          small_regressions = bool(((by_type["current"] - by_type["candidate"]) <= 1 / n + 1e-9).all())
+          report = {
+              "n_queries": len(testset),
+              "recall_at_3": float(overall.loc["candidate", "recall"]),
+              "mrr": float(overall.loc["candidate", "rr"]),
+              "adopt": bool(gain_in_queries >= 3 and small_regressions),
+          }
+          print(report)
+        tests: |
+          r = check_object("report")
+          for key in ["n_queries", "recall_at_3", "mrr", "adopt"]:
+              assert key in r, f"`report` should have the key {key!r}."
+          assert r["n_queries"] == 81, "`report['n_queries']` should be 81."
+          assert abs(r["recall_at_3"] - sol["report"]["recall_at_3"]) < 1e-9, "`report['recall_at_3']` should be the candidate's overall recall@3."
+          assert abs(r["mrr"] - sol["report"]["mrr"]) < 1e-9, "`report['mrr']` should be the candidate's mean `rr`."
+          assert bool(r["adopt"]) == sol["report"]["adopt"], f"`report['adopt']` should be {sol['report']['adopt']}: the gain is about {sol['gain_in_queries']:.1f} queries, and the only regression is one exact-code query, within one query's worth."
+    success_msg: "The report says recall@3 is about 0.83 on 81 queries, a gain of about 7 queries' worth, with one exact-code query lost. That's adoptable, with a caveat to watch codes, which hybrid search from chapter 2 would fix. A number, a sample size and a caveat: that's how search quality should be reported."

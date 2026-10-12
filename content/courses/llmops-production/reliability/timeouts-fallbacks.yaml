@@ -1,0 +1,300 @@
+title: Timeouts, fallbacks and circuit breakers
+description: Bound the slow tail with timeouts, keep answering with a fallback chain, stop hammering a dead dependency with a circuit breaker, and pick a failure strategy per situation.
+exercises:
+  - id: timeouts-fallbacks-slides
+    type: video
+    title: When the model does not answer
+    slides: |
+      # Timeouts: decide how long is too long
+
+      Without a timeout, one hung call holds a worker and a crew member for as long as the network allows,
+      which can be minutes.
+
+      - Set the timeout from your **healthy latency distribution**: above the p99 of normal calls, below what a
+        person will tolerate. ORBIT's brief answers take under 1 s, so 5 s is generous.
+      - For streaming, use an **idle timeout** (no chunk for N seconds) rather than a total one: long answers are fine,
+        stalls are not.
+      - A timed-out request may still run (and be billed) on the server. Do not assume it never happened.
+
+      ```python
+      client = anthropic.Anthropic(timeout=20.0, max_retries=2)                # defaults for every call
+      r = client.messages.create(..., timeout=5.0)                             # per request
+      ```
+
+      ---
+
+      ## Fallback chains
+
+      When the primary fails or is too slow, try the next option, and say so if quality dropped:
+
+      ```
+      Sonnet (5 s timeout)  →  Haiku (5 s timeout)  →  degraded answer: the relevant handbook section, or
+                                                        "ORBIT is busy; for emergencies see panel A-1"
+      ```
+
+      Each step trades something away: the small model is worse on hard questions; a canned answer covers only
+      common questions. **Log which step served each request**. A fallback that quietly handles 30% of traffic is
+      an incident nobody noticed.
+
+      ---
+
+      ## Circuit breakers
+
+      During an outage, every request still tries the dead primary first, waits for it to fail, then falls back.
+      That wastes time and adds load to the service that is trying to recover.
+
+      ```
+         CLOSED ──(N failures in a row)──► OPEN ──(cooldown passes)──► HALF-OPEN
+           ▲                                │ calls skip the primary        │ one probe call
+           └──────────(probe succeeds)──────┴────────(probe fails: open again)┘
+      ```
+
+      ```python
+      def allow(self):                       # may we call the primary?
+          return self.opened_at is None or clock.now() - self.opened_at >= self.cooldown_s
+      ```
+
+      ---
+
+      ## Trade-off: what to do when a call fails
+
+      | strategy | user waits | answer quality | extra cost | wins when |
+      | --- | --- | --- | --- | --- |
+      | **retry with backoff** | seconds more | full | more calls | brief, transient errors |
+      | **fallback model** | a little more | lower on hard questions | small | primary overloaded or slow; most questions easy |
+      | **degraded answer now** (cached section, safe message) | none | partial but safe | none | someone needs something **now**, e.g. safety questions |
+      | **queue for later** | minutes to hours | full | none | nobody is waiting: reports, batch jobs |
+      | **fail fast with a clear error** | none | none | none | the request itself is wrong (400) |
+
+      ---
+
+      ## Playbook: errors and timeouts under load
+
+      1. **Measure** error rate **by type** per minute, and p99 latency (from logs and traces).
+      2. **Diagnose:**
+         - 429s → *you* are sending too much (bursts, retry storms, too many workers): next lesson.
+         - 529s or 5xx → the *provider* is struggling: back off, fall back, open the breaker.
+         - timeouts → a slow tail: look at output lengths and queueing; fix the timeout and the fallback.
+         - 400s → a bug in your request: deploy a fix; retries will not help.
+      3. **Fix**, cheapest first, then **verify** on the same metric: error rate and p99 back under target.
+
+  - id: timeout-fallback
+    type: coding
+    title: Timeouts and a fallback chain
+    context: |
+      About 15% of `client`'s calls hang for an extra 45 s (a slow tail). Without timeouts, ORBIT's p99 is about
+      46 s. `client.messages.create` accepts `timeout=` in seconds and raises `APITimeoutError` after exactly that long
+      on the virtual clock `clk`. `ask(model, q)` is a helper that passes the brief prompt.
+    instructions:
+      - "Complete `answer(q)`: try `MODEL`, then `SMALL`, each with `timeout=5`. On `APITimeoutError` or `OverloadedError`, move to the next one. If both fail, return `(DEGRADED, \"degraded\")`. Otherwise return `(text, model)`."
+      - "For every EVAL question, measure the user's wait (`clk.now()` before and after). Store `waits` (seconds), `p99` (`np.percentile(waits, 99)`) and `accuracy` (graded answers)."
+      - "Store `served`: a dict counting how many questions each source (`MODEL`, `SMALL`, `\"degraded\"`) answered."
+    hint: |
+      `for model in (MODEL, SMALL):` with `try: return ask(model, q, timeout=5).text, model` and
+      `except (APITimeoutError, OverloadedError): continue`. After the loop, return the degraded tuple.
+    pre_code: |
+      import numpy as np
+      from collections import Counter
+      from kits.llmops_production import (OpsClaude, VirtualClock, MODEL, SMALL, SYSTEM, CONCISE, EVAL, grade,
+                                          APITimeoutError, OverloadedError)
+      clk = VirtualClock()
+      client = OpsClaude(slow_rate=0.15, slow_ms=45000, clock=clk)
+      DEGRADED = "ORBIT is busy right now. For emergencies, use the procedures posted at each module hatch."
+
+      def ask(model, q, timeout=None):
+          return client.messages.create(model=model, max_tokens=300, system=SYSTEM + "\n" + CONCISE,
+                                        messages=[{"role": "user", "content": q}], timeout=timeout)
+    sample_code: |
+      def answer(q):
+          for model in (MODEL, SMALL):
+              try:
+                  return ____
+              except ____:
+                  continue
+          return ____
+
+      waits, results = [], []
+      for item in EVAL:
+          start = clk.now()
+          results.append(answer(item["question"]))
+          waits.append(____)
+
+      p99 = ____
+      accuracy = ____
+      served = dict(Counter(source for _, source in results))
+      print(f"p99 wait {p99:.1f} s, accuracy {accuracy:.0%}, served {served}")
+    solution: |
+      def answer(q):
+          for model in (MODEL, SMALL):
+              try:
+                  return ask(model, q, timeout=5).text, model
+              except (APITimeoutError, OverloadedError):
+                  continue
+          return DEGRADED, "degraded"
+
+      waits, results = [], []
+      for item in EVAL:
+          start = clk.now()
+          results.append(answer(item["question"]))
+          waits.append(clk.now() - start)
+
+      p99 = np.percentile(waits, 99)
+      accuracy = sum(grade(item, text) for item, (text, _) in zip(EVAL, results)) / len(EVAL)
+      served = dict(Counter(source for _, source in results))
+      print(f"p99 wait {p99:.1f} s, accuracy {accuracy:.0%}, served {served}")
+    tests: |
+      check_object("results")
+      assert len(user["results"]) == 41, "Answer every EVAL question."
+      check_object("p99")
+      assert user["p99"] <= 10.5, f"p99 wait is {user['p99']:.1f} s. With a 5 s timeout on each of two attempts no one should wait much more than 10 s. Pass `timeout=5` to `ask`."
+      check_equal("p99", tol=1e-6, msg="`p99` should be `np.percentile(waits, 99)` with waits in seconds measured with `clk.now()`.")
+      check_equal("accuracy", tol=1e-6, msg="`accuracy` is the share of results whose text passes `grade`.")
+      assert user["accuracy"] >= 0.9, "Accuracy dropped below 90%. Try MODEL first, and SMALL only when it fails."
+      check_object("served")
+      assert {k: int(v) for k, v in user["served"].items()} == sol["served"], f"`served` should be {sol['served']}."
+    success_msg: |
+      The worst wait fell from about 46 s to 10 s. Two questions fell back to Haiku and two got the degraded message,
+      a small accuracy cost that the `served` counts make visible. In production, alert when the fallback share rises.
+
+  - id: circuit-breaker
+    type: coding
+    title: A circuit breaker for an outage
+    context: |
+      Sonnet is down (529s) from t = 60 s to t = 240 s on the virtual clock `clk`. ORBIT serves 300 requests, one every
+      0.5 s plus the call time, falling back to Haiku when Sonnet fails. Without a breaker, about 200 doomed Sonnet
+      calls are made during the outage.
+    instructions:
+      - "Complete `Breaker`: `allow()` is True when the breaker is closed (`opened_at is None`) or the cooldown has passed since it opened; `record_success()` closes it and resets `failures`; `record_failure()` counts the failure and opens it (sets `opened_at = clock.now()`) when `failures >= threshold`, or immediately if it was already open (a failed probe)."
+      - "Run the loop (already written). Store `doomed`: the number of Sonnet calls made between t = 60 and t = 240, and `primary_after`: the share of requests started at t ≥ 260 that Sonnet served."
+    hint: |
+      `self.opened_at is None or self.clock.now() - self.opened_at >= self.cooldown_s`. Count doomed calls with
+      `sum(1 for c in client.calls if "sonnet" in c["model"] and 60 <= c["t"] < 240)`.
+    pre_code: |
+      from kits.llmops_production import OpsClaude, VirtualClock, MODEL, SMALL, SYSTEM, CONCISE, EVAL, OverloadedError
+      clk = VirtualClock()
+      client = OpsClaude(outages={"sonnet": [(60, 240)]}, clock=clk)
+
+      def ask(model, q):
+          return client.messages.create(model=model, max_tokens=300, system=SYSTEM + "\n" + CONCISE,
+                                        messages=[{"role": "user", "content": q}])
+    sample_code: |
+      class Breaker:
+          def __init__(self, threshold=3, cooldown_s=20, clock=clk):
+              self.threshold, self.cooldown_s, self.clock = threshold, cooldown_s, clock
+              self.failures = 0
+              self.opened_at = None          # None: closed
+
+          def allow(self):
+              return ____
+
+          def record_success(self):
+              ____
+
+          def record_failure(self):
+              self.failures += 1
+              if ____:
+                  self.opened_at = self.clock.now()
+
+      breaker = Breaker()
+      log = []
+      for i in range(300):
+          q = EVAL[i % len(EVAL)]["question"]
+          started, source = clk.now(), SMALL
+          if breaker.allow():
+              try:
+                  ask(MODEL, q)
+                  breaker.record_success()
+                  source = MODEL
+              except OverloadedError:
+                  breaker.record_failure()
+          if source == SMALL:
+              ask(SMALL, q)
+          log.append((started, source))
+          clk.sleep(0.5)
+
+      doomed = ____
+      after = [s for t, s in log if t >= 260]
+      primary_after = ____
+      print(f"doomed Sonnet calls during the outage: {doomed}; Sonnet share after recovery: {primary_after:.0%}")
+    solution: |
+      class Breaker:
+          def __init__(self, threshold=3, cooldown_s=20, clock=clk):
+              self.threshold, self.cooldown_s, self.clock = threshold, cooldown_s, clock
+              self.failures = 0
+              self.opened_at = None          # None: closed
+
+          def allow(self):
+              return self.opened_at is None or self.clock.now() - self.opened_at >= self.cooldown_s
+
+          def record_success(self):
+              self.failures = 0
+              self.opened_at = None
+
+          def record_failure(self):
+              self.failures += 1
+              if self.failures >= self.threshold or self.opened_at is not None:
+                  self.opened_at = self.clock.now()
+
+      breaker = Breaker()
+      log = []
+      for i in range(300):
+          q = EVAL[i % len(EVAL)]["question"]
+          started, source = clk.now(), SMALL
+          if breaker.allow():
+              try:
+                  ask(MODEL, q)
+                  breaker.record_success()
+                  source = MODEL
+              except OverloadedError:
+                  breaker.record_failure()
+          if source == SMALL:
+              ask(SMALL, q)
+          log.append((started, source))
+          clk.sleep(0.5)
+
+      doomed = sum(1 for c in client.calls if "sonnet" in c["model"] and 60 <= c["t"] < 240)
+      after = [s for t, s in log if t >= 260]
+      primary_after = sum(s == MODEL for s in after) / len(after)
+      print(f"doomed Sonnet calls during the outage: {doomed}; Sonnet share after recovery: {primary_after:.0%}")
+    tests: |
+      import aikit
+      B = user["Breaker"]
+      c = aikit.VirtualClock()
+      b = B(threshold=2, cooldown_s=10, clock=c)
+      assert b.allow(), "A new breaker is closed: `allow()` should be True."
+      b.record_failure()
+      assert b.allow(), "One failure is below the threshold of 2: the breaker should stay closed."
+      b.record_failure()
+      assert not b.allow(), "After `threshold` failures in a row the breaker should open: `allow()` False."
+      c.sleep(10)
+      assert b.allow(), "After the cooldown the breaker is half-open: `allow()` should let a probe through."
+      b.record_failure()
+      assert not b.allow(), "A failed probe should open the breaker again at once (restart the cooldown)."
+      c.sleep(10)
+      b.record_success()
+      assert b.allow() and b.failures == 0, "`record_success()` should close the breaker and reset `failures`."
+      check_object("doomed")
+      assert user["doomed"] <= 20, f"{user['doomed']} Sonnet calls were made during the outage; the breaker should keep it to about a dozen."
+      check_equal("doomed", msg="`doomed` counts calls whose model contains 'sonnet' and whose `t` is in [60, 240).")
+      check_equal("primary_after", tol=1e-6)
+      assert user["primary_after"] >= 0.95, "After recovery Sonnet should serve almost everything again: a successful probe must close the breaker."
+    success_msg: |
+      From about 200 doomed calls to about a dozen: three to trip the breaker, then one probe every 20 s. Once Sonnet
+      recovered, the next probe closed the breaker and traffic went straight back. The cooldown is a trade-off:
+      shorter finds recovery sooner but probes a struggling service more often.
+
+  - id: failure-strategy
+    type: classify
+    title: Pick the failure strategy
+    prompt: For each situation, pick the response that best balances the crew's wait, answer quality and cost.
+    hint: Who is waiting, how long can they wait, and what happens if the answer is worse or late?
+    zones: [Retry with backoff, Fall back to another model, Serve a degraded answer now, Queue it for later]
+    items:
+      - { text: A single 429 on an ordinary chat question; the crew member is waiting, zone: Retry with backoff }
+      - { text: One 500 error in the middle of the morning briefing, zone: Retry with backoff }
+      - { text: Sonnet returns 529s for ten minutes; the crew asks routine schedule questions, zone: Fall back to another model }
+      - { text: Sonnet calls time out at the p99 on easy questions the small model answers well, zone: Fall back to another model }
+      - { text: "No model is reachable and someone asks where the defibrillator is", zone: Serve a degraded answer now }
+      - { text: "A fire alarm question while every provider call is failing", zone: Serve a degraded answer now }
+      - { text: The nightly ticket summaries fail during a provider outage, zone: Queue it for later }
+      - { text: The weekly report job hits the rate limit, zone: Queue it for later }

@@ -1,0 +1,349 @@
+title: Rank, overfitting and forgetting
+description: "Pick a rank by measuring it, then troubleshoot the two classic fine-tune failures: overfitting (train/val curves) and forgetting (a held-out general suite)."
+exercises:
+  - id: intro
+    type: video
+    title: When a fine-tune goes wrong
+    slides: |
+      # Rank is capacity
+
+      | rank r | trainable (TicketNet, fc1 + fc2) | capacity | risk |
+      | --- | --- | --- | --- |
+      | 1-2 | 2.5-5 K | small, tightly regularised | may underfit a big shift |
+      | 4-8 | 10-20 K | the usual sweet spot for narrow tasks | low |
+      | 16-64 | 41-164 K | close to full fine-tuning | overfits small data, forgets more |
+
+      Higher rank isn't free quality. Past the point where validation stops improving, extra rank only
+      adds ways to memorise noise and to move away from the base. **Sweep it**: train a few ranks with
+      everything else fixed and take the smallest one that is within noise of the best. Keep
+      $\alpha / r$ fixed (for example $\alpha = 2r$) so the sweep doesn't secretly change the learning rate.
+
+      ---
+
+      ## Read the curves
+
+      ```
+      loss                             overfitting                 underfitting
+       |\                               |\   val /                  |------ val
+       | \__ val                        | \_____/                   |------ train
+       |  \____ train                   |   \______ train           |
+       +-------- epoch                  +----^---- epoch            +-------- epoch
+         healthy                        best epoch
+      ```
+
+      | pattern | diagnosis |
+      | --- | --- |
+      | both high and flat | **underfitting**: LR too low, rank too small, too few epochs |
+      | train falls, val falls then **rises** | **overfitting** after the turning point |
+      | val tracks train all the way to zero | **leaky validation** (chapter 2), not a miracle |
+      | task val great, **general suite drops** | **forgetting**: curves on the task can't show it |
+
+      ---
+
+      ## Playbook: overfitting
+
+      **Symptom:** great on training data, worse on new data. **Measure:** train and val loss per epoch;
+      find the epoch with the lowest val loss and the train/val gap at the end.
+
+      Usual causes: too many epochs, LR too high, too much capacity (rank, target modules), small or **noisy** data.
+
+      Try, in this order:
+
+      | fix | cost |
+      | --- | --- |
+      | Early stopping: keep the best-val epoch | free |
+      | Lower LR or fewer epochs | free; may underfit |
+      | Lower rank, fewer target modules | free; caps quality on big shifts |
+      | Weight decay, LoRA dropout | free; one more knob to tune |
+      | More or **cleaner** data | labelling time, but the only fix that raises the ceiling |
+
+      ---
+
+      ## Playbook: forgetting
+
+      **Symptom:** the task got better, other things got worse. **Measure:** a general held-out suite
+      (tasks the base did well and you must keep) before and after, **per category**.
+
+      Usual causes: LR too high, too many epochs, high rank, and narrow data that never shows the old behaviour.
+
+      | fix | effect | cost |
+      | --- | --- | --- |
+      | **Replay**: mix general examples into training (often 10-50%) | keeps old behaviour in the gradient | more data and compute per step |
+      | Lower LR or fewer epochs | smaller move from the base | may underfit the task |
+      | Lower rank | a smaller, more constrained update | may cap task quality |
+      | LoRA instead of full fine-tuning | fewer weights move | usually a little lower peak quality |
+
+      Verify on **both** suites. A fix for forgetting that loses the task isn't a fix.
+
+      ---
+
+      ## In code
+
+      ```python
+      hist = fit(model, X_tr, y_tr, X_val, y_val, epochs=150, lr=1e-2)   # one row per epoch
+      best = int(hist.loc[hist.val_loss.idxmin(), "epoch"])             # early stopping point
+
+      # replay: every step also sees a batch of general data
+      hist = fit(model, X_tr, y_tr, X_val, y_val, epochs=100, lr=1e-2,
+                 X_extra=X_general, y_extra=y_general)
+      print(accuracy(model, X_gen_eval, y_gen_eval))                   # the forgetting check
+      ```
+
+      For an LLM, replay means adding general instruction data (or samples of the base model's own good
+      answers) to the fine-tuning set.
+
+  - id: rank-sweep
+    type: coding
+    title: Sweep the rank
+    context: |
+      Train TicketNet adapters at five ranks with everything else fixed, then choose. Loaded:
+      `base_model`, `add_lora`, `count_params`, `fit(model, X, y, X_val, y_val, epochs, lr)` (returns a
+      history DataFrame), `accuracy`, Helios `X_train, y_train, X_val, y_val`, general `X_gen, y_gen`,
+      `torch` and `pandas` as `pd`.
+    instructions:
+      - "For each `r` in `[1, 2, 4, 16, 64]`: `torch.manual_seed(0)`, build `add_lora(base_model(), r=r, alpha=2 * r)`, train with `fit(..., epochs=30, lr=3e-3)`, then record `r`, `trainable`, `val_acc` and `general_acc`."
+      - "Store the results as a DataFrame `sweep` with those four columns, one row per rank."
+      - "Store `chosen_r`: the smallest rank whose `val_acc` is within 0.01 of the best `val_acc`."
+    hint: "Collect dicts in a list, then `pd.DataFrame(rows)`. `sweep[sweep.val_acc >= sweep.val_acc.max() - 0.01].r.min()`."
+    pre_code: |
+      import torch
+      import pandas as pd
+      from kits.fine_tuning_llms import base_model, add_lora, count_params, fit, accuracy, featurize, labels_of, helios_split, general_eval
+      _tr, _va = helios_split()
+      X_train, y_train = featurize(_tr.text), labels_of(_tr.category)
+      X_val, y_val = featurize(_va.text), labels_of(_va.category)
+      X_gen, y_gen = general_eval()
+    sample_code: |
+      rows = []
+      for r in [1, 2, 4, 16, 64]:
+          torch.manual_seed(0)
+          model = ____
+          fit(model, X_train, y_train, X_val, y_val, epochs=30, lr=3e-3)
+          rows.append({"r": r, "trainable": count_params(model)[0],
+                       "val_acc": ____, "general_acc": ____})
+
+      sweep = pd.DataFrame(rows)
+      chosen_r = ____
+      print(sweep)
+      print("chosen rank:", chosen_r)
+    solution: |
+      rows = []
+      for r in [1, 2, 4, 16, 64]:
+          torch.manual_seed(0)
+          model = add_lora(base_model(), r=r, alpha=2 * r)
+          fit(model, X_train, y_train, X_val, y_val, epochs=30, lr=3e-3)
+          rows.append({"r": r, "trainable": count_params(model)[0],
+                       "val_acc": accuracy(model, X_val, y_val), "general_acc": accuracy(model, X_gen, y_gen)})
+
+      sweep = pd.DataFrame(rows)
+      chosen_r = int(sweep[sweep.val_acc >= sweep.val_acc.max() - 0.01].r.min())
+      print(sweep)
+      print("chosen rank:", chosen_r)
+    tests: |
+      s = check_object("sweep")
+      assert list(s.columns) == ["r", "trainable", "val_acc", "general_acc"], f"`sweep` should have columns r, trainable, val_acc, general_acc in that order; it has {list(s.columns)}."
+      assert list(s.r) == [1, 2, 4, 16, 64], "`sweep` should have one row per rank, in the order 1, 2, 4, 16, 64."
+      assert list(s.trainable) == list(sol["sweep"].trainable), "`trainable` should come from `count_params(model)[0]`."
+      import numpy as np
+      assert np.allclose(s.val_acc, sol["sweep"].val_acc) and np.allclose(s.general_acc, sol["sweep"].general_acc), "Accuracies differ from the reference. Seed with `torch.manual_seed(0)` right before `add_lora(...)`, with `alpha=2 * r`, 30 epochs and lr 3e-3."
+      check_equal("chosen_r", msg="`chosen_r` is the smallest `r` whose `val_acc` >= the best `val_acc` minus 0.01.")
+    success_msg: "Validation tops out at rank 2, while general accuracy slides from 1.00 to 0.90 as the rank grows. Ranks 16 and 64 cost 8x and 32x the parameters of rank 2 and buy nothing but drift from the base."
+
+  - id: fix-overfitting
+    type: coding
+    title: "Troubleshoot: validation loss going up"
+    context: |
+      A rushed labelling session left 16 of the 80 Helios training labels wrong (`y_noisy`). The team trained
+      rank-16 adapters at `lr=1e-2` for 150 epochs, and validation got *worse* the longer it ran. `hist`
+      holds that run's history (`epoch`, `train_loss`, `val_loss`, `val_acc`). Loaded: `base_model`,
+      `add_lora`, `fit`, `X_train`, `y_noisy`, `X_val`, `y_val`, `torch`.
+    instructions:
+      - "**Measure.** Store the epoch with the lowest `val_loss` in `best_epoch` (an int) and, for the last epoch, `val_loss - train_loss` in `final_gap`."
+      - "**Fix.** Retrain from scratch with any fix you choose (early stopping, lower rank, lower LR...): seed, build, `fit` and keep the history in `hist2`."
+      - "**Verify.** Store the last row's `val_loss` in `fixed_val_loss` and `val_acc` in `fixed_val_acc`. Targets: `fixed_val_loss <= 0.40` and `fixed_val_acc >= 0.85`."
+    hint: "`best_epoch = int(hist.loc[hist.val_loss.idxmin(), \"epoch\"])`. The cheapest fix is early stopping: the same settings with `epochs=best_epoch`."
+    pre_code: |
+      import torch
+      from kits.fine_tuning_llms import base_model, add_lora, fit, featurize, labels_of, helios_split, noisy_helios_train
+      _tr, _va = helios_split()
+      X_train, y_noisy = featurize(_tr.text), labels_of(noisy_helios_train().category)
+      X_val, y_val = featurize(_va.text), labels_of(_va.category)
+      torch.manual_seed(0)
+      _m = add_lora(base_model(), r=16, alpha=32)
+      hist = fit(_m, X_train, y_noisy, X_val, y_val, epochs=150, lr=1e-2)
+    sample_code: |
+      best_epoch = ____
+      last = hist.iloc[-1]
+      final_gap = ____
+      print(f"best epoch {best_epoch}; at epoch 150 train loss {last.train_loss:.3f}, val loss {last.val_loss:.3f}")
+
+      torch.manual_seed(0)
+      model = add_lora(base_model(), r=16, alpha=32)
+      hist2 = fit(model, X_train, y_noisy, X_val, y_val, epochs=____, lr=1e-2)
+
+      fixed_val_loss = ____
+      fixed_val_acc = ____
+      print(f"val loss {last.val_loss:.3f} -> {fixed_val_loss:.3f}, val acc {last.val_acc:.3f} -> {fixed_val_acc:.3f}")
+    solution: |
+      best_epoch = int(hist.loc[hist.val_loss.idxmin(), "epoch"])
+      last = hist.iloc[-1]
+      final_gap = last.val_loss - last.train_loss
+      print(f"best epoch {best_epoch}; at epoch 150 train loss {last.train_loss:.3f}, val loss {last.val_loss:.3f}")
+
+      torch.manual_seed(0)
+      model = add_lora(base_model(), r=16, alpha=32)
+      hist2 = fit(model, X_train, y_noisy, X_val, y_val, epochs=best_epoch, lr=1e-2)
+
+      fixed_val_loss = hist2.val_loss.iloc[-1]
+      fixed_val_acc = hist2.val_acc.iloc[-1]
+      print(f"val loss {last.val_loss:.3f} -> {fixed_val_loss:.3f}, val acc {last.val_acc:.3f} -> {fixed_val_acc:.3f}")
+    tests: |
+      check_equal("best_epoch", msg="`best_epoch` is the `epoch` value of the row with the smallest `val_loss` in `hist`.")
+      check_equal("final_gap", tol=1e-6, msg="`final_gap` is `val_loss - train_loss` on the last row of `hist`.")
+      h2 = check_object("hist2")
+      assert {"val_loss", "val_acc"} <= set(h2.columns), "`hist2` should be the history returned by `fit(...)` with validation data."
+      vl, va = float(h2.val_loss.iloc[-1]), float(h2.val_acc.iloc[-1])
+      assert abs(float(check_object("fixed_val_loss")) - vl) < 1e-9 and abs(float(check_object("fixed_val_acc")) - va) < 1e-9, "Store the last row of `hist2` in `fixed_val_loss` and `fixed_val_acc`."
+      assert vl <= 0.40, f"Validation loss after your fix is {vl:.3f}; the target is <= 0.40. Stop training near `best_epoch`, or lower the rank or learning rate."
+      assert va >= 0.85, f"Validation accuracy after your fix is {va:.3f}; the target is >= 0.85."
+    success_msg: "Training past the turning point memorised the 16 wrong labels: train loss 0.02, val loss near 2. Stopping at the best epoch fixes the loss for free. The fix that would raise the ceiling is cleaning those 16 labels."
+
+  - id: read-the-curves
+    type: classify
+    title: Read the curves
+    prompt: Each line describes a training run. Sort it by diagnosis.
+    hint: "Compare train with validation, then the task with everything else. Curves that are too perfect point to the data, not the model."
+    zones: [Underfitting, Overfitting, Forgetting, Leaky validation]
+    items:
+      - { text: "Train and validation loss are both flat and high after 30 epochs", zone: Underfitting }
+      - { text: "Validation accuracy sits at the frozen baseline; the adapters barely moved", zone: Underfitting }
+      - { text: "Train loss is 0.02, validation loss has risen since epoch 6", zone: Overfitting }
+      - { text: "The gap between train and validation accuracy widens every epoch", zone: Overfitting }
+      - { text: "Task validation is 1.00, the general suite fell from 1.00 to 0.82", zone: Forgetting }
+      - { text: "Ordinary 'my laptop will not turn on' tickets are now routed to maintenance", zone: Forgetting }
+      - { text: "Validation loss tracks training loss almost exactly, all the way to zero", zone: Leaky validation }
+      - { text: "Half the validation tickets also appear in the training file", zone: Leaky validation }
+
+  - id: boss-forgetting
+    type: sequential
+    title: "Mission: the triager forgot how to triage"
+    context: |
+      To squeeze out the last point on Helios, the team retrained the adapters harder: rank 16, `lr=1e-2`, 100
+      epochs. Helios accuracy is perfect, but the fleet's Earth-side help desk, which shares the model, says
+      ordinary tickets are now misrouted. Run the loop. Loaded: `base_model`, `add_lora`, `fit`, `accuracy`,
+      Helios `X_train, y_train, X_val, y_val`, general eval `X_gen, y_gen` with its DataFrame `gen_df`, 200
+      general replay tickets `X_replay, y_replay`, `CATEGORIES`, `torch` and `pd`.
+    pre_code: |
+      import torch
+      import pandas as pd
+      from kits.fine_tuning_llms import (base_model, add_lora, fit, accuracy, featurize, labels_of, helios_split,
+                                         general_eval, general_tickets, CATEGORIES)
+      _tr, _va = helios_split()
+      X_train, y_train = featurize(_tr.text), labels_of(_tr.category)
+      X_val, y_val = featurize(_va.text), labels_of(_va.category)
+      X_gen, y_gen = general_eval()
+      gen_df = general_tickets(500, seed=2)
+      _rep = general_tickets(200, seed=7)
+      X_replay, y_replay = featurize(_rep.text), labels_of(_rep.category)
+    steps:
+      - instructions:
+          - "**Measure.** Reproduce the team's run: `torch.manual_seed(0)`, `team = add_lora(base_model(), r=16, alpha=32)`, `hist = fit(team, X_train, y_train, X_val, y_val, epochs=100, lr=1e-2)`."
+          - "Store its Helios validation accuracy in `helios_acc`, its general accuracy in `general_acc`, and `accuracy(base_model(), X_gen, y_gen) - general_acc` in `drop`."
+        hint: "`accuracy(team, X_gen, y_gen)`."
+        sample_code: |
+          torch.manual_seed(0)
+          team = add_lora(base_model(), r=16, alpha=32)
+          hist = fit(team, X_train, y_train, X_val, y_val, epochs=100, lr=1e-2)
+
+          helios_acc = ____
+          general_acc = ____
+          drop = ____
+          print(f"Helios {helios_acc:.2f}; general {general_acc:.2f} (down {drop:.2f})")
+        solution: |
+          torch.manual_seed(0)
+          team = add_lora(base_model(), r=16, alpha=32)
+          hist = fit(team, X_train, y_train, X_val, y_val, epochs=100, lr=1e-2)
+
+          helios_acc = accuracy(team, X_val, y_val)
+          general_acc = accuracy(team, X_gen, y_gen)
+          drop = accuracy(base_model(), X_gen, y_gen) - general_acc
+          print(f"Helios {helios_acc:.2f}; general {general_acc:.2f} (down {drop:.2f})")
+        tests: |
+          check_equal("helios_acc", msg="`helios_acc` is `accuracy(team, X_val, y_val)`. Seed with `torch.manual_seed(0)` before `add_lora`.")
+          check_equal("general_acc", msg="`general_acc` is `accuracy(team, X_gen, y_gen)`.")
+          check_equal("drop", tol=1e-6, msg="`drop` = the base model's general accuracy minus `general_acc`.")
+      - instructions:
+          - "**Diagnose.** Add a `pred` column to `gen_df` with the team model's predicted category names, and an `ok` column. Store per-category general accuracy in `gen_by_cat` and the worst category in `worst_general`."
+          - "Is this overfitting or forgetting? Look at the last row of `hist` (task validation) and at `drop`. Store `\"overfitting\"` or `\"forgetting\"` in `diagnosis`."
+        hint: "`[CATEGORIES[i] for i in team(X_gen).argmax(1).tolist()]` (inside `torch.no_grad()`). Task validation is still perfect, so it isn't overfitting."
+        sample_code: |
+          with torch.no_grad():
+              gen_df["pred"] = ____
+          gen_df["ok"] = gen_df.pred == gen_df.category
+          gen_by_cat = ____
+          worst_general = ____
+          diagnosis = ____
+          print(gen_by_cat.round(2))
+          print(gen_df[~gen_df.ok].drop_duplicates("text").head(6).to_string())
+          print("final task val acc:", hist.val_acc.iloc[-1], "->", diagnosis)
+        solution: |
+          with torch.no_grad():
+              gen_df["pred"] = [CATEGORIES[i] for i in team(X_gen).argmax(1).tolist()]
+          gen_df["ok"] = gen_df.pred == gen_df.category
+          gen_by_cat = gen_df.groupby("category").ok.mean()
+          worst_general = gen_by_cat.idxmin()
+          diagnosis = "forgetting"
+          print(gen_by_cat.round(2))
+          print(gen_df[~gen_df.ok].drop_duplicates("text").head(6).to_string())
+          print("final task val acc:", hist.val_acc.iloc[-1], "->", diagnosis)
+        tests: |
+          g = check_object("gen_by_cat")
+          assert all(abs(float(g[c]) - float(sol["gen_by_cat"][c])) < 1e-9 for c in sol["gen_by_cat"].index), "`gen_by_cat` should be `gen_df.groupby(\"category\").ok.mean()` with `pred` from the team model."
+          check_equal("worst_general", msg="`worst_general` is the category with the lowest general accuracy.")
+          check_equal("diagnosis", "forgetting", msg="Task validation stayed perfect while the general suite fell, so this is forgetting, not overfitting.")
+      - instructions:
+          - "**Fix.** Train a new adapter, `fixed`, with any fix from the playbook: replay (`fit(..., X_extra=X_replay, y_extra=y_replay)`), a lower LR, fewer epochs, a lower rank, or a mix."
+          - "Targets: Helios validation **≥ 0.95** and general accuracy **≥ 0.97**. Store them in `fixed_helios` and `fixed_general`."
+        hint: "Replay is the most direct fix for forgetting: keep the team's settings and add `X_extra=X_replay, y_extra=y_replay`."
+        sample_code: |
+          torch.manual_seed(0)
+          fixed = add_lora(base_model(), r=16, alpha=32)
+          fit(fixed, X_train, y_train, X_val, y_val, epochs=100, lr=1e-2, X_extra=____, y_extra=____)
+
+          fixed_helios = ____
+          fixed_general = ____
+          print(f"Helios {helios_acc:.2f} -> {fixed_helios:.2f}; general {general_acc:.2f} -> {fixed_general:.2f}")
+        solution: |
+          torch.manual_seed(0)
+          fixed = add_lora(base_model(), r=16, alpha=32)
+          fit(fixed, X_train, y_train, X_val, y_val, epochs=100, lr=1e-2, X_extra=X_replay, y_extra=y_replay)
+
+          fixed_helios = accuracy(fixed, X_val, y_val)
+          fixed_general = accuracy(fixed, X_gen, y_gen)
+          print(f"Helios {helios_acc:.2f} -> {fixed_helios:.2f}; general {general_acc:.2f} -> {fixed_general:.2f}")
+        tests: |
+          from kits.fine_tuning_llms import accuracy
+          f = check_object("fixed")
+          h, g = accuracy(f, user["X_val"], user["y_val"]), accuracy(f, user["X_gen"], user["y_gen"])
+          assert abs(float(check_object("fixed_helios")) - h) < 1e-9 and abs(float(check_object("fixed_general")) - g) < 1e-9, "Store `accuracy(fixed, ...)` on the Helios and general sets in `fixed_helios` and `fixed_general`."
+          assert g >= 0.97, f"General accuracy is {g:.3f}; the target is 0.97. Replay general data, or move less (lower LR, fewer epochs, lower rank)."
+          assert h >= 0.95, f"Helios accuracy is {h:.3f}; the target is 0.95. Your fix overshot: the model no longer learns the task."
+      - instructions:
+          - "**Verify and report.** Store a dict `report` with keys `helios_before`, `helios_after`, `general_before`, `general_after` (the team run's and your fixed run's accuracies) and print it."
+        hint: "`helios_before` is `helios_acc`, `general_before` is `general_acc`."
+        sample_code: |
+          report = {"helios_before": ____, "helios_after": ____,
+                    "general_before": ____, "general_after": ____}
+          print({k: round(v, 3) for k, v in report.items()})
+        solution: |
+          report = {"helios_before": helios_acc, "helios_after": fixed_helios,
+                    "general_before": general_acc, "general_after": fixed_general}
+          print({k: round(v, 3) for k, v in report.items()})
+        tests: |
+          r = check_object("report")
+          assert set(r) == {"helios_before", "helios_after", "general_before", "general_after"}, "`report` needs exactly the four keys."
+          assert abs(r["general_before"] - user["general_acc"]) < 1e-9 and abs(r["helios_before"] - user["helios_acc"]) < 1e-9, "The `_before` values come from the team run (`general_acc`, `helios_acc`)."
+          assert abs(r["general_after"] - user["fixed_general"]) < 1e-9 and abs(r["helios_after"] - user["fixed_helios"]) < 1e-9, "The `_after` values come from your fixed run."
+          assert r["general_after"] - r["general_before"] > 0.1, "The report should show general accuracy recovering by more than 10 points."
+    timeout: 90
+    success_msg: "The team's run lost 18 points of general accuracy, with IT tickets hit hardest, while its own task curves looked perfect. 200 replayed general tickets restore it to 0.99 with no loss on Helios. Always ship with a general suite in the gate."

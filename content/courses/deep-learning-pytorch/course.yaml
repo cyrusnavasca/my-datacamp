@@ -1,0 +1,44 @@
+title: Deep Learning with PyTorch
+description: Tensors, autograd, neural network layers and training loops in PyTorch, from a single neuron
+  to a small image classifier.
+level: intermediate
+est_hours: 5
+prerequisites:
+- supervised-learning
+objectives:
+- Work with tensors and autograd
+- Build networks with torch.nn
+- Write a correct training and evaluation loop
+- Fight overfitting with regularisation
+requires:
+- torch
+chapters:
+- id: tensors
+  title: Tensors and autograd
+  description: Tensor operations, gradients and the computational graph.
+  lessons:
+  - tensor-basics
+  - autograd
+  - broadcasting
+- id: networks
+  title: Building networks
+  description: Linear layers, activations and loss functions.
+  lessons:
+  - neuron-from-scratch
+  - activations
+  - losses
+- id: training
+  title: Training loops
+  description: Datasets, DataLoaders, optimisers and evaluation.
+  lessons:
+  - training-loop
+  - debugging-training
+  - dataloaders
+  - eval-overfitting
+- id: cnns
+  title: Images and CNNs
+  description: Convolutions, pooling and a small image classifier.
+  lessons:
+  - convolutions
+  - pooling-and-shapes
+  - small-cnn

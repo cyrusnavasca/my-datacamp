@@ -1,0 +1,241 @@
+title: "Troubleshooting: the wrong tool gets picked"
+description: Measure tool-selection accuracy on a labelled set, find what confuses the model, fix the descriptions and prove it on held-out requests.
+exercises:
+  - id: wrong-tool-slides
+    type: video
+    title: "Playbook: wrong tool chosen"
+    slides: |
+      # Symptom: ORBIT does the wrong thing
+
+      > Lucía: "Let Lucía know... no wait. Message the commander that the scrubber swap is done."
+      > ORBIT: *lists the crew roster*
+
+      Wrong-tool bugs are worse than wrong answers. A read where you wanted a write fails quietly, and a **write where you
+      wanted a read** changes the station. One anecdote doesn't tell you how often it happens, or whether your fix helped,
+      so measure.
+
+      ---
+
+      ## Measure: selection accuracy on a labelled set
+
+      ```python
+      DEV_SET = [("How humid is hydroponics at the moment?", "get_sensor"),
+                 ("Show the humidity trend over the last 12 hours", "sensor_history"), ...]
+
+      def selection_report(tools, labelled):
+          misses = []
+          for request, wanted in labelled:
+              picked = pick(client, tools, request)          # name of the tool called, or None
+              if picked != wanted:
+                  misses.append((request, wanted, picked))
+          return 1 - len(misses) / len(labelled), misses
+      ```
+
+      - Label 20+ real requests per tool family, including ones you expect to be hard.
+      - Count **"no tool"** separately: it means no description matched at all.
+      - Group misses into **confusion pairs** (`wanted → picked`). The pairs tell you which descriptions to fix.
+
+      ---
+
+      ## Diagnose: why models confuse tools
+
+      This course's practice model scores the **words** a request shares with each tool's name, description and
+      parameters (including enum values). Real models understand far more, but they fail for the same reasons:
+
+      | cause | looks like | example |
+      | --- | --- | --- |
+      | vague description | many "no tool" picks | `"Notify."` never matches "let Lucía know" |
+      | overlapping tools | pairs that swap both ways | `get_sensor` vs `sensor_history`: "now" vs "over time" never stated |
+      | missing user vocabulary | misses on synonyms | "reserve", "remind", "ping" appear nowhere |
+      | incidental words | pulled to an odd tool | "how long does a spacewalk **last**" → a tool that says "last N hours" |
+      | too many tools | accuracy falls as tools are added | 40 tools in one list |
+
+      ---
+
+      ## Fix, in this order
+
+      1. **Rewrite descriptions**: say what the tool does, when to use it, in the crew's words, and how it differs from
+         its neighbour ("live value right now" vs "past readings over hours"). Cost: a few tokens per call.
+      2. **Rename** confusing names (`get_data2` → `sensor_history`). Cost: nothing, but update your logs and evals.
+      3. **Merge or remove** overlapping tools (`get_sensor` + `sensor_history` → one tool with optional `hours`). Cost:
+         a schema change, and every caller must update.
+      4. **Add examples** of typical requests to the description. Cost: more tokens, and a risk of overfitting.
+      5. **Route first**: give each request only the tools its category needs. Cost: an extra step and its latency.
+
+      ---
+
+      ## Verify: dev set, held-out set, token cost
+
+      - Re-run the report on the **dev** set you tuned on. It should clear your bar (say ≥ 90%).
+      - Run it on a **held-out** set you didn't look at while editing. A big gap between the two means you fitted the
+        descriptions to specific sentences, not to the kinds of request.
+      - Check `tool_tokens(tools)`. Descriptions are paid for on every call, so stuffing them with every synonym has a
+        price.
+
+      | result | read it as |
+      | --- | --- |
+      | dev ↑, held-out ↑ | the fix generalises: ship it |
+      | dev ↑, held-out flat | overfitted to the dev sentences: write about kinds of request, not specific ones |
+      | both flat | the tools themselves overlap: merge, rename or route |
+
+  - id: read-the-confusion
+    type: mc
+    title: Read the confusion pairs
+    question: |
+      On 40 labelled requests, ORBIT's tool picks are 72% accurate. Here are the misses:
+
+      | wanted → picked | count |
+      | --- | --- |
+      | `sensor_history` → `get_sensor` | 6 |
+      | `get_sensor` → `sensor_history` | 3 |
+      | `send_message` → no tool | 1 |
+      | `search_handbook` → `crew_roster` | 1 |
+
+      What should you fix first?
+    options:
+      - text: "Make `get_sensor` and `sensor_history` easy to tell apart (\"live value right now\" vs \"past readings over N hours\"), or merge them into one tool with an optional `hours`."
+        correct: true
+        feedback: "Right. 9 of the 11 misses are one pair swapping in both directions, a sign of two overlapping tools. Fix that pair and accuracy jumps to about 95%."
+      - text: Add more synonyms to `send_message`'s description.
+        feedback: "That fixes 1 miss out of 11. Start with the biggest bucket."
+      - text: Switch to a larger model.
+        feedback: "Possibly helpful, but expensive and it doesn't remove the ambiguity. When two descriptions overlap, a stronger model still has to guess."
+      - text: "Force `tool_choice={\"type\": \"tool\", \"name\": \"get_sensor\"}`."
+        feedback: "That makes every history question read a single live value, which turns 6 misses into all of them."
+    hint: Count the misses that involve the same two tools.
+
+  - id: fix-tool-selection
+    type: sequential
+    title: "Mission: ORBIT picks the right tool"
+    context: |
+      The crew complains that ORBIT "does random things". Its six tools (`VAGUE_TOOLS`) have one-line descriptions someone
+      wrote in a hurry. You have 20 labelled requests (`DEV_SET`) and 10 more you'll only use to verify (`HELDOUT_SET`),
+      as `(request, wanted_tool)` pairs. `pick(client, tools, request)` returns the name of the tool the model calls, or
+      `None`. Measure, diagnose, fix, verify.
+    pre_code: |
+      import copy
+      from collections import Counter
+      import aikit
+      from kits.agents_tool_use import VAGUE_TOOLS, DEV_SET, HELDOUT_SET, pick, tool_tokens
+      client = aikit.FakeClaude(aikit.tool_chooser(), clock=aikit.VirtualClock())
+      for t in VAGUE_TOOLS:
+          print(f"{t['name']:16} {t['description']}")
+    steps:
+      - instructions:
+          - "Write `selection_report(tools, labelled)`. It returns `(accuracy, misses)`, where `misses` lists `(request, wanted, picked)` for every wrong pick."
+          - "Run it on `VAGUE_TOOLS` and `DEV_SET`; store the results in `baseline` and `misses`, then print both."
+        hint: Loop over `labelled`, call `pick(client, tools, request)`, and collect a tuple when it differs from `wanted`. Accuracy is `1 - len(misses) / len(labelled)`.
+        sample_code: |
+          def selection_report(tools, labelled):
+              misses = []
+              for request, wanted in labelled:
+                  picked = ____
+                  if picked != wanted:
+                      misses.append(____)
+              return ____, misses
+
+          baseline, misses = selection_report(VAGUE_TOOLS, DEV_SET)
+          print(baseline)
+          for m in misses:
+              print(m)
+        solution: |
+          def selection_report(tools, labelled):
+              misses = []
+              for request, wanted in labelled:
+                  picked = pick(client, tools, request)
+                  if picked != wanted:
+                      misses.append((request, wanted, picked))
+              return 1 - len(misses) / len(labelled), misses
+
+          baseline, misses = selection_report(VAGUE_TOOLS, DEV_SET)
+          print(baseline)
+          for m in misses:
+              print(m)
+        tests: |
+          check_object("selection_report")
+          check_equal("baseline", msg="`baseline` should be the share of DEV_SET requests where the picked tool equals the wanted one.")
+          ms = user["misses"]
+          assert isinstance(ms, list) and len(ms) == len(sol["misses"]), f"Expected {len(sol['misses'])} misses on the dev set, got {len(ms) if isinstance(ms, list) else ms!r}."
+          assert all(len(m) == 3 for m in ms), "Each miss should be a `(request, wanted, picked)` tuple."
+          check_equal("misses")
+      - instructions:
+          - "Count how many misses picked **no tool** at all (`picked is None`); store it in `no_tool`."
+          - "Store a `Counter` of `(wanted, picked)` pairs for the other misses in `confused`, and print `confused.most_common()`."
+        hint: "`no_tool = sum(1 for _, _, p in misses if p is None)` and `Counter((w, p) for _, w, p in misses if p is not None)`."
+        sample_code: |
+          no_tool = ____
+          confused = Counter(____)
+          print("no tool:", no_tool)
+          print(confused.most_common())
+        solution: |
+          no_tool = sum(1 for _, _, p in misses if p is None)
+          confused = Counter((w, p) for _, w, p in misses if p is not None)
+          print("no tool:", no_tool)
+          print(confused.most_common())
+        tests: |
+          check_equal("no_tool")
+          check_equal("confused", msg="`confused` should count `(wanted, picked)` pairs, leaving out the misses where nothing was picked.")
+      - instructions:
+          - "Most misses are \"no tool\" (no description matched) plus `sensor_history` vs `get_sensor` swaps. Rewrite every description in `better`: what the tool does, when to use it, in the crew's words, and how it differs from its neighbour. Keep names and schemas as they are."
+          - "Fix: reach **≥ 90%** on `DEV_SET` while keeping `tool_tokens(better_tools)` **≤ 1100**. Re-read the misses after each edit."
+          - "Verify: run `selection_report` on `HELDOUT_SET` too and store the accuracy in `heldout_acc`. It must be **≥ 70%** without tuning on those requests."
+        hint: |
+          Mention the words the requests use: "right now", "current" and the module names for live readings; "history",
+          "trend", "changed", "past day" for history; roles for the roster; "reserve", "schedule" for bookings; "remind",
+          "let ... know" for messages; "procedure", "how long", "how often" for the handbook. Watch for incidental words:
+          "last" in one tool pulls "how long does it last" towards it. If held-out is much lower than dev, describe kinds of
+          request, not specific sentences.
+        sample_code: |
+          better = {
+              "get_sensor": ____,
+              "sensor_history": ____,
+              "crew_roster": ____,
+              "book_module": ____,
+              "send_message": ____,
+              "search_handbook": ____,
+          }
+          better_tools = copy.deepcopy(VAGUE_TOOLS)
+          for t in better_tools:
+              t["description"] = better[t["name"]]
+
+          dev_acc, dev_misses = selection_report(better_tools, DEV_SET)
+          heldout_acc, heldout_misses = ____
+          print(f"baseline {baseline:.0%} -> dev {dev_acc:.0%}, held-out {heldout_acc:.0%}, {tool_tokens(better_tools)} tokens")
+          for m in dev_misses + heldout_misses:
+              print(m)
+        solution: |
+          better = {
+              "get_sensor": "Read the live, current value of one sensor right now (temperature, humidity, CO2, oxygen or pressure) in a module: A habitat, B lab, C hydroponics, D storage, E engineering, F docking.",
+              "sensor_history": "Past readings of one sensor (temperature, humidity, CO2, oxygen or pressure) over the previous N hours: its history or trend, how a value changed since yesterday or over the past day.",
+              "crew_roster": "List the crew aboard: each person's name and role (commander, flight engineer, medical officer, botanist, systems specialist, payload scientist).",
+              "book_module": "Book, reserve or schedule time in a module, lab bench, glovebox or exercise slot for a crew member on a given day. Max 4 hours.",
+              "send_message": "Send a message to a crew member: let them know, remind, notify or ping them. Use the person's name.",
+              "search_handbook": "Search the station handbook for procedures, rules, policies and schedules: how to do something, how long or how often, what to do after an alarm.",
+          }
+          better_tools = copy.deepcopy(VAGUE_TOOLS)
+          for t in better_tools:
+              t["description"] = better[t["name"]]
+
+          dev_acc, dev_misses = selection_report(better_tools, DEV_SET)
+          heldout_acc, heldout_misses = selection_report(better_tools, HELDOUT_SET)
+          print(f"baseline {baseline:.0%} -> dev {dev_acc:.0%}, held-out {heldout_acc:.0%}, {tool_tokens(better_tools)} tokens")
+          for m in dev_misses + heldout_misses:
+              print(m)
+        tests: |
+          from kits.agents_tool_use import VAGUE_TOOLS as _V, DEV_SET as _D, HELDOUT_SET as _H, tool_tokens as _tt, _accuracy
+          bt = check_object("better_tools")
+          assert [t["name"] for t in bt] == [t["name"] for t in _V], "Keep the six tools, with the same names and in the same order. Only change descriptions."
+          assert [t["input_schema"] for t in bt] == [t["input_schema"] for t in _V], "Leave the input schemas as they are; this fix is about descriptions."
+          assert all(isinstance(t["description"], str) and t["description"].strip() for t in bt), "Every tool needs a description."
+          acc = _accuracy(bt, _D)
+          toks = _tt(bt)
+          assert acc >= 0.9, f"Dev accuracy is {acc:.0%}; it needs to reach 90%. Print the misses and add the words those requests use to the right tool."
+          assert toks <= 1100, f"The tool list costs {toks} tokens per call; keep it at or below 1100. Cut filler words, keep the distinguishing ones."
+          check_object("heldout_acc")
+          real = _accuracy(bt, _H)
+          assert abs(user["heldout_acc"] - real) < 1e-9, "`heldout_acc` should come from `selection_report(better_tools, HELDOUT_SET)`."
+          assert real >= 0.7, f"Held-out accuracy is {real:.0%}; it needs 70%. Your descriptions may fit the dev sentences too closely: describe the kinds of request each tool serves, in plain crew words."
+    success_msg: |
+      From under half right to over 90%, verified on requests you didn't tune on, by editing text alone. The misses that
+      remain are honest overlaps (is "rules for booking the glovebox" a booking or a policy question?). That's where
+      merging tools or routing comes in.

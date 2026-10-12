@@ -1,0 +1,241 @@
+title: Messages, roles and the response
+description: What one API call sends, what the model actually reads, and what comes back, including the usage numbers you pay for.
+exercises:
+  - id: api-anatomy
+    type: video
+    title: Anatomy of an API call
+    slides: |
+      # ORBIT says its first words
+
+      You are the first AI engineer on **Helios-7**, a research station in orbit. The crew wants
+      **ORBIT**, an assistant that answers questions from the station handbook.
+
+      Everything ORBIT does starts with one HTTP request to a model API:
+
+      ```text
+      POST https://api.anthropic.com/v1/messages
+      {
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 300,
+        "system": "You are ORBIT, the assistant on research station Helios-7.",
+        "messages": [{"role": "user", "content": "Who are you?"}]
+      }
+      ```
+
+      The API is **stateless**. The model knows only what is in this one request: no memory of earlier calls,
+      no access to your files. Every chapter of this course follows from that fact.
+
+      ---
+
+      ## The same call with the Python SDK
+
+      ```python
+      import anthropic
+
+      client = anthropic.Anthropic()          # reads ANTHROPIC_API_KEY from the environment
+      response = client.messages.create(
+          model="claude-sonnet-5-5",
+          max_tokens=300,                     # required: a ceiling on the reply length
+          system="You are ORBIT, the assistant on research station Helios-7.",
+          messages=[{"role": "user", "content": "Who are you?"}],
+      )
+      print(response.content[0].text)
+      ```
+
+      | parameter | what it is |
+      | --- | --- |
+      | `model` | which model runs the request |
+      | `max_tokens` | the most tokens the reply may have |
+      | `system` | standing instructions: persona, rules, context |
+      | `messages` | the conversation so far, alternating `user` and `assistant`, starting with `user` |
+
+      There is **no `"system"` role** inside `messages`. The system prompt is its own top-level parameter.
+
+      ---
+
+      ## What the model actually reads
+
+      The API flattens your request into **one sequence of tokens**, roughly:
+
+      ```text
+      [system] You are ORBIT, the assistant on research station Helios-7.
+      [user] Who are you?
+      [assistant] ▌
+      ```
+
+      The model then predicts the assistant's reply one token at a time, until it produces an
+      end-of-turn token or reaches `max_tokens`.
+
+      So the system prompt isn't magic. It's the first text in the context, and models are trained to give it
+      high priority. Put things there that hold for the **whole conversation**: who ORBIT is, its rules,
+      the output format. Put the request itself in a `user` message.
+
+      ---
+
+      ## What comes back
+
+      ```python
+      response.content        # list of blocks: [TextBlock(type="text", text="I'm ORBIT ...")]
+      response.stop_reason    # why generation stopped: "end_turn", "max_tokens", "stop_sequence", "tool_use"
+      response.usage          # input_tokens=31, output_tokens=24, ...
+      ```
+
+      - `content` is a **list** because a reply can mix block types: text, tool calls (a later course) and thinking.
+        `response.content[0].text` reads the first text block.
+      - `stop_reason == "end_turn"` means the model finished on its own. Anything else needs checking (next lesson).
+      - `usage` is what you are billed for.
+
+      ---
+
+      ## Usage is money
+
+      You pay per token, and output tokens cost more than input tokens. Input is processed in parallel;
+      output is generated one token at a time.
+
+      $$\text{cost} = \frac{\text{input tokens} \times p_{in} + \text{output tokens} \times p_{out}}{1{,}000{,}000}$$
+
+      | tier (illustrative prices) | input per 1M tokens | output per 1M tokens |
+      | --- | --- | --- |
+      | small (Haiku-class) | 1.00 USD | 5.00 USD |
+      | medium (Sonnet-class) | 3.00 USD | 15.00 USD |
+      | large (Opus-class) | 5.00 USD | 25.00 USD |
+
+      These numbers are for practice. Real prices change, so check the provider's pricing page.
+
+      ---
+
+      ## Practising offline
+
+      Exercises can't use the network or an API key, so they use `aikit.FakeClaude`. It has the same
+      shape as the real client: `client.messages.create(...)` returns `.content`, `.stop_reason` and `.usage`,
+      and it rejects bad requests the way the real API does.
+
+      ```python
+      import aikit
+      client = aikit.FakeClaude(respond, clock=aikit.VirtualClock())   # instead of anthropic.Anthropic()
+      ```
+
+      The code you write against it works against the real API with that one line changed.
+
+  - id: first-call
+    type: coding
+    title: ORBIT introduces itself
+    context: |
+      `client` is a fake Claude client wired up as ORBIT's model, and `MODEL` holds a model id.
+      The model only takes on the ORBIT persona if you tell it who it is in the system prompt.
+    instructions:
+      - "Call `client.messages.create()` with `model=MODEL`, `max_tokens=200`, a `system` prompt that begins `You are ORBIT` and one user message `Who are you?`. Store the result in `response`."
+      - Store the text of the first content block in `reply` and print it.
+      - Store why generation stopped in `reason`.
+    hint: |
+      The system prompt is a top-level argument: `system="You are ORBIT, ..."`. The user message is
+      `{"role": "user", "content": "Who are you?"}`. The text is `response.content[0].text`, and the reason is `response.stop_reason`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      clk = aikit.VirtualClock()
+      client = aikit.FakeClaude(orbit_chat(), clock=clk)
+    sample_code: |
+      response = client.messages.create(
+          model=MODEL,
+          max_tokens=____,
+          system=____,
+          messages=[{"role": ____, "content": "Who are you?"}],
+      )
+      reply = ____
+      reason = ____
+      print(reply)
+    solution: |
+      response = client.messages.create(
+          model=MODEL,
+          max_tokens=200,
+          system="You are ORBIT, the station assistant on research station Helios-7.",
+          messages=[{"role": "user", "content": "Who are you?"}],
+      )
+      reply = response.content[0].text
+      reason = response.stop_reason
+      print(reply)
+    tests: |
+      check_object("response", msg="Store the result of `client.messages.create(...)` in `response`.")
+      check_object("reply")
+      assert isinstance(user["reply"], str), "`reply` should be a string: take `.text` from `response.content[0]`, not the block itself."
+      assert "ORBIT" in user["reply"], "The model didn't take on the ORBIT persona. Pass `system=\"You are ORBIT, ...\"` as its own argument (not as a message)."
+      check_equal("reply")
+      check_equal("reason", "end_turn", msg="`reason` should be `response.stop_reason`, which is `'end_turn'` here.")
+      check_output_contains("ORBIT", msg="Print `reply`.")
+    success_msg: ORBIT is online. The persona came from the system prompt, not from anything stored on the server.
+
+  - id: call-cost
+    type: coding
+    title: What did that call cost?
+    context: |
+      A crew member asked ORBIT to walk them through the airlock procedure. The call is done and stored in `response`.
+      `PRICE_IN` and `PRICE_OUT` are the illustrative medium-tier prices in USD per **million** tokens.
+    instructions:
+      - Store the input and output token counts from `response.usage` in `tokens_in` and `tokens_out`.
+      - Compute the call's cost in USD and store it in `cost`.
+      - Store the share of `cost` that comes from output tokens in `output_share` (a number between 0 and 1).
+      - Store what 10,000 such calls a month would cost in `monthly_cost`.
+    hint: |
+      `cost = (tokens_in * PRICE_IN + tokens_out * PRICE_OUT) / 1_000_000`. The output part is
+      `tokens_out * PRICE_OUT / 1_000_000`; divide it by `cost`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      clk = aikit.VirtualClock()
+      client = aikit.FakeClaude(orbit_chat(), clock=clk)
+      PRICE_IN, PRICE_OUT = 3.00, 15.00
+      response = client.messages.create(
+          model=MODEL, max_tokens=400,
+          system="You are ORBIT, the station assistant on research station Helios-7.",
+          messages=[{"role": "user", "content": "Walk me through the airlock procedure for an EVA."}],
+      )
+    sample_code: |
+      tokens_in = response.usage.____
+      tokens_out = response.usage.____
+      cost = ____
+      output_share = ____
+      monthly_cost = ____
+      print(tokens_in, tokens_out, round(cost, 6), round(output_share, 2), round(monthly_cost, 2))
+    solution: |
+      tokens_in = response.usage.input_tokens
+      tokens_out = response.usage.output_tokens
+      cost = (tokens_in * PRICE_IN + tokens_out * PRICE_OUT) / 1_000_000
+      output_share = (tokens_out * PRICE_OUT / 1_000_000) / cost
+      monthly_cost = cost * 10_000
+      print(tokens_in, tokens_out, round(cost, 6), round(output_share, 2), round(monthly_cost, 2))
+    tests: |
+      check_equal("tokens_in", msg="`tokens_in` should be `response.usage.input_tokens`.")
+      check_equal("tokens_out", msg="`tokens_out` should be `response.usage.output_tokens`.")
+      check_equal("cost", tol=1e-9, msg="`cost` is off. Prices are per million tokens: divide by 1,000,000, and use PRICE_OUT for output tokens.")
+      assert abs(user["cost"] - user["client"].total_cost()) < 1e-9, "Your cost doesn't match what the client metered. Check the formula."
+      check_equal("output_share", tol=1e-6, msg="`output_share` is the output part of the cost divided by the whole cost.")
+      check_equal("monthly_cost", tol=1e-6, msg="`monthly_cost` is `cost * 10_000`.")
+    success_msg: |
+      Output tokens were most of the bill even though the prompt was longer. Long answers cost more than long
+      questions, so the fastest cost win is usually a shorter reply.
+
+  - id: persona-placement
+    type: mc
+    title: Where does the persona go?
+    question: |
+      ORBIT must always introduce itself as ORBIT and follow station rules for the whole conversation.
+      Where should that text go in the request?
+    context: |
+      The console has `client`, `MODEL` and `aikit` loaded. Try the options, e.g.
+      `client.messages.create(model=MODEL, max_tokens=50, messages=[{"role": "system", "content": "You are ORBIT"}, {"role": "user", "content": "Who are you?"}])`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import orbit_chat, MODEL
+      client = aikit.FakeClaude(orbit_chat(), clock=aikit.VirtualClock())
+    options:
+      - text: "In the top-level `system` parameter."
+        correct: true
+        feedback: Right. The system prompt sits at the very start of the context, holds for every turn, and is kept apart from what the user typed.
+      - text: "As the first message, with `\"role\": \"system\"`."
+        feedback: That is another API's convention. Here the request is rejected with a 400 error, because messages only take `user` and `assistant` roles. Try it in the console.
+      - text: Pasted at the start of every user message.
+        feedback: It works, but it mixes your rules with the user's text, repeats them in every turn of the history (you pay for each copy), and a user can more easily talk the model out of them.
+      - text: "As a first `assistant` message saying \"I am ORBIT\"."
+        feedback: The conversation must start with a `user` message, so this request fails. Even when it is allowed later in a conversation, an assistant turn is something the model said, not a rule it must follow.
+    hint: Run each option in the console and look at the error messages.

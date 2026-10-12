@@ -1,0 +1,341 @@
+title: JSON-RPC messages
+description: Requests, responses, notifications and errors, the four message shapes every MCP exchange is made of, and how to read error codes when calls fail.
+exercises:
+  - id: jsonrpc-slides
+    type: video
+    title: Every MCP message is JSON-RPC 2.0
+    slides: |
+      # Three kinds of message
+
+      MCP doesn't invent a wire format: every message is a **JSON-RPC 2.0** object.
+
+      ```python
+      # request: has an id and a method -> expects exactly one response
+      {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+       "params": {"name": "get_sensor", "arguments": {"module": "C", "metric": "humidity"}}}
+
+      # response: same id, and exactly one of result / error
+      {"jsonrpc": "2.0", "id": 7, "result": {"content": [{"type": "text", "text": "68.0 %"}], "isError": False}}
+
+      # notification: a method but NO id -> fire and forget, never answered
+      {"jsonrpc": "2.0", "method": "notifications/initialized"}
+      ```
+
+      The **id** is the only thing that ties a response to its request. That's what lets a client have
+      several requests in flight and match answers that arrive out of order: keep a dict of pending ids.
+
+      ---
+
+      ## The rules that bite
+
+      - `"jsonrpc"` is exactly the **string** `"2.0"`, not the number `2.0`.
+      - In MCP a request `id` is a **string or an integer**. Never `null`, and never reused by the same
+        sender within a session. A counter is the simplest correct choice.
+      - A response echoes the request's `id` and has `result` **or** `error`, never both.
+      - **Notifications never get a response**. Forget the `id` on a request and you've sent a
+        notification: the server stays silent and your client waits forever.
+      - MCP passes `params` as an **object** (named parameters).
+
+      ---
+
+      ## Error responses
+
+      ```python
+      {"jsonrpc": "2.0", "id": 7, "error": {"code": -32602, "message": "Invalid params: unknown tool 'vent'"}}
+      ```
+
+      | code | name | what it usually means in practice |
+      | --- | --- | --- |
+      | -32700 | Parse error | the bytes aren't JSON: `str(dict)`, single quotes, a truncated line. `id` is `null`: the server couldn't read it |
+      | -32600 | Invalid Request | valid JSON, wrong envelope: `jsonrpc` missing or not `"2.0"`, bad `id`, `method` not a string |
+      | -32601 | Method not found | a typo (`tools/invoke`), or a feature the server never declared |
+      | -32602 | Invalid params | wrong `params` shape: `args` instead of `arguments`, a missing `name`, an unknown tool |
+      | -32603 | Internal error | the server's own code broke; look at the server's logs |
+
+      MCP also uses -32002 for "resource not found". Codes -32000 to -32099 are left for servers to define.
+
+      ---
+
+      ## Playbook: calls fail
+
+      **Symptom:** every tool call fails, or the client hangs.
+
+      **Measure:** log every message on the wire and tally the error codes. Count requests that never got
+      a response.
+
+      **Diagnose by code, outermost layer first.** The server checks in this order, so one bug can hide the next:
+
+      1. **-32700** → fix serialisation (`json.dumps`, not `str`). Nothing else matters until this passes.
+      2. **-32600** → fix the envelope (`"jsonrpc": "2.0"`, integer or string ids).
+      3. **-32601** → fix method names; check the server declared that capability.
+      4. **-32602** → fix the params shape against the spec (`name`, `arguments`).
+      5. **No response at all** → you sent a notification; add an `id`.
+
+      **Verify:** re-run the same batch. The goal is zero protocol errors. A result with `"isError": true`
+      is something else: the tool ran and reported a problem, which is the tool's business, not your client's.
+
+  - id: build-request
+    type: coding
+    title: Build valid messages
+    context: |
+      `server` is a Helios sensor server that has already finished its handshake. Write the two message
+      builders every MCP client needs, then send a real `tools/call`. `message_kind(msg)` from the kit
+      tells you how a message will be read: `"request"`, `"notification"`, `"response"`, `"error"` or
+      `"invalid"`.
+    instructions:
+      - "Finish `make_request(method, params=None)`: `jsonrpc` `\"2.0\"`, a fresh integer `id` from `next(_ids)`, the `method`, and `params` only when given."
+      - "Finish `make_notification(method, params=None)`: the same, but with **no** `id`."
+      - "Build `call_msg`: a `tools/call` request for tool `get_sensor` with arguments `{\"module\": \"C\", \"metric\": \"humidity\"}`."
+      - "Send it with `response = server.handle(call_msg)` and print `message_kind(call_msg)` and `response`."
+    hint: |
+      `params` for `tools/call` is `{"name": "get_sensor", "arguments": {...}}`. In `make_notification`,
+      build the dict without the `"id"` key at all; `"id": None` is not the same thing.
+    pre_code: |
+      import itertools
+      from kits.mcp_integrations import sensor_server, message_kind, NEW
+      server = sensor_server()
+      server.handle({"jsonrpc": "2.0", "id": "setup-1", "method": "initialize",
+                     "params": {"protocolVersion": NEW, "capabilities": {}, "clientInfo": {"name": "orbit", "version": "1"}}})
+      server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+      _ids = itertools.count(1)
+    sample_code: |
+      def make_request(method, params=None):
+          msg = {"jsonrpc": ____, "id": ____, "method": method}
+          if params is not None:
+              msg["params"] = params
+          return msg
+
+      def make_notification(method, params=None):
+          msg = ____
+          if params is not None:
+              msg["params"] = params
+          return msg
+
+      call_msg = make_request("tools/call", ____)
+      response = server.handle(call_msg)
+      print(message_kind(call_msg), response)
+    solution: |
+      def make_request(method, params=None):
+          msg = {"jsonrpc": "2.0", "id": next(_ids), "method": method}
+          if params is not None:
+              msg["params"] = params
+          return msg
+
+      def make_notification(method, params=None):
+          msg = {"jsonrpc": "2.0", "method": method}
+          if params is not None:
+              msg["params"] = params
+          return msg
+
+      call_msg = make_request("tools/call", {"name": "get_sensor", "arguments": {"module": "C", "metric": "humidity"}})
+      response = server.handle(call_msg)
+      print(message_kind(call_msg), response)
+    tests: |
+      mk = user["message_kind"]
+      a, b = user["make_request"]("ping"), user["make_request"]("tools/list", {})
+      assert mk(a) == "request" and mk(b) == "request", "`make_request` should return a valid request: `jsonrpc` must be the string \"2.0\" and `id` an integer."
+      assert a["id"] != b["id"], "Each request needs a fresh id: use `next(_ids)` inside `make_request`."
+      assert "params" not in a and b.get("params") == {}, "Add `params` only when it's given (not None)."
+      n = user["make_notification"]("notifications/initialized")
+      assert mk(n) == "notification", "`make_notification` should return a message with `jsonrpc` and `method` but no `id` key at all."
+      check_object("call_msg")
+      c = user["call_msg"]
+      assert c.get("method") == "tools/call" and c.get("params") == {"name": "get_sensor", "arguments": {"module": "C", "metric": "humidity"}}, "`call_msg` should be a `tools/call` with params `{\"name\": \"get_sensor\", \"arguments\": {...}}`."
+      r = user["response"]
+      assert r and "result" in r and "68" in r["result"]["content"][0]["text"], f"The server should answer with a result containing the humidity. It returned {r!r}."
+    success_msg: |
+      That's a full request/response pair. Note the response's `id` matches `call_msg["id"]`: with many
+      requests in flight, that's the only way to know which answer is which.
+
+  - id: missing-id
+    type: mc
+    title: The request that never comes back
+    question: |
+      A client sends this message, then waits for the reading:
+
+      `{"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_sensor", "arguments": {"module": "C", "metric": "humidity"}}}`
+
+      What happens? The console has `server` and this message as `msg`. Try `server.handle(msg)`.
+    pre_code: |
+      from kits.mcp_integrations import sensor_server, NEW
+      server = sensor_server()
+      server.handle({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": NEW, "capabilities": {}, "clientInfo": {"name": "orbit", "version": "1"}}})
+      server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+      msg = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "get_sensor", "arguments": {"module": "C", "metric": "humidity"}}}
+    options:
+      - text: The server returns the reading as usual
+        feedback: There's nowhere to send it. A response must carry the request's id, and this message has none. Run `server.handle(msg)` and look at what comes back.
+      - text: The server returns error -32600 because the id is missing
+        feedback: "A message without an id isn't an invalid request: JSON-RPC defines it as a notification. Servers don't send error responses to notifications either."
+      - text: It's a notification, so the server sends nothing back and the client waits forever
+        correct: true
+        feedback: Right. No id means notification, and notifications are never answered. A client should time out pending requests, but the real fix is to always give requests an id.
+      - text: The server returns error -32601 because tools/call can't be a notification
+        feedback: The server doesn't reply to notifications at all, not even with an error. It may ignore one it doesn't understand, and that's all.
+    hint: Which field ties a response to its request? Check what `server.handle(msg)` returns.
+
+  - id: message-kind
+    type: coding
+    title: Classify messages like a server does
+    context: |
+      Before a server routes anything it has to know what it received. Write that check yourself.
+      `SAMPLES` holds 12 messages, from well-formed to subtly broken.
+    instructions:
+      - "Write `kind(msg)` returning `\"request\"`, `\"notification\"`, `\"response\"`, `\"error\"` or `\"invalid\"`."
+      - "Anything that isn't a dict, or whose `jsonrpc` isn't exactly `\"2.0\"`, is `\"invalid\"`. With a string `method`: no `id` key means notification; an `id` that is an int or str (not bool, not None) means request; any other id means invalid."
+      - "Without `method`: it needs an `id` and exactly one of `result` / `error`. With `error` it's `\"error\"` (the id may be None, as in a parse error); with `result` it's `\"response\"`. Anything else is invalid."
+      - "Store `kinds = [kind(m) for m in SAMPLES]` and print it."
+    hint: |
+      `isinstance(True, int)` is `True` in Python, so check `not isinstance(x, bool)` explicitly.
+      `("result" in msg) != ("error" in msg)` is true when exactly one of them is present.
+    pre_code: |
+      SAMPLES = [
+          {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+          {"jsonrpc": "2.0", "method": "notifications/initialized"},
+          {"jsonrpc": "2.0", "id": 1, "result": {"tools": []}},
+          {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
+          {"jsonrpc": 2.0, "id": 2, "method": "ping"},
+          {"jsonrpc": "2.0", "id": None, "method": "ping"},
+          {"jsonrpc": "2.0", "id": "req-7", "method": "tools/call", "params": {"name": "get_sensor"}},
+          {"jsonrpc": "2.0", "id": 3, "result": {}, "error": {"code": -32603, "message": "Internal error"}},
+          {"jsonrpc": "2.0", "id": True, "method": "ping"},
+          {"jsonrpc": "2.0", "id": 4, "error": {"code": -32601, "message": "Method not found"}},
+          ["jsonrpc", "2.0"],
+          {"jsonrpc": "2.0", "id": 5},
+      ]
+    sample_code: |
+      def valid_id(x):
+          return isinstance(x, (str, int)) and not isinstance(x, bool)
+
+      def kind(msg):
+          if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+              return "invalid"
+          if "method" in msg:
+              if not isinstance(msg["method"], str):
+                  return "invalid"
+              if "id" not in msg:
+                  return ____
+              return ____
+          if "id" not in msg or ____:
+              return "invalid"
+          if "error" in msg:
+              return "error"
+          return "response" if valid_id(msg["id"]) else "invalid"
+
+      kinds = [kind(m) for m in SAMPLES]
+      print(kinds)
+    solution: |
+      def valid_id(x):
+          return isinstance(x, (str, int)) and not isinstance(x, bool)
+
+      def kind(msg):
+          if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+              return "invalid"
+          if "method" in msg:
+              if not isinstance(msg["method"], str):
+                  return "invalid"
+              if "id" not in msg:
+                  return "notification"
+              return "request" if valid_id(msg["id"]) else "invalid"
+          if "id" not in msg or ("result" in msg) == ("error" in msg):
+              return "invalid"
+          if "error" in msg:
+              return "error"
+          return "response" if valid_id(msg["id"]) else "invalid"
+
+      kinds = [kind(m) for m in SAMPLES]
+      print(kinds)
+    tests: |
+      expected = ["request", "notification", "response", "error", "invalid", "invalid",
+                  "request", "invalid", "invalid", "error", "invalid", "invalid"]
+      check_object("kinds")
+      got = user["kinds"]
+      assert isinstance(got, list) and len(got) == len(expected), "`kinds` should hold one label per message in `SAMPLES`."
+      wrong = [i for i, (g, e) in enumerate(zip(got, expected)) if g != e]
+      assert not wrong, f"SAMPLES[{wrong[0]}] should be {expected[wrong[0]]!r}, you returned {got[wrong[0]]!r}. Message: {user['SAMPLES'][wrong[0]]!r}"
+    success_msg: |
+      Three of those are classic real-world bugs: `jsonrpc` as the number 2.0, an `id` of `None` on a
+      request, and `True` as an id (it slips through `isinstance(x, int)`).
+
+  - id: error-triage
+    type: coding
+    title: "Troubleshoot: every call fails"
+    context: |
+      The mission-control dashboard's MCP client fails every tool call. `send_all(build, encode)` sends
+      the 8 calls in `CALLS` to a fresh sensor/crew server, building each message with
+      `build(n, tool, args)` and serialising it with `encode(msg)`, and returns the 8 responses.
+      `build_v1` and `encode_v1` are the dashboard's current code (shown in the instructions' hint).
+    instructions:
+      - "**Measure:** `before = Counter(error_codes(send_all(build_v1, encode_v1)))` and print it. `error_codes(responses)` lists the error code of each error response."
+      - "**Diagnose and fix one layer at a time**, re-measuring after each: write `encode(msg)` and `build(n, tool, args)` that produce a correct `tools/call` request."
+      - "**Verify:** store `responses = send_all(build, encode)` and `after = Counter(error_codes(responses))`. It must be empty."
+      - "Store `tool_errors`: how many responses are results with `isError` true. These are the tool reporting a problem, not a protocol bug."
+    hint: |
+      The current code is `encode_v1 = lambda msg: str(msg)` and
+      `build_v1 = lambda n, tool, args: {"jsonrpc": 2.0, "id": n, "method": "tools/run", "params": {"tool": tool, "args": args}}`.
+      Four bugs, one per error layer: `json.dumps`, the string `"2.0"`, `tools/call`, and params `{"name": ..., "arguments": ...}`.
+    pre_code: |
+      import json
+      from collections import Counter
+      from kits.mcp_integrations import MCPServer, mcp_tool_from_station, NEW
+      import aikit
+
+      CALLS = [("get_sensor", {"module": "C", "metric": "humidity"}), ("crew_roster", {}),
+               ("get_sensor", {"module": "A", "metric": "temperature"}), ("get_sensor", {"module": "E", "metric": "co2"}),
+               ("get_sensor", {"module": "B", "metric": "o2"}), ("crew_roster", {}),
+               ("get_sensor", {"module": "F", "metric": "pressure"}), ("get_sensor", {"module": "D", "metric": "humidity"})]
+
+      def send_all(build, encode):
+          station = aikit.helios.Station(offline=[("E", "co2")])
+          server = MCPServer("helios-dashboard-backend", tools=[mcp_tool_from_station(n, station) for n in ("get_sensor", "crew_roster")])
+          server.handle({"jsonrpc": "2.0", "id": "init", "method": "initialize",
+                         "params": {"protocolVersion": NEW, "capabilities": {}, "clientInfo": {"name": "dashboard", "version": "1"}}})
+          server.handle({"jsonrpc": "2.0", "method": "notifications/initialized"})
+          return [server.handle(encode(build(n, tool, args))) for n, (tool, args) in enumerate(CALLS, 1)]
+
+      def error_codes(responses):
+          return [r["error"]["code"] for r in responses if r and "error" in r]
+
+      encode_v1 = lambda msg: str(msg)
+      build_v1 = lambda n, tool, args: {"jsonrpc": 2.0, "id": n, "method": "tools/run", "params": {"tool": tool, "args": args}}
+    sample_code: |
+      before = Counter(error_codes(send_all(build_v1, encode_v1)))
+      print("before:", before)
+
+      def encode(msg):
+          return ____
+
+      def build(n, tool, args):
+          return ____
+
+      responses = send_all(build, encode)
+      after = Counter(error_codes(responses))
+      tool_errors = ____
+      print("after:", after, "tool errors:", tool_errors)
+    solution: |
+      before = Counter(error_codes(send_all(build_v1, encode_v1)))
+      print("before:", before)
+
+      def encode(msg):
+          return json.dumps(msg)
+
+      def build(n, tool, args):
+          return {"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": tool, "arguments": args}}
+
+      responses = send_all(build, encode)
+      after = Counter(error_codes(responses))
+      tool_errors = sum(1 for r in responses if r and r.get("result", {}).get("isError"))
+      print("after:", after, "tool errors:", tool_errors)
+    tests: |
+      check_equal("before", msg="`before` should be `Counter(error_codes(send_all(build_v1, encode_v1)))`: every call fails at the first layer, parsing.")
+      check_object("after")
+      a = user["after"]
+      assert not a, f"There are still protocol errors: {dict(a)}. Read the code: -32700 is serialisation, -32600 the envelope, -32601 the method name, -32602 the params."
+      rs = user["responses"]
+      assert sum(1 for r in rs if r and "result" in r) == 8, "All 8 calls should come back as results."
+      check_equal("tool_errors", 1, msg="One sensor (E co2) is offline, so exactly one result has `isError: true`. Count results where `r['result'].get('isError')` is true.")
+    success_msg: |
+      Each fix exposed the next error, -32700 → -32600 → -32601 → -32602, because a server checks the
+      outer layers first. The one remaining `isError` result is correct behaviour: an offline sensor
+      is the tool's news for the model, not a protocol bug.

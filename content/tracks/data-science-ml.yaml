@@ -1,0 +1,14 @@
+title: Data Science & Machine Learning
+order: 1
+description: From Python and pandas to statistics and classic machine learning with scikit-learn. Build,
+  evaluate and tune models on real tabular data.
+courses:
+- python-for-data-science
+- pandas-data-manipulation
+- data-visualization
+- statistics-probability
+- supervised-learning
+- unsupervised-learning
+- feature-engineering-evaluation
+- tree-ensembles
+- mlops-model-serving

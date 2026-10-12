@@ -1,0 +1,201 @@
+title: From one neuron to nn.Module
+description: Build a neuron and a layer by hand, then with nn.Linear and nn.Module, and count what you built.
+exercises:
+  - id: intro
+    type: video
+    title: Neurons, layers and modules
+    slides: |
+      # One neuron
+
+      A neuron takes a weighted sum of its inputs, adds a bias and passes the result through an
+      activation function $\varphi$:
+
+      $$a = \varphi(w \cdot x + b) = \varphi\Big(\sum_i w_i x_i + b\Big)$$
+
+      ```python
+      x = torch.tensor([0.5, -1.0, 2.0])     # one example, 3 features
+      w = torch.tensor([0.2, 0.4, -0.1])
+      b = torch.tensor(0.3)
+      a = torch.relu(w @ x + b)
+      ```
+
+      The weights decide how much each input counts; the bias shifts the point where the neuron
+      "switches on".
+
+      ---
+
+      ## A layer is a matrix multiply
+
+      Put `out` neurons side by side and run a whole batch at once:
+
+      $$Z = X W^\top + b \qquad X: (N, \text{in}) \quad W: (\text{out}, \text{in}) \quad b: (\text{out},) \quad Z: (N, \text{out})$$
+
+      ```python
+      layer = nn.Linear(4, 3)        # in_features=4, out_features=3
+      layer.weight.shape             # (3, 4): one row per neuron
+      layer.bias.shape               # (3,)
+      Z = layer(X)                   # same as X @ layer.weight.T + layer.bias
+      ```
+
+      `nn.Linear` is nothing more than this formula plus a sensible random initialisation.
+
+      ---
+
+      ## `nn.Module`: a container that tracks parameters
+
+      ```python
+      class TinyNet(nn.Module):
+          def __init__(self):
+              super().__init__()               # must come first
+              self.hidden = nn.Linear(4, 8)    # assigning a layer registers its parameters
+              self.out = nn.Linear(8, 2)
+
+          def forward(self, x):
+              return self.out(torch.relu(self.hidden(x)))
+
+      model = TinyNet()
+      model(X)                                 # call the model, not model.forward(X)
+      list(model.parameters())                 # what the optimiser will update
+      ```
+
+      For a plain stack, `nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.Linear(8, 2))` does the same.
+
+      ---
+
+      ## Counting parameters, and what they cost
+
+      A `Linear(in, out)` has $\text{in} \times \text{out} + \text{out}$ parameters.
+
+      | model | parameters | float32 weights | training memory with Adam |
+      | --- | --- | --- | --- |
+      | `20 → 64 → 64 → 3` | 5,699 | 22 KB | ~4x weights (weights, grads, 2 Adam moments) plus activations |
+      | 7B LLM | 7,000,000,000 | 28 GB | ~112 GB before activations |
+
+      **Wide vs deep.** A wider layer adds parameters quadratically and is easy to train. Extra depth
+      composes more steps of computation for fewer parameters, but deep stacks need good
+      activations, initialisation and normalisation to train at all (next lesson).
+
+      ---
+
+      ## Playbook: when a module misbehaves
+
+      | symptom | measure | usual cause | fix |
+      | --- | --- | --- | --- |
+      | `cannot assign module before Module.__init__() call` | read the traceback | forgot `super().__init__()` | call it first |
+      | some layers never change during training | `sum(p.numel() for p in model.parameters())` vs your formula | layers kept in a plain Python list or dict, so they are not registered | `nn.ModuleList` / `nn.ModuleDict` |
+      | `mat1 and mat2 shapes cannot be multiplied (32x10 and 12x8)` | print the input shape | `in_features` does not match the data | set `in_features` to the last dimension of the input |
+
+      The parameter count is the cheapest check there is. Run it on every new model.
+
+  - id: neuron-vs-linear
+    type: coding
+    title: A layer by hand equals nn.Linear
+    context: |
+      `layer` is an `nn.Linear(4, 3)` with random weights, and `X` is a batch of 5 examples with 4
+      features each. Reproduce what the layer computes using only its weights.
+    instructions:
+      - Compute the layer's output by hand from `layer.weight` and `layer.bias`, and store it in `manual`.
+      - Store `layer(X)` in `auto`.
+      - "Store `torch.allclose(manual, auto)` in `same` and print it."
+    hint: "`X` is `(5, 4)` and `layer.weight` is `(3, 4)`, so transpose the weight: `X @ layer.weight.T + layer.bias`."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      torch.manual_seed(0)
+      layer = nn.Linear(4, 3)
+      X = torch.randn(5, 4)
+    sample_code: |
+      manual = ____
+      auto = ____
+      same = ____
+      print(manual.shape, same)
+    solution: |
+      manual = X @ layer.weight.T + layer.bias
+      auto = layer(X)
+      same = torch.allclose(manual, auto)
+      print(manual.shape, same)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "manual", msg="`manual` should be `X @ layer.weight.T + layer.bias`, shape `(5, 3)`.")
+      check_tensor(user, sol, "auto", msg="`auto` should be `layer(X)`.")
+      assert user.get("same") is True, "`same` should be `True`: compare `manual` and `auto` with `torch.allclose`."
+    success_msg: Identical. `nn.Linear` is a matrix multiply plus a bias.
+
+  - id: module-forward
+    type: parsons
+    title: Write a module with a forward pass
+    prompt: |
+      Arrange the lines into a module with a hidden layer of 16 units (with ReLU) and an output
+      layer of 3 units, for inputs with 10 features. Indent the method bodies.
+    hint: "`super().__init__()` must run before any layer is assigned. `forward` takes `self` and `x`."
+    lines:
+      - "class Classifier(nn.Module):"
+      - "    def __init__(self):"
+      - "        super().__init__()"
+      - "        self.hidden = nn.Linear(10, 16)"
+      - "        self.out = nn.Linear(16, 3)"
+      - "    def forward(self, x):"
+      - "        h = torch.relu(self.hidden(x))"
+      - "        return self.out(h)"
+
+  - id: missing-parameters
+    type: coding
+    title: "Fix it: the layers the optimiser cannot see"
+    context: |
+      A colleague's network trains, but its hidden layers never change. The class keeps its hidden
+      layers in a plain Python list. Your job: count what the model should have, measure what
+      PyTorch sees, and fix the class.
+    instructions:
+      - "Store the parameter count you expect in `expected`, from the formula `in * out + out` for each of the three `Linear` layers."
+      - "Measure: store `sum(p.numel() for p in model.parameters())` in `counted` and print both."
+      - Fix the `Deep` class so every layer is registered, and check that `counted` now equals `expected`.
+    hint: |
+      `20*64 + 64 + 64*64 + 64 + 64*3 + 3`. A plain list hides modules from `parameters()`; wrap it
+      in `nn.ModuleList([...])`.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+    sample_code: |
+      class Deep(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.blocks = [nn.Linear(20, 64), nn.Linear(64, 64)]
+              self.out = nn.Linear(64, 3)
+
+          def forward(self, x):
+              for layer in self.blocks:
+                  x = torch.relu(layer(x))
+              return self.out(x)
+
+      model = Deep()
+      expected = ____
+      counted = ____
+      print(expected, counted)
+    solution: |
+      class Deep(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.blocks = nn.ModuleList([nn.Linear(20, 64), nn.Linear(64, 64)])
+              self.out = nn.Linear(64, 3)
+
+          def forward(self, x):
+              for layer in self.blocks:
+                  x = torch.relu(layer(x))
+              return self.out(x)
+
+      model = Deep()
+      expected = 20 * 64 + 64 + 64 * 64 + 64 + 64 * 3 + 3
+      counted = sum(p.numel() for p in model.parameters())
+      print(expected, counted)
+    tests: |
+      import torch
+      check_equal("expected", 5699, msg="`expected` should be 5,699: add `in * out + out` for Linear(20, 64), Linear(64, 64) and Linear(64, 3).")
+      fresh = user["Deep"]()
+      n = sum(p.numel() for p in fresh.parameters())
+      assert n == 5699, f"PyTorch still sees only {n} parameters in `Deep()`. Register the hidden layers with `nn.ModuleList`."
+      check_equal("counted", 5699, msg="`counted` should be measured from `model.parameters()` after the fix.")
+      out = fresh(torch.zeros(2, 20))
+      assert tuple(out.shape) == (2, 3), "`Deep()` should still map `(N, 20)` inputs to `(N, 3)` outputs."
+    success_msg: |
+      From 195 to 5,699 parameters. Before the fix, the optimiser only ever saw the output layer.
+      `nn.ModuleList`, `nn.ModuleDict` and `nn.Sequential` register what they hold; Python lists do not.

@@ -1,0 +1,207 @@
+title: Human approval
+description: Put an approval gate in front of dangerous tools, tell the model what happened, and keep approvals rare enough that people still read them.
+exercises:
+  - id: approval-slides
+    type: video
+    title: The approval gate
+    slides: |
+      # Where the gate sits
+
+      ```text
+      model ─ tool_use open_airlock(AL-1) ─→ harness ─ policy says "ask" ─→ approval queue ─→ commander
+                                                │                                     │
+                    tool_result: "pending #3" ←─┘            approve ─→ run the tool, log it, tell the crew
+      ```
+
+      The gate sits **between** the model's request and the tool. The model never calls the station directly, and it can
+      never approve anything itself: approvals come from a person, through a channel the model can't write to.
+
+      ---
+
+      ## What the model should see
+
+      | the harness... | the model sees | what happens next |
+      | --- | --- | --- |
+      | raises an exception | nothing, the run dies | the crew gets no answer |
+      | silently skips the call | no result for its `tool_use` | `400` from the API, or worse: a fake "done" |
+      | returns a success-looking result | "AL-1 opened" | the model tells the crew something false |
+      | **returns an `is_error` result: "pending approval, request #3; don't retry"** | the truth | it tells the crew it's waiting for the commander |
+
+      Make the pending message say **don't retry**, or the model may ask again and flood the queue (chapter 2's loop).
+
+      ---
+
+      ## A good approval request
+
+      ```python
+      approval_queue.append({
+          "id": 3, "tool": "open_airlock", "input": {"airlock_id": "AL-1"},
+          "requester": "Tomas Lindqvist", "task": "I'm suited up in AL-1, open the outer hatch",
+          "status": "pending",
+      })
+      ```
+
+      - Show **what** (tool and arguments), **who** asked, **why** (the original task) and **what it does** ("vents AL-1 to space").
+      - Check **who approves**: on Helios-7 only the commander may approve an airlock cycle (handbook rule).
+      - Approvals **expire**, and are for exactly that call: an approval for AL-1 doesn't open AL-2.
+      - Log the request, the decision and the result.
+
+      ---
+
+      ## Troubleshooting: approval fatigue
+
+      **Symptom:** the commander approves 17 requests a night in under two seconds each. A real airlock request would be
+      clicked through like the rest.
+
+      **Measure** over a logged shift: approvals asked, high-risk calls auto-allowed (must be 0), routine calls blocked.
+
+      **Diagnose:** the policy asks for every write, so routine bookings and messages drown out the rare dangerous call.
+
+      **Fix**, cheapest first:
+
+      1. **Tier the policy**: allow and log low-impact writes; ask only for high-impact or irreversible ones.
+      2. **Batch** routine items into one morning digest instead of interrupting.
+      3. **Better requests**: a one-line consequence ("vents AL-1 to space") makes the risky ones stand out.
+
+      **Verify** on the same log: asks down to a handful, high-risk auto-allowed still **0**, routine blocked 0.
+
+  - id: airlock-gate
+    type: coding
+    title: Gate the airlock
+    context: |
+      Tomas asks ORBIT to open the outer hatch of AL-1. ORBIT's model will call `open_airlock`. Put a gate in front of it:
+      the call is queued for the commander, and the model is told it's pending. `run_agent(client, task, TOOLS, execute)`
+      runs the loop; an `execute` that returns `(text, True)` sends an `is_error` result.
+    instructions:
+      - "In `make_execute(requester)`, for `open_airlock`: append `{\"id\", \"tool\", \"input\", \"requester\", \"status\": \"pending\"}` to `approval_queue` (id = queue length + 1) and return `(f\"Approval required: request #{id} is pending the commander's decision. Do not retry.\", True)`. Run any other tool on `station`."
+      - "Write `approve(req_id, approver)`: if `approver != COMMANDER`, return `\"refused: only the commander can approve\"`. Otherwise run the queued call on `station`, set its status to `\"approved\"` and return the tool's output."
+      - "Run the agent for Tomas and store its answer in `answer`."
+    hint: |
+      `item = {"id": len(approval_queue) + 1, "tool": name, "input": input, "requester": requester, "status": "pending"}`.
+      In `approve`, find the item with `next(x for x in approval_queue if x["id"] == req_id)`.
+    pre_code: |
+      from kits.agents_tool_use import HeliosStation, FakeClaude, VirtualClock, airlock_agent, run_agent, COMMANDER
+      station = HeliosStation()
+      TOOLS = station.tools
+      client = FakeClaude(airlock_agent(), clock=VirtualClock())
+      approval_queue = []
+      task = "I'm suited up in AL-1 with Lucía. Please open the outer hatch."
+    sample_code: |
+      def make_execute(requester):
+          def execute(name, input):
+              if name == "open_airlock":
+                  item = ____
+                  approval_queue.append(item)
+                  return ____
+              return station.run_tool(name, input)
+          return execute
+
+      def approve(req_id, approver):
+          if ____:
+              return "refused: only the commander can approve"
+          item = next(x for x in approval_queue if x["id"] == req_id)
+          output = station.run_tool(item["tool"], item["input"])
+          item["status"] = "approved"
+          return output
+
+      answer = run_agent(client, task, TOOLS, make_execute("Tomas Lindqvist"))["answer"]
+      print(answer)
+      print(approval_queue)
+      print(station.airlocks)
+    solution: |
+      def make_execute(requester):
+          def execute(name, input):
+              if name == "open_airlock":
+                  item = {"id": len(approval_queue) + 1, "tool": name, "input": input,
+                          "requester": requester, "status": "pending"}
+                  approval_queue.append(item)
+                  return f"Approval required: request #{item['id']} is pending the commander's decision. Do not retry.", True
+              return station.run_tool(name, input)
+          return execute
+
+      def approve(req_id, approver):
+          if approver != COMMANDER:
+              return "refused: only the commander can approve"
+          item = next(x for x in approval_queue if x["id"] == req_id)
+          output = station.run_tool(item["tool"], item["input"])
+          item["status"] = "approved"
+          return output
+
+      answer = run_agent(client, task, TOOLS, make_execute("Tomas Lindqvist"))["answer"]
+      print(answer)
+      print(approval_queue)
+      print(station.airlocks)
+    tests: |
+      st = user["station"]
+      assert st.airlocks["AL-1"] == "closed", "AL-1 opened without approval! The gate must stop open_airlock before it reaches the station."
+      assert all(a["tool"] != "open_airlock" for a in st.actions), "open_airlock reached the station during the agent run. Queue it instead of running it."
+      q = user["approval_queue"]
+      assert len(q) == 1 and q[0].get("status") == "pending" and q[0].get("requester") == "Tomas Lindqvist" and q[0].get("input") == {"airlock_id": "AL-1"}, f"The queue should hold one pending request from Tomas for AL-1; it holds {q}."
+      a = check_object("answer")
+      assert "pending" in a and "approval" in a.lower(), f"ORBIT should tell Tomas the request is pending approval. It said: {a!r}. Return the pending message as an error result."
+      r = user["approve"](1, "Tomas Lindqvist")
+      assert "refused" in str(r) and st.airlocks["AL-1"] == "closed", "Only the commander may approve: approve(1, 'Tomas Lindqvist') must be refused and leave AL-1 closed."
+      user["approve"](1, "Amara Okafor")
+      assert st.airlocks["AL-1"] == "OPEN" and q[0]["status"] == "approved", "approve(1, COMMANDER) should run the queued call and mark it approved."
+    success_msg: |
+      The model asked, the gate held, and ORBIT told Tomas the truth: it's waiting for the commander. The hatch opened only
+      when the one person allowed to approve did. The model never had a way to approve its own request.
+
+  - id: approval-fatigue
+    type: coding
+    title: "Troubleshooting: too many approvals"
+    context: |
+      Last night's log (`SHIFT_LOG`, 33 calls) went through a policy that asks for every write. The commander approved
+      17 requests, and admits she stopped reading them. `shift_metrics(policy)` replays the log and returns `asks`,
+      `denies`, `risky_allowed` (high-risk calls that ran without a human) and `routine_blocked` (routine calls that were
+      asked or denied). The high-risk calls are airlock openings, bookings of the EVA module F, and tools nobody planned for.
+    instructions:
+      - "Measure: store `before = shift_metrics(ask_every_write)` and print it."
+      - "Fix: write `tiered(name, input)`: deny unknown tools; ask for `open_airlock` and for `book_module` in module `\"F\"`; allow everything else."
+      - "Verify: store `after = shift_metrics(tiered)`. Targets: `asks` ≤ 4, `risky_allowed` 0, `routine_blocked` 0."
+    hint: "Keep a set of known tools: `KNOWN = {\"get_sensor\", \"sensor_history\", \"search_handbook\", \"crew_roster\", \"book_module\", \"send_message\", \"open_airlock\"}`. Check unknown first, then the two ask rules, then return `\"allow\"`."
+    pre_code: |
+      from kits.agents_tool_use import SHIFT_LOG, shift_metrics
+      READS = {"get_sensor", "sensor_history", "search_handbook", "crew_roster"}
+
+      def ask_every_write(name, input):
+          return "allow" if name in READS else "ask"
+    sample_code: |
+      before = ____
+      print("before:", before)
+
+      KNOWN = {"get_sensor", "sensor_history", "search_handbook", "crew_roster", "book_module", "send_message", "open_airlock"}
+
+      def tiered(name, input):
+          if name not in KNOWN:
+              return ____
+          if ____:
+              return "ask"
+          return "allow"
+
+      after = shift_metrics(tiered)
+      print("after: ", after)
+    solution: |
+      before = shift_metrics(ask_every_write)
+      print("before:", before)
+
+      KNOWN = {"get_sensor", "sensor_history", "search_handbook", "crew_roster", "book_module", "send_message", "open_airlock"}
+
+      def tiered(name, input):
+          if name not in KNOWN:
+              return "deny"
+          if name == "open_airlock" or (name == "book_module" and input.get("module") == "F"):
+              return "ask"
+          return "allow"
+
+      after = shift_metrics(tiered)
+      print("after: ", after)
+    tests: |
+      check_equal("before", msg="`before` is `shift_metrics(ask_every_write)`.")
+      a = check_object("after")
+      assert a["risky_allowed"] == 0, f"{a['risky_allowed']} high-risk call(s) would run without a human. Airlocks, EVA-module bookings and unknown tools must never be auto-allowed."
+      assert a["routine_blocked"] == 0, f"{a['routine_blocked']} routine call(s) are still asked or denied. Allow ordinary bookings and messages."
+      assert a["asks"] <= 4, f"The policy still asks {a['asks']} times a shift; get it to 4 or fewer."
+    success_msg: |
+      From 17 approvals a night to 3, and every one of them now matters: two airlocks and the EVA-module booking. The tool
+      nobody planned for is denied outright. Fewer, sharper asks are safer than many, because people read them.

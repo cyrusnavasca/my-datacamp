@@ -1,0 +1,259 @@
+title: Activations and deep stacks
+description: Why networks need non-linearity, how activations and initialisation decide whether gradients survive depth, and how to diagnose vanishing gradients.
+exercises:
+  - id: intro
+    type: video
+    title: Activations, initialisation and vanishing gradients
+    slides: |
+      # Without an activation, depth buys nothing
+
+      Two linear layers in a row are still one linear layer:
+
+      $$W_2(W_1 x + b_1) + b_2 = \underbrace{(W_2 W_1)}_{W} x + \underbrace{(W_2 b_1 + b_2)}_{b}$$
+
+      Stack a hundred and you still have a straight-line model. A non-linear function between the
+      layers is what lets a network bend its decision boundary. That function is the
+      **activation**.
+
+      ---
+
+      ## The activations you will meet
+
+      | activation | formula | output range | largest slope | notes |
+      | --- | --- | --- | --- | --- |
+      | sigmoid | $\frac{1}{1+e^{-z}}$ | (0, 1) | 0.25 | saturates at both ends; fine as a final probability, poor in hidden layers |
+      | tanh | $\tanh z$ | (-1, 1) | 1 | zero-centred, still saturates |
+      | ReLU | $\max(0, z)$ | [0, ∞) | 1 | cheap, no saturation for $z>0$; units can "die" (always 0) |
+      | LeakyReLU | $\max(0.01z, z)$ | (-∞, ∞) | 1 | fixes dead units at almost no cost |
+      | GELU | $z\,\Phi(z)$ | ≈ (-0.17, ∞) | ≈ 1.1 | smooth ReLU, standard in transformers; a little more compute |
+      | softmax | $\frac{e^{z_i}}{\sum_j e^{z_j}}$ | (0, 1), sums to 1 | | output layer only, and usually inside the loss |
+
+      ---
+
+      ## Underneath: gradients are products
+
+      Backpropagation multiplies one local slope per layer. Through 12 sigmoids the best case is
+      $0.25^{12} \approx 6 \times 10^{-8}$: the first layers get almost no gradient, so they barely
+      learn. That is **vanishing gradients**. If each layer instead multiplies by more than 1, you
+      get **exploding gradients** and `nan` losses.
+
+      The weights matter as much as the activation. Each layer scales the signal's variance by
+      about $n_{\text{in}} \cdot \text{Var}(w) \cdot g$. Initialisation schemes pick $\text{Var}(w)$
+      so this stays near 1:
+
+      | scheme | weight std | made for |
+      | --- | --- | --- |
+      | Xavier / Glorot | $\sqrt{2 / (n_{\text{in}} + n_{\text{out}})}$ | tanh, sigmoid |
+      | Kaiming / He | $\sqrt{2 / n_{\text{in}}}$ | ReLU family |
+
+      ```python
+      nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+      nn.init.zeros_(layer.bias)
+      ```
+
+      ---
+
+      ## Playbook: a deep network that will not learn
+
+      **Symptom:** the loss barely moves, or turns into `nan`; shallow versions of the same model train fine.
+
+      **Measure:** after one `backward()`, print the gradient norm of every layer's weight, first to last.
+
+      ```python
+      [l.weight.grad.norm().item() for l in model if isinstance(l, nn.Linear)]
+      ```
+
+      **Diagnose:** norms shrinking by orders of magnitude towards the input = vanishing; growing = exploding.
+
+      **Fix, cheapest first:**
+      1. ReLU/GELU instead of sigmoid/tanh in hidden layers, **with** matching init (Kaiming). One without the other is often not enough.
+      2. Normalisation layers (`nn.LayerNorm`, `nn.BatchNorm1d`) after each linear layer: robust, slightly slower.
+      3. Residual connections (`x + layer(x)`): the standard fix for very deep nets; changes the architecture.
+      4. For exploding gradients: a lower learning rate and `torch.nn.utils.clip_grad_norm_`.
+
+      **Verify:** re-measure. First-layer norms within a couple of orders of magnitude of the last layer's.
+
+      ---
+
+      ## Trade-off: picking an activation
+
+      | where | default | switch when |
+      | --- | --- | --- |
+      | hidden layers, MLP or CNN | ReLU + Kaiming init | many dead units: LeakyReLU; transformer-style blocks: GELU |
+      | hidden layers, RNN gates | sigmoid / tanh | they act as gates there, which is what saturation is for |
+      | output, regression | none | the target is bounded: sigmoid scaled to the range |
+      | output, classification | **none** (raw logits) | never add softmax/sigmoid before `CrossEntropyLoss` / `BCEWithLogitsLoss`; they apply it themselves, more stably |
+
+  - id: linear-collapse
+    type: coding
+    title: Two linear layers are one
+    context: |
+      `l1 = nn.Linear(3, 5)` and `l2 = nn.Linear(5, 2)` are stacked with nothing in between. Prove
+      that the stack equals a single linear layer, then show that a ReLU breaks the equivalence.
+      `X` is a `(10, 3)` batch.
+    instructions:
+      - "Store the combined weight `W = l2.weight @ l1.weight` (shape `(2, 3)`) and the combined bias `b = l2.weight @ l1.bias + l2.bias`."
+      - "Store `torch.allclose(X @ W.T + b, l2(l1(X)), atol=1e-6)` in `collapsed_matches`."
+      - "Store the same comparison with a ReLU between the layers, `l2(torch.relu(l1(X)))`, in `relu_matches`."
+      - Print both.
+    hint: The combined bias is what you get when you push `l1.bias` through `l2`, plus `l2.bias`.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      torch.manual_seed(0)
+      l1 = nn.Linear(3, 5)
+      l2 = nn.Linear(5, 2)
+      X = torch.randn(10, 3)
+    sample_code: |
+      W = ____
+      b = ____
+
+      single = X @ W.T + b
+      collapsed_matches = torch.allclose(single, ____, atol=1e-6)
+      relu_matches = torch.allclose(single, ____, atol=1e-6)
+      print(collapsed_matches, relu_matches)
+    solution: |
+      W = l2.weight @ l1.weight
+      b = l2.weight @ l1.bias + l2.bias
+
+      single = X @ W.T + b
+      collapsed_matches = torch.allclose(single, l2(l1(X)), atol=1e-6)
+      relu_matches = torch.allclose(single, l2(torch.relu(l1(X))), atol=1e-6)
+      print(collapsed_matches, relu_matches)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "W", msg="`W` should be `l2.weight @ l1.weight`, shape `(2, 3)`.")
+      check_tensor(user, sol, "b", msg="`b` should be `l2.weight @ l1.bias + l2.bias`, shape `(2,)`.")
+      assert user.get("collapsed_matches") is True, "`collapsed_matches` should be True: compare `X @ W.T + b` with `l2(l1(X))`."
+      assert user.get("relu_matches") is False, "`relu_matches` should compare against `l2(torch.relu(l1(X)))`, which is no longer linear."
+    success_msg: The ReLU is the only thing that makes the second layer worth having.
+
+  - id: vanishing-gradients
+    type: coding
+    title: "Fix it: the deep net whose first layers never learn"
+    context: |
+      `deep` is a 12-hidden-layer sigmoid network (width 32) built with `make_deep(activation)`.
+      Its loss barely moves in training. `X` and `y` are a batch of 256 examples with 4 classes.
+      Measure the gradients, diagnose, then build a fixed network **of the same depth and width**.
+    instructions:
+      - "Write `grad_norms(model)`: zero the grads, compute `F.cross_entropy(model(X), y)`, call `backward()`, and return the list of `.weight.grad.norm().item()` for every `nn.Linear`, in order."
+      - "Measure: store `grad_norms(deep)` in `before` and `before[0] / before[-1]` in `ratio_before`."
+      - "Fix: build `fixed` with `make_deep(...)` (same depth and width) and change the activation and/or initialisation until its ratio `ratio_after` is at least `0.01`."
+      - Print both ratios.
+    hint: |
+      ReLU alone is not enough here: PyTorch's default init still shrinks the signal. Use `make_deep(nn.ReLU)`,
+      then loop over the `nn.Linear` layers and call `nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")`
+      and `nn.init.zeros_(layer.bias)`.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.randn(256, 16)
+      y = torch.randint(0, 4, (256,))
+
+      def make_deep(activation=nn.Sigmoid, depth=12, width=32):
+          layers, d = [], 16
+          for _ in range(depth):
+              layers += [nn.Linear(d, width), activation()]
+              d = width
+          layers.append(nn.Linear(d, 4))
+          return nn.Sequential(*layers)
+
+      torch.manual_seed(1)
+      deep = make_deep()
+    sample_code: |
+      def grad_norms(model):
+          model.zero_grad()
+          loss = ____
+          loss.backward()
+          return [layer.weight.grad.norm().item() for layer in model if isinstance(layer, nn.Linear)]
+
+      before = grad_norms(deep)
+      ratio_before = ____
+      print(f"first/last before: {ratio_before:.1e}")
+
+      fixed = make_deep(____)
+      # change the initialisation of fixed's Linear layers here
+
+      after = grad_norms(fixed)
+      ratio_after = after[0] / after[-1]
+      print(f"first/last after: {ratio_after:.1e}")
+    solution: |
+      def grad_norms(model):
+          model.zero_grad()
+          loss = F.cross_entropy(model(X), y)
+          loss.backward()
+          return [layer.weight.grad.norm().item() for layer in model if isinstance(layer, nn.Linear)]
+
+      before = grad_norms(deep)
+      ratio_before = before[0] / before[-1]
+      print(f"first/last before: {ratio_before:.1e}")
+
+      fixed = make_deep(nn.ReLU)
+      for layer in fixed:
+          if isinstance(layer, nn.Linear):
+              nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+              nn.init.zeros_(layer.bias)
+
+      after = grad_norms(fixed)
+      ratio_after = after[0] / after[-1]
+      print(f"first/last after: {ratio_after:.1e}")
+    tests: |
+      import torch, torch.nn as nn, torch.nn.functional as F
+      check_object("before")
+      assert len(user["before"]) == 13, "`before` should have one norm per `nn.Linear` in `deep` (13)."
+      for g, s in zip(user["before"], sol["before"]):
+          assert abs(g - s) <= 1e-3 * abs(s) + 1e-12, "`before` does not match. In `grad_norms`, use `F.cross_entropy(model(X), y)` and zero the grads first."
+      check_object("ratio_before")
+      assert user["ratio_before"] < 1e-6, "`ratio_before` should be `before[0] / before[-1]`, a tiny number."
+      check_object("fixed")
+      lins = [m for m in user["fixed"].modules() if isinstance(m, nn.Linear)]
+      assert len(lins) >= 13 and all(l.out_features == 32 for l in lins[:-1]), "Keep the depth and width: build `fixed` with `make_deep(...)` and 12 hidden layers of 32 units. Making it shallower hides the problem rather than fixing it."
+      model = user["fixed"]
+      model.zero_grad()
+      F.cross_entropy(model(sol["X"]), sol["y"]).backward()
+      norms = [l.weight.grad.norm().item() for l in lins]
+      r = norms[0] / norms[-1]
+      assert r >= 0.01, f"The first layer still gets only {r:.1e} of the last layer's gradient. Try ReLU **with** Kaiming initialisation."
+    success_msg: |
+      From about 1e-11 to about 0.2. Measured on this net: ReLU alone gives 1e-4 and GELU alone 1e-5,
+      while ReLU + Kaiming, tanh + Xavier, or ReLU + LayerNorm all pass. Activation and initialisation
+      have to match.
+
+  - id: choose-activation
+    type: mc
+    title: Pick the hidden activation
+    question: |
+      You are building a 20-layer MLP for tabular data. It must train reliably, run fast on CPU at
+      inference time, and you do not want to add normalisation layers. What do you use in the
+      hidden layers?
+    options:
+      - text: Sigmoid, because its outputs look like probabilities
+        feedback: "Its slope is at most 0.25, so 20 layers multiply gradients by at most $0.25^{20}$. You measured this kind of collapse in the last exercise."
+      - text: ReLU with Kaiming initialisation
+        correct: true
+        feedback: "Right. A slope of 1 for positive inputs plus an init chosen for ReLU keeps gradients alive through depth, and ReLU is the cheapest activation to compute."
+      - text: GELU with PyTorch's default initialisation
+        feedback: "GELU is a fine activation, but with the default init it still vanished in the last exercise (about 1e-5), and it costs a little more than ReLU on CPU. Pair any activation with a matching init."
+      - text: Softmax, so every layer's outputs sum to 1
+        feedback: "Softmax couples all units in a layer and squashes them; it belongs at the output of a classifier (usually inside the loss), not in hidden layers."
+    hint: Which option keeps the per-layer slope near 1 **and** keeps the signal's scale stable?
+
+  - id: output-activation
+    type: mc
+    title: What goes on the output layer?
+    question: |
+      A fraud model outputs one number per transaction and is trained with
+      `nn.BCEWithLogitsLoss()`. What should the last layer apply to its output?
+    options:
+      - text: "`torch.sigmoid`, so the output is a probability"
+        feedback: "`BCEWithLogitsLoss` already applies a sigmoid internally (in a numerically stable way). Adding one yourself applies it twice and squashes the gradients. Apply sigmoid only when you want a probability at prediction time."
+      - text: "`torch.softmax(out, dim=1)`"
+        feedback: "Softmax over a single output is always exactly 1.0, so the model could not learn anything."
+      - text: "`torch.relu`, to keep outputs positive"
+        feedback: "A logit must be able to go negative (negative means 'probably not fraud'). ReLU would clip half the range away."
+      - text: Nothing; output the raw logit
+        correct: true
+        feedback: "Right. The loss turns the logit into a probability itself. At prediction time, call `torch.sigmoid(model(x))` if you need the probability."
+    hint: Read the loss's name carefully. What does "with logits" mean it expects?

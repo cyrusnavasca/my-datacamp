@@ -1,0 +1,30 @@
+title: Statistics and Probability
+description: 'The statistics behind machine learning: distributions, sampling, confidence intervals, hypothesis
+  tests and correlation.'
+level: intermediate
+est_hours: 4
+prerequisites:
+- pandas-data-manipulation
+objectives:
+- Describe data with summary statistics
+- Reason about probability distributions
+- Build confidence intervals with the bootstrap
+- Run and interpret hypothesis tests
+requires: []
+chapters:
+- id: summary-stats
+  title: Summary statistics
+  description: Centre, spread and shape.
+  lessons: []
+- id: distributions
+  title: Probability distributions
+  description: Discrete and continuous distributions, the normal distribution, CLT.
+  lessons: []
+- id: sampling-inference
+  title: Sampling and inference
+  description: Sampling distributions, bootstrap and confidence intervals.
+  lessons: []
+- id: hypothesis-testing
+  title: Hypothesis testing
+  description: p-values, t-tests, A/B tests and correlation.
+  lessons: []

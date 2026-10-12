@@ -1,0 +1,419 @@
+title: Transports
+description: How stdio and Streamable HTTP carry the same messages, when each one fits, and how to debug each.
+exercises:
+  - id: transports-slides
+    type: video
+    title: stdio and Streamable HTTP
+    slides: |
+      # Same messages, two ways to carry them
+
+      A transport only moves JSON-RPC messages between client and server. The messages you built in
+      the last two lessons are **identical** on both. Only the framing, the sessions and the security
+      around them differ.
+
+      | | stdio | Streamable HTTP |
+      | --- | --- | --- |
+      | who starts the server | the host launches it as a subprocess | it's already running somewhere |
+      | how a message travels | one line on stdin / stdout | an HTTP POST to one endpoint |
+      | clients per server | one (the host that launched it) | many |
+
+      ---
+
+      ## stdio: one JSON message per line
+
+      ```python
+      import subprocess, json
+      proc = subprocess.Popen(["python", "helios_sensors.py"], stdin=subprocess.PIPE,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+      proc.stdin.write(json.dumps(init_request) + "\n"); proc.stdin.flush()
+      reply = json.loads(proc.stdout.readline())
+      ```
+
+      - Messages are UTF-8 JSON, **one per line**, with no newlines inside. `json.dumps` escapes the
+        `\n` inside strings for you; `indent=2` breaks the framing.
+      - **stdout carries protocol messages and nothing else.** Logs go to **stderr**, which hosts
+        capture or show in a log panel. In Python, a stray `print()` goes to stdout.
+      - Shutdown: close the server's stdin, wait for it to exit, then send SIGTERM (and SIGKILL if it hangs).
+
+      ---
+
+      ## Streamable HTTP: one endpoint, sessions in a header
+
+      ```
+      POST /mcp   Accept: application/json, text/event-stream     body: initialize request
+      ← 200       Mcp-Session-Id: 9f1c...                           body: initialize result
+      POST /mcp   Mcp-Session-Id: 9f1c...                           body: notifications/initialized
+      ← 202 Accepted                                                (no body: it was a notification)
+      POST /mcp   Mcp-Session-Id: 9f1c...                           body: tools/list request
+      ← 200       Content-Type: application/json (or an SSE stream)  body: result
+      ```
+
+      - Every client message is a **POST**. The client's `Accept` header must list **both**
+        `application/json` and `text/event-stream`, because the server may answer with a stream.
+      - The session id from `initialize` goes on every later request. **404** means the session is gone:
+        initialize again. `GET` opens a stream for server-initiated messages; `DELETE` ends the session.
+      - Security: servers must validate the `Origin` header (against DNS rebinding), local servers should
+        bind to `127.0.0.1` only, and remote servers need real authentication (chapter 4).
+
+      ---
+
+      ## Which transport?
+
+      | | stdio | Streamable HTTP |
+      | --- | --- | --- |
+      | deployment | ship a command; nothing to host | run and operate a service |
+      | latency | a pipe: sub-millisecond | a network round trip |
+      | sharing | one host per process | many hosts and users share one server |
+      | auth | inherits the local user's permissions | you must build it (OAuth-based in the spec) |
+      | scaling | one process per host | load balancers; sessions need sticky routing or shared state |
+      | typical failures | stray stdout output, crashes, zombie processes | 4xx from headers, expired sessions, timeouts |
+
+      **stdio wins** for local tools that act as the user: files, git, a CLI wrapper, a prototype.
+      **HTTP wins** when one capability serves many people, needs per-user auth and audit, or must scale.
+
+      ---
+
+      ## Playbook: transport-level failures
+
+      **stdio. Symptom:** "unexpected token" or parse errors, or the host says the server disconnected
+      at startup. **Measure:** capture stdout and count the lines that don't parse as JSON.
+      **Usual causes:** `print()` debug output on stdout; pretty-printed JSON split over several lines;
+      a library printing a banner or warning; `str(dict)` instead of JSON. **Fix:** logs to stderr,
+      compact `json.dumps`, silence or redirect chatty libraries. **Verify:** 100% of stdout lines
+      parse, and the logs still arrive on stderr.
+
+      **HTTP. Read the status code first:** 406 → your `Accept` header; 400 → missing session id or bad
+      body; 404 → the session expired, so initialize again; 403 → `Origin` rejected; 401 → authentication.
+
+  - id: pick-transport
+    type: classify
+    title: stdio or Streamable HTTP?
+    prompt: Pick the transport that fits each Helios server best.
+    hint: Is it a local helper acting as one user, or a shared service many people reach over the network?
+    zones: [stdio, Streamable HTTP]
+    items:
+      - { text: "A file-search server Claude Code launches on one engineer's laptop", zone: stdio }
+      - { text: "A server that reads local git repositories with the user's own permissions", zone: stdio }
+      - { text: "A prototype you start from your IDE to try a new tool", zone: stdio }
+      - { text: "A CLI wrapper that must work with no network at all", zone: stdio }
+      - { text: "The station-wide sensor service used by six crew laptops and ground control", zone: Streamable HTTP }
+      - { text: "A vendor-hosted integration for the station's supply orders", zone: Streamable HTTP }
+      - { text: "A server that must authenticate each crew member and audit who called what", zone: Streamable HTTP }
+      - { text: "A server that has to scale out behind a load balancer", zone: Streamable HTTP }
+
+  - id: stdio-noise
+    type: coding
+    title: "Troubleshoot: the stdio server talks garbage"
+    context: |
+      A colleague's sensor server works in their tests but ORBIT's host reports parse errors.
+      `run_stdio_session(write_message, write_log)` runs the server on a simulated stdio pipe: for every
+      message it calls `write_log(stdout, stderr, text)` and then `write_message(stdout, stderr, msg)`.
+      It returns a result with `.parse_rate`, `.delivered`, `.bad_lines` and `.stderr`. Their current
+      functions are `write_message_v1` and `write_log_v1`.
+    instructions:
+      - "**Measure:** `before = run_stdio_session(write_message_v1, write_log_v1)`. Print it and the first 6 of `before.bad_lines`."
+      - "**Diagnose** from the bad lines, then **fix**: write `write_message(stdout, stderr, msg)` and `write_log(stdout, stderr, text)`. Each writes with `.write(...)` to the right stream, ending with `\\n`."
+      - "**Verify:** `after = run_stdio_session(write_message, write_log)` must have `parse_rate` 1.0 and `delivered` 1.0, and the log lines must still arrive on stderr. Print `after`."
+    hint: |
+      The v1 code is `stdout.write(json.dumps(msg, indent=2) + "\n")` for messages and
+      `stdout.write(text + "\n")` for logs. Messages: compact `json.dumps(msg)` on stdout. Logs: `stderr`.
+    pre_code: |
+      import json
+      from kits.mcp_integrations import run_stdio_session
+
+      def write_message_v1(stdout, stderr, msg):
+          stdout.write(json.dumps(msg, indent=2) + "\n")   # "readable" output
+
+      def write_log_v1(stdout, stderr, text):
+          stdout.write(text + "\n")                         # quick debug print
+    sample_code: |
+      before = run_stdio_session(write_message_v1, write_log_v1)
+      print(before)
+      print(before.bad_lines[:6])
+
+      def write_message(stdout, stderr, msg):
+          ____
+
+      def write_log(stdout, stderr, text):
+          ____
+
+      after = run_stdio_session(write_message, write_log)
+      print(after)
+    solution: |
+      before = run_stdio_session(write_message_v1, write_log_v1)
+      print(before)
+      print(before.bad_lines[:6])
+
+      def write_message(stdout, stderr, msg):
+          stdout.write(json.dumps(msg) + "\n")
+
+      def write_log(stdout, stderr, text):
+          stderr.write(text + "\n")
+
+      after = run_stdio_session(write_message, write_log)
+      print(after)
+    tests: |
+      check_object("before")
+      assert user["before"].parse_rate == 0.0, "`before` should be the run with the v1 functions."
+      check_object("after")
+      a = user["after"]
+      assert a.parse_rate == 1.0, f"{len(a.bad_lines)} stdout line(s) still don't parse, e.g. {a.bad_lines[:1]}. Only one compact JSON message per line belongs on stdout."
+      assert a.delivered == 1.0, "Every response must reach the client: write each message to stdout as one line of `json.dumps(msg)`."
+      assert len([x for x in a.stderr.splitlines() if x.strip()]) >= 5, "The logs vanished. Don't drop them: write them to `stderr`, where the host can still show them."
+    success_msg: |
+      Two bugs, both invisible when you run the server on its own in a terminal: debug prints on stdout
+      and pretty-printed JSON. A real host would have dropped the connection at the first bad line.
+
+  - id: http-session
+    type: coding
+    title: A session over Streamable HTTP
+    context: |
+      The handbook team runs `helios-sensors` as a remote service. `endpoint.post(path, headers, body)`
+      sends one HTTP POST and returns a response with `.status`, `.headers` and `.json()`. The endpoint is
+      at `/mcp`. `INIT`, `INITIALIZED` and `LIST` are the three messages to send, already built.
+    instructions:
+      - "POST `INIT` with headers `Accept: application/json, text/event-stream` and `Content-Type: application/json`. Store the response's `Mcp-Session-Id` header in `session_id`."
+      - "POST `INITIALIZED` with the same headers plus `Mcp-Session-Id`. Store the response status in `ack_status` (it should be 202: notifications get no body)."
+      - "POST `LIST` with the session header. Store the tool names from the JSON result in `tool_names`."
+    hint: |
+      `r = endpoint.post("/mcp", headers, json.dumps(INIT))`, then `session_id = r.headers["Mcp-Session-Id"]`.
+      Build `session_headers = {**headers, "Mcp-Session-Id": session_id}` for the next two posts.
+    pre_code: |
+      import json
+      from kits.mcp_integrations import HttpEndpoint, request, notification, NEW
+      endpoint = HttpEndpoint()
+      INIT = request(1, "initialize", {"protocolVersion": NEW, "capabilities": {}, "clientInfo": {"name": "dashboard", "version": "2.0"}})
+      INITIALIZED = notification("notifications/initialized")
+      LIST = request(2, "tools/list")
+    sample_code: |
+      headers = {"Accept": ____, "Content-Type": "application/json"}
+
+      r = endpoint.post("/mcp", headers, json.dumps(INIT))
+      session_id = ____
+
+      session_headers = ____
+      ack_status = endpoint.post("/mcp", session_headers, json.dumps(INITIALIZED)).status
+
+      r = endpoint.post("/mcp", session_headers, json.dumps(LIST))
+      tool_names = ____
+      print(session_id, ack_status, tool_names)
+      print(endpoint.requests)
+    solution: |
+      headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+
+      r = endpoint.post("/mcp", headers, json.dumps(INIT))
+      session_id = r.headers["Mcp-Session-Id"]
+
+      session_headers = {**headers, "Mcp-Session-Id": session_id}
+      ack_status = endpoint.post("/mcp", session_headers, json.dumps(INITIALIZED)).status
+
+      r = endpoint.post("/mcp", session_headers, json.dumps(LIST))
+      tool_names = [t["name"] for t in r.json()["result"]["tools"]]
+      print(session_id, ack_status, tool_names)
+      print(endpoint.requests)
+    tests: |
+      reqs = user["endpoint"].requests
+      bad = [(m, s) for m, s in reqs if s >= 400]
+      assert not bad, f"Some POSTs failed: {bad}. 406 means the Accept header must list both application/json and text/event-stream; 400 means the Mcp-Session-Id header is missing."
+      check_object("session_id")
+      assert user["session_id"] in user["endpoint"].sessions, "`session_id` should be the `Mcp-Session-Id` header from the initialize response."
+      check_equal("ack_status", 202, msg="`ack_status` should be the status of the notification POST: 202 Accepted.")
+      check_equal("tool_names", ["get_sensor"], msg="`tool_names` should be the names in `r.json()['result']['tools']`.")
+    success_msg: |
+      Same three messages as over stdio; only the envelope changed. If the server restarts and forgets
+      your session, the next POST gets a 404, and the right reaction is a fresh `initialize`.
+
+  - id: dashboard-mission
+    type: sequential
+    title: "Mission: the ground dashboard can't connect"
+    context: |
+      Ground control's dashboard connects to two servers: `helios-sensors` over stdio and
+      `helios-handbook` over Streamable HTTP. The handbook server is older and speaks only the older
+      protocol version. Both are behind `send(msg) -> response or None` functions, so your session
+      code doesn't care about the transport. `make_links()` returns fresh `{name: send}` links;
+      each `send` keeps every response it received in `send.wire`.
+      `old_dashboard(send)` is the dashboard's current session code.
+    pre_code: |
+      import itertools, json
+      from kits.mcp_integrations import (sensor_server, handbook_server, HttpEndpoint, request, notification, NEW, OLD)
+      CLIENT_VERSIONS = [NEW, OLD]
+      LISTS = {"tools": ("tools/list", "tools", "name"), "resources": ("resources/list", "resources", "uri"),
+               "prompts": ("prompts/list", "prompts", "name")}
+
+      def stdio_link(server):
+          def send(msg):
+              line = server.handle_line(json.dumps(msg))
+              resp = json.loads(line) if line else None
+              send.wire.append(resp)
+              return resp
+          send.wire = []
+          return send
+
+      def http_link(endpoint):
+          state = {"sid": None}
+          def send(msg):
+              h = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+              if state["sid"]:
+                  h["Mcp-Session-Id"] = state["sid"]
+              r = endpoint.post("/mcp", h, json.dumps(msg))
+              state["sid"] = r.headers.get("Mcp-Session-Id", state["sid"])
+              resp = r.json() if r.status == 200 and r.body else None
+              send.wire.append(resp)
+              return resp
+          send.wire = []
+          return send
+
+      def make_links():
+          return {"helios-sensors": stdio_link(sensor_server()),
+                  "helios-handbook": http_link(HttpEndpoint(lambda: handbook_server(versions=[OLD])))}
+
+      def protocol_errors(send):
+          return [r["error"] for r in send.wire if r and "error" in r]
+
+      def old_dashboard(send):
+          """The dashboard's current session code."""
+          send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2024-02-02", "capabilities": {}, "clientInfo": {"name": "dashboard", "version": "0.9"}}})
+          for method in ["tools/list", "resources/list", "prompts/list"]:
+              send({"jsonrpc": "2.0", "id": 1, "method": method})
+    steps:
+      - instructions:
+          - "**Measure.** Run `old_dashboard` on a fresh sensors link: `send = make_links()[\"helios-sensors\"]`, then `old_dashboard(send)`."
+          - "Store `errors = protocol_errors(send)` and print each error's code and message."
+          - "Also store `chosen`, the `protocolVersion` in the server's initialize result (`send.wire[0]`). The dashboard asked for `2024-02-02`; did it get it?"
+        hint: "`chosen = send.wire[0][\"result\"][\"protocolVersion\"]`"
+        sample_code: |
+          send = make_links()["helios-sensors"]
+          old_dashboard(send)
+          errors = ____
+          for e in errors:
+              print(e["code"], e["message"])
+          chosen = ____
+          print("asked 2024-02-02, server chose", chosen)
+        solution: |
+          send = make_links()["helios-sensors"]
+          old_dashboard(send)
+          errors = protocol_errors(send)
+          for e in errors:
+              print(e["code"], e["message"])
+          chosen = send.wire[0]["result"]["protocolVersion"]
+          print("asked 2024-02-02, server chose", chosen)
+        tests: |
+          check_equal("errors", msg="`errors` should be `protocol_errors(send)` after running `old_dashboard(send)`.")
+          check_equal("chosen", msg="`chosen` is `send.wire[0]['result']['protocolVersion']`. The server answered with its own newest version, and the old dashboard never checked.")
+      - instructions:
+          - "**Fix the handshake.** All three errors say the id 1 was reused, and that hides the next problem. Write `connect(send, ids)`: send `initialize` with id `next(ids)` and `CLIENT_VERSIONS[0]`; if the chosen version isn't in `CLIENT_VERSIONS` return `None`; else send `notifications/initialized` and return the result's `capabilities`."
+          - "Test it: `caps = connect(make_links()[\"helios-sensors\"], itertools.count(1))` and print `caps`."
+        hint: |
+          `res = send(request(next(ids), "initialize", {"protocolVersion": CLIENT_VERSIONS[0], "capabilities": {}, "clientInfo": {...}}))["result"]`,
+          then `send(notification("notifications/initialized"))`.
+        sample_code: |
+          def connect(send, ids):
+              res = send(request(next(ids), "initialize", {
+                  "protocolVersion": ____, "capabilities": {},
+                  "clientInfo": {"name": "dashboard", "version": "1.0"}}))["result"]
+              if ____:
+                  return None
+              ____
+              return res["capabilities"]
+
+          caps = connect(make_links()["helios-sensors"], itertools.count(1))
+          print(caps)
+        solution: |
+          def connect(send, ids):
+              res = send(request(next(ids), "initialize", {
+                  "protocolVersion": CLIENT_VERSIONS[0], "capabilities": {},
+                  "clientInfo": {"name": "dashboard", "version": "1.0"}}))["result"]
+              if res["protocolVersion"] not in CLIENT_VERSIONS:
+                  return None
+              send(notification("notifications/initialized"))
+              return res["capabilities"]
+
+          caps = connect(make_links()["helios-sensors"], itertools.count(1))
+          print(caps)
+        tests: |
+          import itertools
+          make_links, protocol_errors, stdio_link, sensor_server = user["make_links"], user["protocol_errors"], user["stdio_link"], user["sensor_server"]
+          check_object("connect")
+          links = make_links()
+          for name, s in links.items():
+              c = user["connect"](s, itertools.count(1))
+              assert isinstance(c, dict), f"`connect` should return the capabilities dict for {name} (both servers speak a version in CLIENT_VERSIONS)."
+              s({"jsonrpc": "2.0", "id": 99, "method": "tools/list" if "tools" in c else "resources/list"})
+              assert not protocol_errors(s), f"After `connect`, {name} still reports {protocol_errors(s)[0]['message']!r}."
+          from kits.mcp_integrations import MCPServer
+          future = stdio_link(MCPServer("x", tools=sensor_server().tool_definitions(), versions=["2027-05-01"]))
+          assert user["connect"](future, itertools.count(1)) is None, "When the server picks a version not in CLIENT_VERSIONS, `connect` should return None."
+          assert len(future.wire) == 1, "After an unacceptable version, disconnect: send nothing more (no notifications/initialized)."
+      - instructions:
+          - "**Fix discovery.** Write `discover(send, caps, ids)`: for each capability in `caps` that is a key of `LISTS`, send the list request with a fresh id and collect the ids of the items. `LISTS[cap]` gives `(method, result_key, id_field)`."
+          - "Return a dict like `{\"tools\": [\"get_sensor\"]}`. Never call a list method for a capability the server didn't declare."
+        hint: |
+          `method, key, field = LISTS[cap]`, then `res = send(request(next(ids), method))["result"]` and
+          `found[cap] = [item[field] for item in res[key]]`.
+        sample_code: |
+          def discover(send, caps, ids):
+              found = {}
+              for cap in caps:
+                  if cap in LISTS:
+                      method, key, field = LISTS[cap]
+                      res = ____
+                      found[cap] = ____
+              return found
+
+          s = make_links()["helios-sensors"]
+          ids = itertools.count(1)
+          print(discover(s, connect(s, ids), ids))
+        solution: |
+          def discover(send, caps, ids):
+              found = {}
+              for cap in caps:
+                  if cap in LISTS:
+                      method, key, field = LISTS[cap]
+                      res = send(request(next(ids), method))["result"]
+                      found[cap] = [item[field] for item in res[key]]
+              return found
+
+          s = make_links()["helios-sensors"]
+          ids = itertools.count(1)
+          print(discover(s, connect(s, ids), ids))
+        tests: |
+          import itertools
+          make_links, protocol_errors, stdio_link, sensor_server = user["make_links"], user["protocol_errors"], user["stdio_link"], user["sensor_server"]
+          connect = user["connect"]
+          check_object("discover")
+          s = make_links()["helios-sensors"]
+          ids = itertools.count(1)
+          got = user["discover"](s, connect(s, ids), ids)
+          assert got == {"tools": ["get_sensor"]}, f"For helios-sensors, `discover` should return {{'tools': ['get_sensor']}}, got {got!r}."
+          assert not protocol_errors(s), f"Discovery caused a protocol error: {protocol_errors(s)[0]['message']!r}."
+      - instructions:
+          - "**Verify** on both servers and both transports. For each `name, send` in `make_links().items()`, run `connect` and `discover` with its own `itertools.count(1)`."
+          - "Store `inventory = {name: {cap: len(items) for cap, items in found.items()}}` and `total_errors`, the number of protocol errors across both links (it must be 0). Print both."
+        hint: "Keep the links in a variable so you can call `protocol_errors(send)` on each after the loop."
+        sample_code: |
+          links = make_links()
+          inventory = {}
+          for name, send in links.items():
+              ids = itertools.count(1)
+              found = ____
+              inventory[name] = ____
+          total_errors = ____
+          print(inventory, total_errors)
+        solution: |
+          links = make_links()
+          inventory = {}
+          for name, send in links.items():
+              ids = itertools.count(1)
+              found = discover(send, connect(send, ids), ids)
+              inventory[name] = {cap: len(items) for cap, items in found.items()}
+          total_errors = sum(len(protocol_errors(s)) for s in links.values())
+          print(inventory, total_errors)
+        tests: |
+          check_equal("inventory", {"helios-sensors": {"tools": 1}, "helios-handbook": {"resources": 34}},
+                      msg="`inventory` should show 1 tool on helios-sensors and 34 resources on helios-handbook, and nothing undeclared.")
+          check_equal("total_errors", 0, msg="`total_errors` should count protocol errors on both links after your session code ran: it must be 0.")
+    success_msg: |
+      One session code, two transports, two protocol versions, zero protocol errors. The old dashboard
+      broke the three things this chapter is about: ids (reused), lifecycle (no `initialized`, no version
+      check) and capabilities (asking for prompts nobody offered).

@@ -1,0 +1,251 @@
+title: Tools are prompts with a schema
+description: What a tool definition is, how the model sees it, and how to write one the model uses correctly.
+exercises:
+  - id: tool-schemas-slides
+    type: video
+    title: How a model "calls" a function
+    slides: |
+      # The model never runs your code
+
+      ORBIT can't read a sensor by itself. You **describe** a tool, the model **asks** for it, and **your code** runs it.
+
+      ```python
+      import anthropic
+      client = anthropic.Anthropic()
+
+      get_sensor = {
+          "name": "get_sensor",
+          "description": "Read the live value of one environment sensor in a station module.",
+          "input_schema": {
+              "type": "object",
+              "properties": {
+                  "module": {"type": "string", "enum": ["A", "B", "C", "D", "E", "F"]},
+                  "metric": {"type": "string", "enum": ["temperature", "humidity", "co2", "o2", "pressure"]},
+              },
+              "required": ["module", "metric"],
+          },
+      }
+      r = client.messages.create(model="claude-sonnet-5-5", max_tokens=1024, tools=[get_sensor],
+                                 messages=[{"role": "user", "content": "How humid is hydroponics?"}])
+      r.stop_reason   # "tool_use"
+      r.content[-1]   # ToolUseBlock(id="toolu_01...", name="get_sensor", input={"module": "C", "metric": "humidity"})
+      ```
+
+      The reply is a **request**: a name and a JSON input. Nothing has happened on the station yet.
+
+      ---
+
+      ## What happens underneath
+
+      1. The API turns your `tools` list into text in the model's context, ahead of the conversation.
+      2. The model was trained to emit a structured tool call when one of those tools fits the request. Choosing the tool and
+         filling in the arguments is ordinary next-token prediction, conditioned on **your names and descriptions**.
+      3. The API parses that call into a `tool_use` block and stops with `stop_reason == "tool_use"`.
+
+      Three consequences you'll keep running into:
+
+      - **Descriptions are prompts.** A vague description gives vague choices.
+      - **Tools cost tokens on every call**, even calls that use no tool.
+      - **The schema is guidance, not a guarantee.** Unless you turn on strict schema enforcement where the API offers it,
+        the model can still send a value outside your `enum`. Validate before you act (lesson 3).
+
+      ---
+
+      ## Anatomy of a good tool
+
+      | part | its job | common mistake |
+      | --- | --- | --- |
+      | `name` | short `verb_noun`, unique | `tool1`, `helper`, two tools that differ by a suffix |
+      | `description` | what it does, **when to use it**, what comes back, limits and units | "Gets data." |
+      | `properties` | one entry per argument, with a type | everything is a free `string` |
+      | `enum` | the only valid values | leaving the model to guess `"carbon dioxide"` vs `"co2"` |
+      | property `description` | format and meaning ("module letter: A habitat ... F docking") | none, so the model guesses the format |
+      | `required` | what must always be present | forgetting it, so the model omits arguments |
+
+      Write descriptions for a capable new colleague who has never seen the station: the words the crew use, the edge
+      cases, and what the tool will **not** do.
+
+      ---
+
+      ## Trade-off: few broad tools or many narrow ones?
+
+      | design | example | selection accuracy | tokens per call | permissions and logging | when it wins |
+      | --- | --- | --- | --- | --- | --- |
+      | one broad tool | `station(action, params)` | lower: the choice hides inside a parameter | lowest | coarse: you have to parse `params` to tell a read from a write | prototypes, or a stable command language the model knows well |
+      | one tool per job | `get_sensor`, `book_module`, `send_message` | high while there are few tools and they don't overlap | grows with each tool | per tool: easy to allow, gate or switch off | most production agents |
+      | very many narrow tools | `get_temp_A`, `get_temp_B`, ... | drops again: near-duplicates confuse the choice | high | fine-grained but noisy | rarely; use parameters instead |
+
+      Rule of thumb: one tool per **kind of action** (read, book, message), with parameters for the variations, and
+      descriptions that make neighbouring tools easy to tell apart. With dozens of tools, show the model only the subset
+      the current task needs.
+
+  - id: write-get-sensor
+    type: coding
+    title: Write the get_sensor schema
+    context: |
+      ORBIT needs a tool that reads live sensors. Modules are letters: A habitat, B laboratory, C hydroponics, D storage,
+      E engineering, F docking. Metrics are `temperature`, `humidity`, `co2`, `o2` and `pressure`.
+      `try_tool(tool, request)` shows which tool the practice model calls, and with what input, when it can choose between
+      your tool, `crew_roster` and `book_module`.
+    instructions:
+      - Write a `description` for `get_sensor_tool` that says what it reads, and names the modules the way the crew does (habitat, lab, hydroponics, ...).
+      - Restrict `module` to the six letters and `metric` to the five metric names with `enum` lists.
+      - Make both arguments required.
+      - Print what `try_tool` returns for each request in `requests`.
+    hint: |
+      `"enum": ["A", "B", "C", "D", "E", "F"]`, `"enum": ["temperature", "humidity", "co2", "o2", "pressure"]` and
+      `"required": ["module", "metric"]`. The practice model matches the words in a request against your tool's name,
+      description and properties, so a description that mentions "lab" and "hydroponics" wins those requests.
+    pre_code: |
+      from kits.agents_tool_use import try_tool, validate_input
+      requests = [
+          "How humid is hydroponics right now?",
+          "What's the temperature in the lab?",
+          "Is the CO2 level in engineering okay?",
+          "Check the oxygen in the habitat",
+          "What's the pressure in docking?",
+      ]
+    sample_code: |
+      get_sensor_tool = {
+          "name": "get_sensor",
+          "description": ____,
+          "input_schema": {
+              "type": "object",
+              "properties": {
+                  "module": {"type": "string", "enum": ____},
+                  "metric": {"type": "string", "enum": ____},
+              },
+              "required": ____,
+          },
+      }
+
+      for request in requests:
+          print(request, "->", try_tool(get_sensor_tool, request))
+    solution: |
+      get_sensor_tool = {
+          "name": "get_sensor",
+          "description": (
+              "Read the current value of one environment sensor (temperature, humidity, CO2, oxygen or pressure) "
+              "in one module: A habitat, B lab, C hydroponics, D storage, E engineering, F docking. "
+              "Returns the value and its unit."
+          ),
+          "input_schema": {
+              "type": "object",
+              "properties": {
+                  "module": {"type": "string", "enum": ["A", "B", "C", "D", "E", "F"]},
+                  "metric": {"type": "string", "enum": ["temperature", "humidity", "co2", "o2", "pressure"]},
+              },
+              "required": ["module", "metric"],
+          },
+      }
+
+      for request in requests:
+          print(request, "->", try_tool(get_sensor_tool, request))
+    tests: |
+      from kits.agents_tool_use import try_tool, validate_input
+      t = check_object("get_sensor_tool")
+      assert isinstance(t, dict) and t.get("name") == "get_sensor", "Keep the tool's `name` as `get_sensor`."
+      assert isinstance(t.get("description"), str) and len(t["description"].split()) >= 6, "Write a real `description`: at least a sentence saying what the tool reads."
+      assert t.get("input_schema", {}).get("type") == "object", "`input_schema` must have `\"type\": \"object\"`."
+      assert validate_input(t, {"module": "C", "metric": "humidity"}) == [], "A valid input ({'module': 'C', 'metric': 'humidity'}) was rejected. Check the enums and types."
+      assert validate_input(t, {"module": "G", "metric": "humidity"}), "Module 'G' should be invalid. Put the six letters in an `enum` on `module`."
+      assert validate_input(t, {"module": "C", "metric": "carbon dioxide"}), "'carbon dioxide' should be invalid. Put the five metric names in an `enum` on `metric`."
+      assert validate_input(t, {"module": "C"}), "An input without `metric` should be invalid. List both arguments in `required`."
+      want = {"How humid is hydroponics right now?": ("C", "humidity"), "What's the temperature in the lab?": ("B", "temperature"),
+              "Is the CO2 level in engineering okay?": ("E", "co2"), "Check the oxygen in the habitat": ("A", "o2"),
+              "What's the pressure in docking?": ("F", "pressure")}
+      for req, (mod, met) in want.items():
+          got = try_tool(t, req)
+          assert got is not None and got[0] == "get_sensor", f"For {req!r} the model picked {got[0] if got else 'no tool'} instead of get_sensor. Add the words the crew use (module names, metric names) to the description."
+          assert got[1] == {"module": mod, "metric": met}, f"For {req!r} the model sent {got[1]}; expected module {mod} and metric {met}."
+    success_msg: |
+      Every request now reaches your tool with a valid input. Notice what did the work: the module names in the description
+      pulled in "lab" and "hydroponics", and the enums made "carbon dioxide" an invalid value you can catch.
+
+  - id: describe-or-confuse
+    type: classify
+    title: Clear or confusing?
+    prompt: |
+      Sort these tool descriptions. A clear one tells a newcomer what the tool does, when to use it, and its limits. One that
+      needs work is vague, does several unrelated things, or relies on knowledge only you have.
+    hint: Ask "could a new crew member pick the right tool from this sentence alone, and know what comes back?"
+    zones: [Clear, Needs work]
+    items:
+      - { text: "Read the live value of one sensor (temperature, humidity, CO2, O2, pressure) in a module. Returns value and unit.", zone: Clear }
+      - { text: "Gets data.", zone: Needs work }
+      - { text: "Book 1 to 4 hours in a module for one crew member. Start is 'YYYY-MM-DD HH:MM' station time.", zone: Clear }
+      - { text: "Handles bookings, messages and other station stuff.", zone: Needs work }
+      - { text: "Search the handbook for procedures and limits. Use it for 'how do I' and 'how long' questions.", zone: Clear }
+      - { text: "Utility endpoint v2 (legacy, see wiki).", zone: Needs work }
+      - { text: "Send a text message to one crew member by full name. Delivered at once; cannot be recalled.", zone: Clear }
+      - { text: "Returns whatever the user asked for.", zone: Needs work }
+      - { text: "hist: sensor hist", zone: Needs work }
+      - { text: "Open the outer hatch of an airlock. DANGEROUS: vents it to space. Needs commander approval.", zone: Clear }
+
+  - id: tool-token-overhead
+    type: coding
+    title: What tool definitions cost
+    context: |
+      Tool definitions travel with **every** request. `client.messages.count_tokens(...)` counts a request's input tokens
+      without running the model (the real SDK has the same method). `TOOLS` holds ORBIT's 7 tool definitions and
+      `question` a short crew question.
+    instructions:
+      - Count the input tokens of `question` with no tools and store `.input_tokens` in `base`; count again with `tools=TOOLS` and store it in `with_tools`.
+      - Store `overhead = with_tools - base`.
+      - ORBIT handles `REQUESTS_PER_DAY` requests, each making `CALLS_PER_REQUEST` model calls. Store the daily cost of the tool definitions alone in `daily_cost`, at `PRICE_PER_MTOK` dollars per million input tokens.
+    hint: |
+      `client.messages.count_tokens(model=MODEL, messages=msgs, tools=TOOLS).input_tokens`. Then
+      `daily_cost = overhead * REQUESTS_PER_DAY * CALLS_PER_REQUEST * PRICE_PER_MTOK / 1_000_000`.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, MODEL
+      client = aikit.FakeClaude(clock=aikit.VirtualClock())
+      TOOLS = HeliosStation().tools
+      question = "Is the CO2 level in engineering normal?"
+      REQUESTS_PER_DAY = 5_000
+      CALLS_PER_REQUEST = 3
+      PRICE_PER_MTOK = 3.00
+    sample_code: |
+      msgs = [{"role": "user", "content": question}]
+      base = client.messages.count_tokens(model=MODEL, messages=msgs).input_tokens
+      with_tools = ____
+      overhead = ____
+      daily_cost = ____
+      print(base, with_tools, overhead)
+      print(f"${daily_cost:.2f} a day just to describe the tools")
+    solution: |
+      msgs = [{"role": "user", "content": question}]
+      base = client.messages.count_tokens(model=MODEL, messages=msgs).input_tokens
+      with_tools = client.messages.count_tokens(model=MODEL, messages=msgs, tools=TOOLS).input_tokens
+      overhead = with_tools - base
+      daily_cost = overhead * REQUESTS_PER_DAY * CALLS_PER_REQUEST * PRICE_PER_MTOK / 1_000_000
+      print(base, with_tools, overhead)
+      print(f"${daily_cost:.2f} a day just to describe the tools")
+    tests: |
+      check_equal("base")
+      check_equal("with_tools", msg="`with_tools` should count the same messages with `tools=TOOLS` passed in.")
+      check_equal("overhead")
+      check_equal("daily_cost", tol=1e-6, msg="`daily_cost` = overhead x requests per day x calls per request x price / 1,000,000.")
+    success_msg: |
+      The tools outweigh the question many times over, and you pay for them on every call. Two levers: keep descriptions
+      tight (but not vague), and use prompt caching, since tool definitions sit at the very start of the prompt and
+      are the easiest part to cache.
+
+  - id: broad-or-narrow
+    type: mc
+    title: Choose a tool design
+    question: |
+      ORBIT's night assistant must read sensors, book modules and message crew. Two constraints: the commander must be able
+      to switch **messaging** off without touching anything else, and the audit log must show each action by kind
+      (read, book, message). Which design fits?
+    options:
+      - text: "One tool, `station(action, params)`, with `action` set to `read`, `book` or `message`."
+        feedback: "Cheapest in tokens, but switching off messaging now means parsing `params` inside one tool, and the choice of action hides in a string the model fills in, where descriptions guide it less. Both constraints get harder."
+      - text: "Three tools, `get_sensor`, `book_module` and `send_message`, each with clear parameters."
+        correct: true
+        feedback: "Right. One tool per kind of action means you can remove `send_message` from the tool list to switch messaging off, and the log records the tool name. Parameters cover the variations within each kind."
+      - text: "Thirty tools: one per module and metric (`get_temp_A`, ...), plus one per booking type."
+        feedback: "Fine-grained, but near-duplicate tools confuse the choice and cost many tokens on every call. Variations belong in parameters, not in tool names."
+      - text: "No tools: ask the model to write commands like `BOOK B 09:00` in its text and parse them with a regex."
+        feedback: "This reinvents tool calling without the structure. There's no schema to validate against, the format drifts, and nothing stops a message command from appearing inside other text."
+    hint: Which design lets you remove one capability by deleting one thing?

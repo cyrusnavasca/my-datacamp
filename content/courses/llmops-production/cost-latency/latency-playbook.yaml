@@ -1,0 +1,319 @@
+title: The latency playbook
+description: "Symptom: ORBIT is slow. Measure p50, p95 and TTFT, find which part of the call is slow, then compare the fixes on the eval set: speed, accuracy and cost together."
+exercises:
+  - id: latency-playbook-slides
+    type: video
+    title: "\"ORBIT is slow\": a playbook"
+    slides: |
+      # Where an LLM call spends its time
+
+      $$\text{latency} \approx \underbrace{\text{queue} + \text{prefill}(n_\text{in})}_{\text{TTFT}} + \underbrace{n_\text{out} \times \text{ms per output token}}_{\text{decode}}$$
+
+      - **Prefill** reads the whole prompt in parallel: it grows slowly with input length (and caching skips most of it).
+      - **Decode** writes one token at a time: it grows **linearly** with output length, and a bigger model is slower per token.
+
+      On ORBIT's 41-question eval set (fake timings): **TTFT p95 0.72 s**, but **total p50 2.9 s and p95 5.1 s**.
+      About 80% of the time is decode. ORBIT is not slow to start; it is slow to finish.
+
+      ---
+
+      ## Measure, then diagnose
+
+      Never fix "slow" before you know which number is high.
+
+      | what you measure | likely cause | first fix to try |
+      | --- | --- | --- |
+      | high TTFT, short outputs | long prompt, big model, provider queueing | prompt caching, trim the prompt, smaller model |
+      | low TTFT, high total, long outputs | verbose answers | ask for brevity; stream |
+      | several sequential LLM or tool spans | the request waits for steps one after another | run independent steps in parallel |
+      | fine at p50, bad at p95 | a slow tail: long answers, retries, one slow tool | look at the slowest 5% of traces |
+      | same questions asked again and again | doing the same work twice | response cache |
+
+      Check `stop_reason` too. If many replies end with `max_tokens`, someone "fixed" latency by cutting answers off.
+
+      ---
+
+      ## The fixes and what they cost
+
+      | fix | latency effect | quality risk | cost effect | complexity |
+      | --- | --- | --- | --- | --- |
+      | **streaming** | first words at TTFT; total unchanged | none | none | a loop; errors can arrive mid-reply |
+      | **brief answers** (instruction) | decode shrinks a lot | may drop detail | output cost down | one sentence; measure accuracy |
+      | `max_tokens` **cap alone** | decode capped | **truncated answers** | output cost down | trivial, and a trap |
+      | **smaller model / routing** | faster TTFT and decode | worse on hard questions | ~3× cheaper | a router plus an eval per route |
+      | **prompt caching** | prefill of the cached prefix skipped | none | input ~90% cheaper | stable prefix layout |
+      | **parallel calls** | sum of steps → the slowest step | none | none | async code, rate limits |
+      | **response cache** | a hit skips the call | stale or wrong hits | hits are free | keys, invalidation |
+
+      ---
+
+      ## Streaming is not the whole answer
+
+      Streaming shows the first token at TTFT. But if the model opens with a polite preamble and background, the
+      crew is still **waiting for the answer**, now while reading filler.
+
+      Measure the **time to the useful part**: the moment the streamed text first contains the answer.
+
+      ```python
+      with client.messages.stream(model=MODEL, max_tokens=600, system=SYSTEM, messages=msgs) as stream:
+          text, answer_ms = "", None
+          for ms, chunk in stream.events:          # aikit extra: (ms since start, chunk)
+              text += chunk
+              if answer_ms is None and grade(item, text):
+                  answer_ms = ms
+      ```
+
+      With the real SDK, take `time.perf_counter()` inside `for chunk in stream.text_stream:`.
+
+      ---
+
+      ## The order to try, and how to verify
+
+      1. **Stream** anything a person reads. It costs nothing and fixes perceived latency.
+      2. **Shorten outputs** with an instruction ("answer first, in one or two sentences"). Keep `max_tokens` as a
+         safety net above the longest good answer, not as the brevity tool.
+      3. **Parallelise** independent steps (retrieval, tool calls).
+      4. **Cache** stable prompt prefixes: TTFT and cost.
+      5. **Route** easy requests to a smaller model, only with an eval per route.
+
+      After **each** change, re-run the eval set and compare **p95, accuracy, cost and truncation rate** together.
+      A fix that makes ORBIT fast and wrong is a regression.
+
+  - id: measure-latency
+    type: coding
+    title: Measure p50, p95 and TTFT on the eval set
+    context: |
+      `client` runs ORBIT's production model on a virtual clock. `EVAL` is the 41-question eval set (dicts with
+      `question` and key `facts`) and `grade(item, text)` checks an answer. ORBIT's production prompt is `SYSTEM`.
+    instructions:
+      - "For every item in `EVAL`, call `client.messages.create` with `model=MODEL`, `max_tokens=600`, `system=SYSTEM` and the question as the user message."
+      - "Collect one row per question in a DataFrame `runs` with columns `latency_ms`, `ttft_ms` (from the reply's `.latency_ms` and `.ttft_ms`), `output_tokens` and `correct` (from `grade`)."
+      - "Store `p50`, `p95` and `ttft_p95` (use `np.percentile`), and `decode_share`: the total decode time (latency minus TTFT) divided by the total latency."
+    hint: |
+      Build a list of dicts in the loop, then `pd.DataFrame(rows)`. `np.percentile(runs["latency_ms"], 95)`.
+      `decode_share = (runs["latency_ms"] - runs["ttft_ms"]).sum() / runs["latency_ms"].sum()`.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      from kits.llmops_production import make_client, MODEL, SYSTEM, EVAL, grade
+      client = make_client()
+    sample_code: |
+      rows = []
+      for item in EVAL:
+          r = client.messages.create(model=MODEL, max_tokens=600, system=SYSTEM,
+                                     messages=[{"role": "user", "content": ____}])
+          rows.append({
+              "latency_ms": r.latency_ms,
+              "ttft_ms": ____,
+              "output_tokens": ____,
+              "correct": grade(item, ____),
+          })
+      runs = pd.DataFrame(rows)
+
+      p50 = ____
+      p95 = ____
+      ttft_p95 = ____
+      decode_share = ____
+      print(f"p50 {p50:.0f} ms, p95 {p95:.0f} ms, TTFT p95 {ttft_p95:.0f} ms, decode {decode_share:.0%}")
+      print(f"accuracy {runs['correct'].mean():.0%}, mean output {runs['output_tokens'].mean():.0f} tokens")
+    solution: |
+      rows = []
+      for item in EVAL:
+          r = client.messages.create(model=MODEL, max_tokens=600, system=SYSTEM,
+                                     messages=[{"role": "user", "content": item["question"]}])
+          rows.append({
+              "latency_ms": r.latency_ms,
+              "ttft_ms": r.ttft_ms,
+              "output_tokens": r.usage.output_tokens,
+              "correct": grade(item, r.text),
+          })
+      runs = pd.DataFrame(rows)
+
+      p50 = np.percentile(runs["latency_ms"], 50)
+      p95 = np.percentile(runs["latency_ms"], 95)
+      ttft_p95 = np.percentile(runs["ttft_ms"], 95)
+      decode_share = (runs["latency_ms"] - runs["ttft_ms"]).sum() / runs["latency_ms"].sum()
+      print(f"p50 {p50:.0f} ms, p95 {p95:.0f} ms, TTFT p95 {ttft_p95:.0f} ms, decode {decode_share:.0%}")
+      print(f"accuracy {runs['correct'].mean():.0%}, mean output {runs['output_tokens'].mean():.0f} tokens")
+    tests: |
+      import numpy as np
+      check_object("runs")
+      r, e = user["runs"], sol["runs"]
+      assert len(r) == 41, f"`runs` should have one row per EVAL question (41), it has {len(r)}."
+      for col in ("latency_ms", "ttft_ms", "output_tokens", "correct"):
+          assert col in r.columns, f"`runs` needs a `{col}` column."
+          assert np.allclose(r[col].astype(float), e[col].astype(float)), f"Column `{col}` does not match. Ask the questions in EVAL order with model=MODEL, max_tokens=600 and system=SYSTEM."
+      check_equal("p50", tol=1e-6)
+      check_equal("p95", tol=1e-6, msg="`p95` should be `np.percentile(runs['latency_ms'], 95)`.")
+      check_equal("ttft_p95", tol=1e-6)
+      check_equal("decode_share", tol=1e-6, msg="`decode_share` is sum(latency - ttft) / sum(latency).")
+    success_msg: |
+      About 80% of ORBIT's time is decode: it starts in about 0.7 s and then writes around 180 tokens of mostly
+      preamble and background. That is the diagnosis: shorten the output and stream it. A smaller model or caching
+      would attack the smaller part.
+
+  - id: stream-perceived
+    type: coding
+    title: "Streaming: first token vs first answer"
+    context: |
+      Streaming makes ORBIT show words at TTFT. But does the crew get the **answer** sooner? `stream.events` lists
+      `(ms_since_start, chunk)` pairs. `stream_times(system)` is half written: it streams every EVAL question.
+    instructions:
+      - "Complete `stream_times`: for each question record `first_token_ms` (the first event's time), `answer_ms` (the time of the first event at which the accumulated text passes `grade`) and `total_ms` (the last event's time)."
+      - "Run it with `SYSTEM` (store `verbose`), then with `SYSTEM + \"\\n\" + CONCISE` (store `brief`), in that order."
+      - "Store `p95`: a DataFrame with columns `verbose` and `brief`, holding each one's 0.95 quantile of the three columns."
+    hint: |
+      Inside the loop over `stream.events`, add the chunk to `text`, and set `answer_ms = ms` the first time
+      `grade(item, text)` is True. `p95 = pd.DataFrame({"verbose": verbose.quantile(0.95), "brief": brief.quantile(0.95)})`.
+    pre_code: |
+      import pandas as pd
+      from kits.llmops_production import make_client, MODEL, SYSTEM, CONCISE, EVAL, grade
+      client = make_client()
+    sample_code: |
+      def stream_times(system):
+          rows = []
+          for item in EVAL:
+              with client.messages.stream(model=MODEL, max_tokens=600, system=system,
+                                          messages=[{"role": "user", "content": item["question"]}]) as stream:
+                  text, answer_ms = "", None
+                  for ms, chunk in stream.events:
+                      text += chunk
+                      if answer_ms is None and ____:
+                          answer_ms = ____
+                  rows.append({"first_token_ms": ____, "answer_ms": answer_ms,
+                               "total_ms": ____})
+          return pd.DataFrame(rows)
+
+      verbose = ____
+      brief = ____
+      p95 = pd.DataFrame({"verbose": ____, "brief": ____})
+      print(p95.round(0))
+    solution: |
+      def stream_times(system):
+          rows = []
+          for item in EVAL:
+              with client.messages.stream(model=MODEL, max_tokens=600, system=system,
+                                          messages=[{"role": "user", "content": item["question"]}]) as stream:
+                  text, answer_ms = "", None
+                  for ms, chunk in stream.events:
+                      text += chunk
+                      if answer_ms is None and grade(item, text):
+                          answer_ms = ms
+                  rows.append({"first_token_ms": stream.events[0][0], "answer_ms": answer_ms,
+                               "total_ms": stream.events[-1][0]})
+          return pd.DataFrame(rows)
+
+      verbose = stream_times(SYSTEM)
+      brief = stream_times(SYSTEM + "\n" + CONCISE)
+      p95 = pd.DataFrame({"verbose": verbose.quantile(0.95), "brief": brief.quantile(0.95)})
+      print(p95.round(0))
+    tests: |
+      import numpy as np
+      check_object("p95")
+      p, e = user["p95"], sol["p95"]
+      assert {"verbose", "brief"} <= set(p.columns), "`p95` needs columns `verbose` and `brief`."
+      for row in ("first_token_ms", "answer_ms", "total_ms"):
+          assert row in p.index, f"`p95` should have a row `{row}` (the 0.95 quantile of that column)."
+          for col in ("verbose", "brief"):
+              assert abs(float(p.loc[row, col]) - float(e.loc[row, col])) < 0.5, f"`p95.loc['{row}', '{col}']` should be about {e.loc[row, col]:.0f} ms, got {p.loc[row, col]}. Check how you record `{row}`, and run `verbose` before `brief`."
+    success_msg: |
+      With the verbose prompt, words appear after 0.7 s, but the **answer** arrives at p95 2.8 s and the reply ends
+      at 5.1 s. With the brief prompt the answer arrives at about 0.8 s. Streaming fixes the blank screen, brevity
+      fixes the wait. Use both.
+
+  - id: fix-lab
+    type: coding
+    title: Compare the fixes on the eval set
+    context: |
+      `run_eval(client, **config)` runs the 41 questions and returns one row per question (including `latency_ms`,
+      `correct`, `cost` and `stop_reason`); `summarize(df)` turns that into p50/p95, accuracy and cost.
+      You need **p95 ≤ 1,500 ms and accuracy ≥ 95%**, as cheaply as possible.
+    instructions:
+      - "Add a config `brief_cached` to `configs` that uses the brief prompt (`SYSTEM + \"\\n\" + CONCISE`) **and** `cache=True`."
+      - "For each config, run `run_eval(make_client(), **kw)`, take `summarize(df)` and add `truncated`: the share of rows whose `stop_reason` is `\"max_tokens\"`. Collect them in a DataFrame `results` (one row per config name)."
+      - "Store in `choice` the name of the cheapest config (lowest `cost`) that meets both targets."
+    hint: |
+      `rows[name] = s` inside the loop, then `results = pd.DataFrame(rows).T`. Filter with
+      `results[(results["p95_ms"] <= 1500) & (results["accuracy"] >= 0.95)]`, then `["cost"].idxmin()`.
+    pre_code: |
+      import pandas as pd
+      from kits.llmops_production import make_client, run_eval, summarize, SYSTEM, CONCISE, SMALL
+      configs = {
+          "baseline": {},
+          "cap_120": {"max_tokens": 120},
+          "brief": {"system": SYSTEM + "\n" + CONCISE},
+          "small_model": {"model": SMALL},
+          "cached": {"cache": True},
+      }
+    sample_code: |
+      configs["brief_cached"] = ____
+
+      rows = {}
+      for name, kw in configs.items():
+          df = run_eval(make_client(), **kw)
+          s = summarize(df)
+          s["truncated"] = ____
+          rows[name] = s
+      results = pd.DataFrame(rows).T
+
+      ok = results[____]
+      choice = ____
+      print(results[["p95_ms", "ttft_p95_ms", "accuracy", "truncated", "cost"]].round(3))
+      print("choice:", choice)
+    solution: |
+      configs["brief_cached"] = {"system": SYSTEM + "\n" + CONCISE, "cache": True}
+
+      rows = {}
+      for name, kw in configs.items():
+          df = run_eval(make_client(), **kw)
+          s = summarize(df)
+          s["truncated"] = (df["stop_reason"] == "max_tokens").mean()
+          rows[name] = s
+      results = pd.DataFrame(rows).T
+
+      ok = results[(results["p95_ms"] <= 1500) & (results["accuracy"] >= 0.95)]
+      choice = ok["cost"].idxmin()
+      print(results[["p95_ms", "ttft_p95_ms", "accuracy", "truncated", "cost"]].round(3))
+      print("choice:", choice)
+    tests: |
+      check_object("results")
+      r, e = user["results"], sol["results"]
+      assert set(r.index) == set(e.index), f"`results` should have one row per config: {sorted(e.index)}. Did you add `brief_cached`?"
+      for col in ("p95_ms", "accuracy", "cost", "truncated"):
+          assert col in r.columns, f"`results` needs a `{col}` column."
+          for name in e.index:
+              assert abs(float(r.loc[name, col]) - float(e.loc[name, col])) < 1e-6, f"`results.loc['{name}', '{col}']` should be {float(e.loc[name, col]):.4f}, got {r.loc[name, col]}. Check the config and how you compute `{col}`."
+      check_equal("choice", msg=f"`choice` should be the cheapest config with p95_ms <= 1500 and accuracy >= 0.95, which is {sol['choice']!r}.")
+    success_msg: |
+      Read the table like an engineer. Capping `max_tokens` cut p95 only to 2.6 s and **truncated almost every answer**
+      (accuracy 78%). The small model is faster but wrong on the hard questions. Caching barely moved latency here,
+      because the prompt was never the slow part, but it cut cost by 70%. Brevity fixed latency; brevity plus caching
+      fixed latency **and** cost at full accuracy.
+
+  - id: latency-decision
+    type: mc
+    title: Pick the first fix
+    question: |
+      ORBIT's new "station status" feature answers questions like *"Is everything normal in Module C?"*. A trace:
+
+      ```
+      retrieve                 150 ms
+      tool:get_sensor (temp)   300 ms
+      tool:get_sensor (hum)    300 ms
+      tool:get_sensor (co2)    300 ms
+      llm                      950 ms   TTFT 620 ms · 25 output tokens
+      total                  2,000 ms   (p95 2.4 s, target 1.5 s)
+      ```
+
+      The three sensor reads do not depend on each other. Which fix should you try first?
+    options:
+      - text: Stream the reply.
+        feedback: The reply is 25 tokens and arrives about 0.3 s after its first token, so streaming barely changes what the crew sees. The wait happens before the LLM even starts.
+      - text: Read the three sensors in parallel.
+        correct: true
+        feedback: "Right. Independent calls in sequence cost 900 ms; in parallel they cost about 300 ms, the slowest one. That saves about 600 ms on every request, with no quality or cost change, and gets the total to about 1.4 s. The price is async code, and it multiplies your request rate to the sensor service."
+      - text: Switch the LLM call to the small model.
+        feedback: It might save around 400 ms of the 950 ms, but it risks quality, and you would need an eval to prove it is safe. Free wins with no quality risk come first.
+      - text: Cap `max_tokens` at 10.
+        feedback: The answer is already 25 tokens long. A cap of 10 would cut it off mid-sentence to save about 0.2 s.
+    hint: Add up the spans. Which ones could overlap instead of waiting for each other?

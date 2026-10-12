@@ -1,0 +1,18 @@
+title: AI Engineering
+order: 2
+description: 'Build, measure and ship LLM applications: from PyTorch and transformers to prompting, retrieval,
+  agents, MCP, evaluation, security, LLMOps and fine-tuning, ending with a capstone that ships a
+  working assistant.'
+courses:
+- deep-learning-pytorch
+- nlp-transformers
+- llm-apis-prompting
+- embeddings-vector-search
+- rag-systems
+- agents-tool-use
+- mcp-integrations
+- llm-evaluation
+- ai-security-guardrails
+- llmops-production
+- fine-tuning-llms
+- ai-engineering-capstone

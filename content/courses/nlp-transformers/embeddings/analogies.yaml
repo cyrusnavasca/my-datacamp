@@ -1,0 +1,328 @@
+title: Vector arithmetic, bias and broken similarity
+description: Solve analogies with vector offsets, measure and remove a bias direction, and repair a similarity search that returns nonsense.
+exercises:
+  - id: intro
+    type: video
+    title: Directions mean something
+    slides: |
+      # Analogies as vector offsets
+
+      In a good embedding space, consistent relations become consistent **directions**:
+
+      $$\vec{\text{king}} - \vec{\text{man}} + \vec{\text{woman}} \approx \vec{\text{queen}}$$
+
+      "man is to king as woman is to ?": take the offset from `man` to `king` (royalty) and add it to `woman`.
+
+      ```python
+      def analogy(a, b, c):
+          target = E[idx[b]] - E[idx[a]] + E[idx[c]]
+          scores = U @ (target / np.linalg.norm(target))   # cosine with every word (U: unit rows)
+          for w in (a, b, c):
+              scores[idx[w]] = -np.inf                       # inputs are not answers
+          return words[scores.argmax()]
+      ```
+
+      ---
+
+      ## Read analogy results with care
+
+      - **The exclusion does a lot of work.** Without it, the nearest vector to the target is very often
+        one of the inputs (`king` or `woman`). Published analogy scores all exclude inputs.
+      - **Only some relations are linear.** Gender, plural and capital-of work well; most relations do not.
+      - **Frequency and polysemy distort** the space: rare words have noisy vectors, and a word with two
+        senses sits between them.
+
+      Treat analogies as a probe of what the space encodes, not as reasoning.
+
+      ---
+
+      ## Embeddings learn the corpus's biases
+
+      If the training text mentions engineers next to "he" more than "she", the vector for `engineer`
+      leans along the he-she direction. Measure it directly:
+
+      ```python
+      g = E[idx["he"]] - E[idx["she"]]
+      g = g / np.linalg.norm(g)                 # the gender direction
+      lean = U[idx["nurse"]] @ g                # > 0 leans "he", < 0 leans "she"
+      ```
+
+      **Neutralise** a word that should be neutral by removing its component along $g$:
+      $v \leftarrow v - (v \cdot g)\,g$. This fixes the measured direction, but bias also hides in
+      neighbourhoods and other directions, so re-test the downstream task, not just the projection.
+
+      ---
+
+      ## Troubleshooting: similarity search returns nonsense
+
+      **Symptoms:** the same few words are the "nearest neighbour" of everything, or every pair scores
+      0.9 so a similarity threshold flags everything.
+
+      **Measure first:** nearest-neighbour accuracy on a few labelled groups; how many queries share
+      one neighbour (the **hub**); the mean cosine over random pairs (healthy: near 0).
+
+      | finding | usual cause | fix, in this order |
+      | --- | --- | --- |
+      | hub words are the longest vectors | dot product on unnormalised vectors (length tracks frequency) | L2-normalise, use cosine |
+      | mean cosine of random pairs is 0.5 or more | all vectors share one big common direction (anisotropy) | subtract the mean vector, then normalise |
+      | still poor after both | the model does not know your domain | different or fine-tuned embedding model |
+
+      Normalising is free. Centring needs the mean of a representative sample and must be stored and
+      reapplied to every new vector. Verify both metrics after each fix.
+
+  - id: analogy
+    type: coding
+    title: Solve analogies
+    context: |
+      `words`, `idx` (word to row) and `E` (the 29 x 12 toy embedding table) are loaded, along with
+      `U`, the same table with unit-length rows. `np` is imported.
+    instructions:
+      - "Write `analogy(a, b, c, exclude=True)` for \"a is to b as c is to ?\": build `E[idx[b]] - E[idx[a]] + E[idx[c]]`, score every word by cosine with it, and return the best-scoring word."
+      - "When `exclude` is True, `a`, `b` and `c` must never be returned."
+      - "Print `analogy(\"man\", \"king\", \"woman\")` and `analogy(\"man\", \"woman\", \"engineer\", exclude=False)`."
+    hint: "`scores = U @ (target / np.linalg.norm(target))`. Set `scores[idx[w]] = -np.inf` for each input word, then `words[int(scores.argmax())]`."
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import toy_table
+      words, E = toy_table()
+      idx = {w: i for i, w in enumerate(words)}
+      U = E / np.linalg.norm(E, axis=1, keepdims=True)
+    sample_code: |
+      def analogy(a, b, c, exclude=True):
+          target = ____
+          scores = U @ (target / np.linalg.norm(target))
+          if exclude:
+              for w in (a, b, c):
+                  scores[idx[w]] = ____
+          return words[int(scores.argmax())]
+
+      print(analogy("man", "king", "woman"))
+      print(analogy("man", "woman", "engineer", exclude=False))
+    solution: |
+      def analogy(a, b, c, exclude=True):
+          target = E[idx[b]] - E[idx[a]] + E[idx[c]]
+          scores = U @ (target / np.linalg.norm(target))
+          if exclude:
+              for w in (a, b, c):
+                  scores[idx[w]] = -np.inf
+          return words[int(scores.argmax())]
+
+      print(analogy("man", "king", "woman"))
+      print(analogy("man", "woman", "engineer", exclude=False))
+    tests: |
+      f = check_object("analogy")
+      cases = [("man", "king", "woman", "queen"), ("man", "boy", "woman", "girl"), ("king", "queen", "prince", "princess"),
+               ("he", "she", "king", "queen"), ("son", "daughter", "father", "mother"), ("woman", "man", "girl", "boy")]
+      for a, b, c, want in cases:
+          got = f(a, b, c)
+          assert got == want, f"analogy('{a}', '{b}', '{c}') returned '{got}', expected '{want}'. Target is E[b] - E[a] + E[c]; rank by cosine and exclude the inputs."
+      assert f("man", "woman", "engineer", exclude=False) == "woman", "With exclude=False the inputs stay in the running: analogy('man', 'woman', 'engineer', exclude=False) should return 'woman'."
+    success_msg: Royalty, age and kinship offsets all transfer. But without exclusion, 'man is to woman as engineer is to ?' simply returns `woman`, an input. Remember that when you read analogy claims.
+
+  - id: bias-projection
+    type: coding
+    title: Measure and neutralise a bias direction
+    context: |
+      Job titles should be gender-neutral, but the toy table was "trained" on a skewed corpus.
+      `words`, `idx`, `E`, `U` and `jobs` (the 7 job words) are loaded.
+    instructions:
+      - "Store the unit gender direction `E[idx[\"he\"]] - E[idx[\"she\"]]`, divided by its norm, in `g`."
+      - "Store a dict `lean` mapping each job to `U[idx[job]] @ g` (positive leans 'he')."
+      - "Copy `E` into `E_fixed` and, for each job row `v`, replace it with `v - (v @ g) * g`."
+      - "Store the largest absolute projection `abs(v @ g)` over the job rows of `E_fixed` in `max_lean_after`."
+    hint: "`E_fixed = E.copy()`, then in a loop `v = E_fixed[idx[job]]` and `E_fixed[idx[job]] = v - (v @ g) * g`."
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import toy_table
+      words, E = toy_table()
+      idx = {w: i for i, w in enumerate(words)}
+      U = E / np.linalg.norm(E, axis=1, keepdims=True)
+      jobs = ["engineer", "pilot", "commander", "doctor", "nurse", "teacher", "scientist"]
+    sample_code: |
+      g = ____
+      g = g / np.linalg.norm(g)
+
+      lean = {job: ____ for job in jobs}
+      print({j: round(float(x), 2) for j, x in lean.items()})
+
+      E_fixed = E.copy()
+      for job in jobs:
+          v = E_fixed[idx[job]]
+          E_fixed[idx[job]] = ____
+
+      max_lean_after = max(abs(E_fixed[idx[j]] @ g) for j in jobs)
+      print(max_lean_after)
+    solution: |
+      g = E[idx["he"]] - E[idx["she"]]
+      g = g / np.linalg.norm(g)
+
+      lean = {job: U[idx[job]] @ g for job in jobs}
+      print({j: round(float(x), 2) for j, x in lean.items()})
+
+      E_fixed = E.copy()
+      for job in jobs:
+          v = E_fixed[idx[job]]
+          E_fixed[idx[job]] = v - (v @ g) * g
+
+      max_lean_after = max(abs(E_fixed[idx[j]] @ g) for j in jobs)
+      print(max_lean_after)
+    tests: |
+      import numpy as np
+      check_equal("g", msg="`g` should be the normalised difference E[he] - E[she].")
+      l = check_object("lean")
+      assert set(l) == set(user["jobs"]), "`lean` should have one entry per job in `jobs`."
+      for j in user["jobs"]:
+          assert abs(float(l[j]) - float(sol["lean"][j])) < 1e-6, f"lean['{j}'] should be U[idx['{j}']] @ g (cosine of the unit job vector with g)."
+      Ef = check_object("E_fixed")
+      assert np.allclose(Ef[[user["idx"][w] for w in user["words"] if w not in user["jobs"]]], user["E"][[user["idx"][w] for w in user["words"] if w not in user["jobs"]]]), \
+          "Only the job rows should change. Gendered words like 'king' must keep their gender component."
+      check_equal("E_fixed", msg="Each job row should become v - (v @ g) * g.")
+      check_equal("max_lean_after", msg="`max_lean_after` should be the largest |E_fixed[job] @ g| over the jobs, which is now essentially 0.")
+    success_msg: Before, `pilot` and `commander` leaned 'he' and `nurse` leaned 'she'. After neutralising, every job has zero gender component, and `king`/`queen` still differ by gender.
+
+  - id: analogy-limits
+    type: mc
+    title: What does the analogy really show?
+    question: |
+      Your `analogy` function (which excludes inputs) says *man is to woman as engineer is to* **nurse**.
+      With `exclude=False` it says **woman**. A colleague writes in a report: "the model believes the
+      female version of an engineer is a nurse". What is the most accurate reading?
+    options:
+      - text: The report is right; analogy output is what the model believes
+        feedback: Embeddings do not hold beliefs, and the top answer was actually an input word. The forced exclusion manufactured `nurse` as the runner-up.
+      - text: Nothing can be concluded, because analogy tests are random
+        feedback: They are deterministic and they do reveal structure. The point is to measure that structure properly rather than over-read a single answer.
+      - text: The vectors carry a gender lean on job words, which the analogy exposes; quantify it with projections onto the he-she direction rather than one analogy answer
+        correct: true
+        feedback: |
+          Right. The analogy hints at a real lean, but its answer depends on excluding inputs and on
+          which words are in the vocabulary. Direct projections (your `lean` dict) give a number per word
+          that you can track before and after a fix.
+      - text: The lean comes from the analogy formula, so normalising the vectors would remove it
+        feedback: "Normalising changes lengths, not directions. `lean` already uses unit vectors and still shows the skew."
+    hint: Compare what the analogy returns with and without exclusion, and what your `lean` numbers measured.
+
+  - id: search-mission
+    type: sequential
+    title: "Mission: repair ORBIT's related-words search"
+    xp: 200
+    context: |
+      **Mission.** ORBIT expands handbook searches with related words from an embedding table exported
+      from an old model. Crew complaints: searching "pump" also searches "dizziness", and the
+      "strongly related" filter (cosine above 0.5) lets almost every pair through.
+
+      Loaded: `words` (48 words), `groups` (each word's topic, a NumPy array), `freq` (corpus counts),
+      `E` (48 x 16 table) and `np`. A helper `pair_precision(M, threshold=0.5)` returns the share of
+      word pairs with cosine above the threshold, between rows of `M` (unit rows), that share a topic.
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import search_table
+      words, groups, freq, E = search_table()
+      def pair_precision(M, threshold=0.5):
+          S = M @ M.T
+          iu = np.triu_indices(len(M), 1)
+          flagged = S[iu] > threshold
+          same = (groups[:, None] == groups[None, :])[iu]
+          return float(same[flagged].mean()) if flagged.any() else 0.0
+    steps:
+      - instructions:
+          - "**Measure.** Using raw dot products `E @ E.T` (ignore each word's similarity with itself), store each word's nearest neighbour index in `nn`."
+          - "Store the share of words whose neighbour has the same topic in `acc_dot`."
+          - "Store the word that is most often somebody's nearest neighbour in `hub`, and how many words have it as neighbour in `hub_count`."
+        hint: "`S = E @ E.T`, then `np.fill_diagonal(S, -np.inf)` and `nn = S.argmax(axis=1)`. `np.bincount(nn)` counts how often each index is a neighbour."
+        sample_code: |
+          S = E @ E.T
+          np.fill_diagonal(S, -np.inf)
+          nn = ____
+          acc_dot = ____
+          counts = np.bincount(nn, minlength=len(words))
+          hub = ____
+          hub_count = ____
+          print(f"accuracy {acc_dot:.0%}; '{hub}' is the neighbour of {hub_count} words")
+        solution: |
+          S = E @ E.T
+          np.fill_diagonal(S, -np.inf)
+          nn = S.argmax(axis=1)
+          acc_dot = np.mean(groups[nn] == groups)
+          counts = np.bincount(nn, minlength=len(words))
+          hub = words[counts.argmax()]
+          hub_count = int(counts.max())
+          print(f"accuracy {acc_dot:.0%}; '{hub}' is the neighbour of {hub_count} words")
+        tests: |
+          check_equal("nn", msg="`nn` should be `S.argmax(axis=1)` after setting the diagonal of S to -inf.")
+          check_equal("acc_dot", msg="`acc_dot` is the mean of `groups[nn] == groups`.")
+          check_equal("hub", msg="`hub` is the word whose index appears most often in `nn`.")
+          check_equal("hub_count", msg="`hub_count` is how many words have `hub` as their nearest neighbour.")
+      - instructions:
+          - "**Diagnose.** Store the row norms of `E` in `norms`, and the rank of the hub's norm in `hub_rank` (0 = longest vector)."
+          - "Store the mean cosine similarity over all distinct pairs of words in `mean_cos`."
+        hint: "`norms = np.linalg.norm(E, axis=1)`; `hub_rank = int(np.argsort(-norms).tolist().index(words.index(hub)))`. For `mean_cos`, normalise rows, take `U @ U.T` and average the upper triangle `np.triu_indices(len(words), 1)`."
+        sample_code: |
+          norms = ____
+          hub_rank = ____
+
+          U = E / norms[:, None]
+          C = U @ U.T
+          mean_cos = ____
+          print(f"hub norm rank {hub_rank}; mean cosine of random pairs {mean_cos:.2f}")
+        solution: |
+          norms = np.linalg.norm(E, axis=1)
+          hub_rank = int(np.argsort(-norms).tolist().index(words.index(hub)))
+
+          U = E / norms[:, None]
+          C = U @ U.T
+          mean_cos = C[np.triu_indices(len(words), 1)].mean()
+          print(f"hub norm rank {hub_rank}; mean cosine of random pairs {mean_cos:.2f}")
+        tests: |
+          check_equal("norms", msg="`norms` should be `np.linalg.norm(E, axis=1)`.")
+          check_equal("hub_rank", msg="`hub_rank` is the position of the hub in the words sorted by norm, longest first (0 = longest).")
+          check_equal("mean_cos", msg="`mean_cos` is the mean of the cosine matrix over the upper triangle (k=1), excluding each word with itself.")
+      - instructions:
+          - "**Fix 1.** The hub is one of the longest vectors, so length is winning. Rank neighbours by cosine instead: store the nearest-neighbour topic accuracy using unit vectors `U` in `acc_cos`. It must reach at least 95%."
+          - "Store `pair_precision(U)` (precision of the 0.5 threshold filter) in `prec_cos`."
+        hint: "Same recipe as step 1 with `U @ U.T` instead of `E @ E.T`."
+        sample_code: |
+          S2 = ____
+          np.fill_diagonal(S2, -np.inf)
+          acc_cos = ____
+          prec_cos = ____
+          print(f"cosine accuracy {acc_cos:.0%}; threshold precision {prec_cos:.0%}")
+        solution: |
+          S2 = U @ U.T
+          np.fill_diagonal(S2, -np.inf)
+          acc_cos = np.mean(groups[S2.argmax(axis=1)] == groups)
+          prec_cos = pair_precision(U)
+          print(f"cosine accuracy {acc_cos:.0%}; threshold precision {prec_cos:.0%}")
+        tests: |
+          a = check_object("acc_cos")
+          assert a >= 0.95, f"`acc_cos` is {a:.0%}; with unit-length rows the nearest-neighbour accuracy should reach at least 95%."
+          check_equal("acc_cos", msg="`acc_cos` should be the topic accuracy of nearest neighbours ranked by `U @ U.T`.")
+          check_equal("prec_cos", msg="`prec_cos` should be `pair_precision(U)`.")
+      - instructions:
+          - "**Fix 2.** Neighbours are right now, but the 0.5 filter still has terrible precision because every pair has cosine near 0.92. Remove the shared direction: subtract the mean row from `E`, then normalise rows. Store the result in `U_fixed`."
+          - "**Verify.** Store `pair_precision(U_fixed)` in `prec_fixed` (must be at least 0.8) and the new mean pairwise cosine in `mean_cos_fixed` (must be below 0.1)."
+        hint: "`Z = E - E.mean(axis=0)`, then `U_fixed = Z / np.linalg.norm(Z, axis=1, keepdims=True)`."
+        sample_code: |
+          Z = ____
+          U_fixed = ____
+          prec_fixed = pair_precision(U_fixed)
+          mean_cos_fixed = (U_fixed @ U_fixed.T)[np.triu_indices(len(words), 1)].mean()
+          print(f"precision {prec_cos:.0%} -> {prec_fixed:.0%}; mean cosine {mean_cos:.2f} -> {mean_cos_fixed:.2f}")
+        solution: |
+          Z = E - E.mean(axis=0)
+          U_fixed = Z / np.linalg.norm(Z, axis=1, keepdims=True)
+          prec_fixed = pair_precision(U_fixed)
+          mean_cos_fixed = (U_fixed @ U_fixed.T)[np.triu_indices(len(words), 1)].mean()
+          print(f"precision {prec_cos:.0%} -> {prec_fixed:.0%}; mean cosine {mean_cos:.2f} -> {mean_cos_fixed:.2f}")
+        tests: |
+          import numpy as np
+          Uf = np.asarray(check_object("U_fixed"))
+          assert Uf.shape == (48, 16), "`U_fixed` should keep the shape of `E`, (48, 16)."
+          assert np.allclose(np.linalg.norm(Uf, axis=1), 1), "Every row of `U_fixed` should have length 1. Normalise after centring."
+          p = user["pair_precision"](Uf)
+          assert p >= 0.8, f"Precision of the 0.5 filter is {p:.0%}; it needs at least 80%. Subtract the mean vector before normalising."
+          m = (Uf @ Uf.T)[np.triu_indices(48, 1)].mean()
+          assert m < 0.1, f"Mean pairwise cosine is {m:.2f}; after removing the common direction it should be close to 0."
+          check_equal("prec_fixed", p, msg="`prec_fixed` should be `pair_precision(U_fixed)`.")
+          check_equal("mean_cos_fixed", m, msg="`mean_cos_fixed` is the mean of `U_fixed @ U_fixed.T` over the upper triangle.")
+    success_msg: Mission complete. Normalising fixed the hub, centring fixed the threshold, and you have the before and after numbers for both. Store the mean vector, because every new embedding must be centred the same way.

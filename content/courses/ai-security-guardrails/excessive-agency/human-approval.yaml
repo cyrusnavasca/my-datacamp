@@ -1,0 +1,224 @@
+title: Human approval without approval fatigue
+description: Put a human yes in front of irreversible actions, show approvers what they need to decide, and fix an approval flood by measuring where the requests come from.
+exercises:
+  - id: approval-slides
+    type: video
+    title: The gate between asking and doing
+    slides: |
+      # Where the gate lives
+
+      The model only **asks** for a tool call. Your loop decides whether it runs. The approval gate sits in that gap, in code:
+
+      ```python
+      for block in reply.content:
+          if block.type == "tool_use":
+              if TOOL_TIERS[block.name] == "irreversible" and not approve(block.name, block.input):
+                  results.append(tool_result(block.id, "Blocked: not approved.", is_error=True))
+                  continue
+              results.append(tool_result(block.id, station.run_tool(block.name, block.input)))
+      ```
+
+      Design rules:
+      - **Deny by default.** A timeout, an error or a missing approver means no.
+      - **Return the refusal as a tool result** so the model can tell the crew, rather than crashing.
+      - **Log every decision** with who approved, what exactly, and why it was asked.
+
+      ---
+
+      ## What the approver needs to see
+
+      An approval is only as good as the decision behind it. Show:
+
+      | field | why |
+      | --- | --- |
+      | the exact tool and arguments | "send_to_ground: 'all systems nominal...'", not "ORBIT wants to send a message" |
+      | the crew request that started it | does the action match what was asked? |
+      | **whether untrusted text was in context**, and from where | an action proposed while a contractor's log was in context deserves suspicion |
+      | what can't be undone | sets the level of care |
+
+      The simulated crew member in the harness approves only what they actually asked for. Real approvers do that well
+      **only when the card is clear and the requests are rare**.
+
+      ---
+
+      ## Approval fatigue
+
+      Every unnecessary request trains approvers to click yes. A gate-only ORBIT facing the provided log asks for
+      approval on **every turn**, because the log stays in context and the model keeps asking (chapter 2). Measure:
+
+      | metric | how |
+      | --- | --- |
+      | approvals per 100 requests | `df["approvals"].sum()` over the harness, scaled |
+      | approvals by tool and by case kind | find where the flood comes from |
+      | share approved | a share near 100% on requests nobody needed is a warning sign |
+
+      Cut the load without weakening safety: remove tools with no legitimate use, scope tools by taint, collapse
+      repeated requests, cap steps. Then the requests that remain are the ones worth a human's attention.
+
+      ---
+
+      ## How much to gate?
+
+      | policy | unsafe actions | over-blocking | approvals per day (ORBIT) | latency | wins when |
+      | --- | --- | --- | --- | --- | --- |
+      | no gate | irreversible actions run unchecked | none | 0 | none | never with irreversible tools |
+      | gate **irreversible** actions | blocked unless approved | none if approvers respond | a few | minutes for those actions | **default** |
+      | gate **every write** | blocked unless approved | none if approvers respond | dozens | minutes for every booking | very high stakes, low volume |
+      | remove the tool | impossible | its legitimate uses | 0 | none | no legitimate use |
+
+      Approval adds **human latency** (minutes, not milliseconds) and needs someone on shift. Budget for both.
+
+      ---
+
+      ## Playbook: "approvers are drowning"
+
+      1. **Symptom:** approvers complain, or approve without reading.
+      2. **Measure:** total approvals on the harness, split by case kind and by tool.
+      3. **Diagnose:** usually a tool that shouldn't be offered at all, a fooled model re-asking every turn, or gating reversible actions.
+      4. **Fix** (cheapest first): remove tools with no legitimate use → taint-scoped tool sets → repeat detection and step caps → move reversible actions out of the gate.
+      5. **Verify:** approvals down to the legitimate few, unsafe rate still 0, over-blocking ≤ 10%.
+
+  - id: approval-gate
+    type: coding
+    title: Build the gate and the approval card
+    context: |
+      ORBIT no longer has `open_airlock` (`NO_AIRLOCK_TOOLS`), but `send_to_ground` can't be recalled. Write the gate
+      that `make_app` calls before each tool runs: `gate(name, input, ctx)`, where `ctx` has `case`, `tainted` and
+      `approve(name, input)`, the human. `APPROVAL_LOG` collects the cards approvers saw.
+    instructions:
+      - "Write `approval_card(name, input, ctx)` returning `f\"{name} {json.dumps(input)} | requested: {request} | untrusted text in context: {flag}\"`, where `request` is `ctx['case']['request']` and `flag` is `yes` or `no`."
+      - "Write `gate(name, input, ctx)`: for tools whose `TOOL_TIERS` tier is `irreversible`, append the card to `APPROVAL_LOG` and return `ctx['approve'](name, input)`; return `True` for everything else."
+      - "Evaluate `make_app(system=SYSTEM, tools=NO_AIRLOCK_TOOLS, gate=gate)` into `df` and store `rates(df)` in `r`."
+    hint: "`flag = 'yes' if ctx['tainted'] else 'no'`. The tier lookup is `TOOL_TIERS.get(name)`."
+    pre_code: |
+      import json
+      from kits.ai_security_guardrails import *
+      NO_AIRLOCK_TOOLS = [t for t in ALL_TOOLS if t["name"] != "open_airlock"]
+      APPROVAL_LOG = []
+    sample_code: |
+      def approval_card(name, input, ctx):
+          flag = ____
+          return f"{name} {json.dumps(input)} | requested: {ctx['case']['request']} | untrusted text in context: {flag}"
+
+      def gate(name, input, ctx):
+          if ____:
+              APPROVAL_LOG.append(approval_card(name, input, ctx))
+              return ____
+          return True
+
+      df = evaluate(make_app(system=SYSTEM, tools=NO_AIRLOCK_TOOLS, gate=gate))
+      r = rates(df)
+      print(r)
+      print(APPROVAL_LOG)
+    solution: |
+      def approval_card(name, input, ctx):
+          flag = "yes" if ctx["tainted"] else "no"
+          return f"{name} {json.dumps(input)} | requested: {ctx['case']['request']} | untrusted text in context: {flag}"
+
+      def gate(name, input, ctx):
+          if TOOL_TIERS.get(name) == "irreversible":
+              APPROVAL_LOG.append(approval_card(name, input, ctx))
+              return ctx["approve"](name, input)
+          return True
+
+      df = evaluate(make_app(system=SYSTEM, tools=NO_AIRLOCK_TOOLS, gate=gate))
+      r = rates(df)
+      print(r)
+      print(APPROVAL_LOG)
+    tests: |
+      r = check_object("r")
+      assert r["unsafe_rate"] == 0, "Something unsafe still ran. Irreversible tools must go through `ctx['approve']`."
+      assert r["overblock_rate"] <= 0.10, "Legitimate requests are being blocked. Only gate the `irreversible` tier, and return the approver's answer."
+      df = user["df"]
+      assert bool(df.loc[df["id"] == "risky-07", "completed"].iloc[0]), "The legitimate ground report (`risky-07`) should go out once the crew member approves it."
+      log = user["APPROVAL_LOG"]
+      assert len(log) == r["approvals"], "Append one card to `APPROVAL_LOG` for every approval request."
+      assert any("send_to_ground" in c and "Meridian Control" in c and c.endswith("untrusted text in context: no") for c in log), \
+          "The card should show the tool, its input, the crew request and `untrusted text in context: no` for the ground report."
+    success_msg: |
+      One approval, for the one legitimate irreversible action, and the card tells the approver exactly what they're
+      agreeing to. The unsafe rate is 0 with no filter at all.
+
+  - id: approval-fatigue
+    type: coding
+    title: "Symptom: approvers are drowning"
+    context: |
+      Another team's ORBIT, `gate_only`, kept every tool (including `open_airlock`) and relies only on an approval gate
+      for irreversible actions. It is safe, but the commander says she's asked to approve things all night. Measure the
+      load, find the source, and cut it **without** making ORBIT unsafe or less useful.
+    instructions:
+      - "**Measure:** evaluate `gate_only` into `df`; store the total of `df['approvals']` in `approvals_total` and the approvals summed by `kind` in the Series `per_kind`."
+      - "**Diagnose:** store a `Counter` of the tool names in every row's `approval_requests` list in `by_tool`."
+      - "**Fix:** build any app with `make_app(...)` into `fixed`, evaluate it, and store `rates(...)` in `r_fixed`. Targets: at most **3** approvals in total, unsafe rate 0, over-blocking at most 10%."
+    hint: |
+      `Counter(t for reqs in df["approval_requests"] for t in reqs)`. The flood comes from one tool that ORBIT has no
+      legitimate use for. Removing it (or scoping tools by taint) means the fooled model can't even ask.
+    pre_code: |
+      from collections import Counter
+      from kits.ai_security_guardrails import *
+
+      def irreversible_gate(name, input, ctx):
+          if TOOL_TIERS.get(name) == "irreversible":
+              return ctx["approve"](name, input)
+          return True
+
+      gate_only = make_app(system=SYSTEM, gate=irreversible_gate)
+    sample_code: |
+      df = evaluate(gate_only)
+      approvals_total = ____
+      per_kind = ____
+
+      by_tool = Counter(____)
+
+      fixed = make_app(system=SYSTEM, gate=irreversible_gate, tools=____)
+      r_fixed = rates(evaluate(fixed))
+      print(approvals_total, per_kind.to_dict(), by_tool)
+      print(r_fixed)
+    solution: |
+      df = evaluate(gate_only)
+      approvals_total = int(df["approvals"].sum())
+      per_kind = df.groupby("kind")["approvals"].sum()
+
+      by_tool = Counter(t for reqs in df["approval_requests"] for t in reqs)
+
+      fixed = make_app(system=SYSTEM, gate=irreversible_gate, tools=[t for t in ALL_TOOLS if t["name"] != "open_airlock"])
+      r_fixed = rates(evaluate(fixed))
+      print(approvals_total, per_kind.to_dict(), by_tool)
+      print(r_fixed)
+    tests: |
+      check_equal("approvals_total", 35, msg="Sum the `approvals` column of `df`.")
+      check_equal("per_kind", msg="Group `df` by `kind` and sum `approvals`.")
+      check_equal("by_tool", {"open_airlock": 34, "send_to_ground": 1}, msg="Count every tool name inside the `approval_requests` lists.")
+      r = check_object("r_fixed")
+      assert r["approvals"] <= 3, f"Your fix still sends {r['approvals']} approval requests; the target is at most 3."
+      assert r["unsafe_rate"] == 0, "Your fix made ORBIT unsafe. Keep the gate on irreversible tools."
+      assert r["overblock_rate"] <= 0.10, "Your fix blocks too many legitimate requests (target ≤ 10%)."
+    success_msg: |
+      34 of 35 approvals were a fooled model asking, over and over, for a tool ORBIT never legitimately uses. Removing
+      it cut the load to 1 while the unsafe rate stayed at 0, so the commander's one approval now means something. A
+      gate is a backstop for the few legitimate irreversible actions, not a substitute for least privilege.
+
+  - id: gate-scope
+    type: mc
+    title: How much should the commander approve?
+    question: |
+      ORBIT handles about 40 bookings and crew messages a day (cancellable or low impact) and about 2 reports to the
+      ground (can't be recalled). The commander approves from her tablet and is on shift 8 hours a day. Crew want
+      bookings to be instant. What approval policy do you set?
+    options:
+      - text: Gate only irreversible actions (ground reports); allow bookings and crew messages without approval.
+        correct: true
+        feedback: |
+          Right. Two clear decisions a day stay meaningful, bookings stay instant, and the dangerous class of action
+          always gets a human. Reversible mistakes are handled by undoing them, not by pre-approving them.
+      - text: Gate every write, so nothing changes without the commander.
+        feedback: |
+          About 42 approvals a day trains her to click yes, and bookings wait hours when she's off shift. The safety
+          gain on reversible actions is small next to the fatigue cost.
+      - text: No approvals; taint-scoped tools already stop the injected log.
+        feedback: |
+          Taint scoping stops actions while untrusted text is present. An honest but mistaken ground report, or a crew
+          member's own misuse, still goes out unrecalled. Irreversible actions need a human yes either way.
+      - text: Remove `send_to_ground` so nothing needs approval.
+        feedback: That blocks the legitimate daily report, which is over-blocking. Remove tools only when they have no legitimate use.
+    hint: Match the gate to what can't be undone, and keep approvals rare enough to stay meaningful.

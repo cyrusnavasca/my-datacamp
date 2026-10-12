@@ -1,0 +1,215 @@
+title: "Search is slow at scale: a tuning lab"
+description: A playbook for slow vector search. Confirm where the time goes, measure latency and recall together, diagnose the cause, tune an index against both budgets, and verify.
+exercises:
+  - id: slow-search-slides
+    type: video
+    title: Playbook for slow search
+    slides: |
+      # Symptom: "ORBIT got slow when the archive was added"
+
+      The corpus grew from 200k to 5M chunks, and ORBIT's p95 latency went from 40 ms to over 200 ms.
+
+      **First, check that it's the search at all.** Break one request into spans (the *llmops* course covers tracing):
+
+      | span | typical | if it's the slow one |
+      | --- | --- | --- |
+      | embed the query (API) | 50-300 ms | cache frequent queries, use a local model, batch |
+      | vector search | 1-500 ms | **this lesson** |
+      | metadata filter / fetch chunks | 1-50 ms | indexes on metadata, fetch only ids then text |
+      | rerank / LLM call | 100s of ms to seconds | another course |
+
+      Only tune the index once the trace shows the search span is the problem.
+
+      ---
+
+      ## Measure: two numbers, always together
+
+      - **Latency at p95** (not the mean): the slow tail is what users feel. Per query, latency follows the work done:
+        vectors scanned × d.
+      - **Recall@10 against brute force** on a sample of real queries. Exact search gives the ground truth; compute it
+        offline, batched.
+
+      An index tuned on latency alone turns into a fast way to return wrong answers. One tuned on recall alone stays slow.
+      Report the pair, against the budget: *"recall@10 ≥ 0.9 and p95 ≤ 60 ms"*.
+
+      ---
+
+      ## Diagnose: usual causes
+
+      | what you measure | cause |
+      | --- | --- |
+      | scanned = 100% of N | brute force past its comfortable size |
+      | IVF recall low, latency tiny | `nprobe` too low (often left at the default of 1) |
+      | IVF p95 much worse than the mean | unbalanced lists: a few huge buckets |
+      | HNSW latency high, recall ≈ 1.0 | `ef` higher than the recall target needs |
+      | everything about 2x slower than expected | float64 vectors, or one query at a time where batching was possible |
+      | recall fell after compression | PQ too coarse, or no rescoring |
+
+      ---
+
+      ## Fix: options in order of cost
+
+      | fix | speed | recall | memory | cost and effort |
+      | --- | --- | --- | --- | --- |
+      | float32, batching | ~2x+ | same | half (from float64) | an afternoon |
+      | ANN index (IVF / HNSW) | 10-100x | slightly below 1, tunable | +links/centroids | build and operate an index |
+      | tune `nprobe` / `ef` on the recall-latency curve | dial | dial | same | an evaluation set |
+      | quantise (int8, PQ) + rescoring | faster scans | small loss | 4-32x less | codebook training |
+      | fewer dimensions (Matryoshka, PCA) | proportional | **can collapse**, so measure | proportional | re-embed or project |
+      | shard across machines | parallel | same | spread out | more machines, more ops |
+
+      **Verify** on the same query sample: both numbers inside the budget. Then choose the **cheapest** setting that
+      passes: the knee of the curve, not its far end.
+
+  - id: which-span
+    type: mc
+    title: Where does the time go?
+    question: |
+      The crew complains ORBIT is slow. A trace of 1,000 requests gives these per-span p95 latencies:
+
+      | span | p95 |
+      | --- | --- |
+      | embed query (embedding API) | 310 ms |
+      | vector search (HNSW, ef=64) | 6 ms |
+      | fetch chunk text | 9 ms |
+      | LLM answer, time to first token | 450 ms |
+
+      A teammate proposes switching from HNSW to IVF-PQ "to speed up search". What do you recommend?
+    options:
+      - text: Go ahead. IVF-PQ is faster than HNSW.
+        feedback: "Search is 6 ms of roughly 775 ms. Even an infinitely fast index saves under 1%, and PQ would cost recall. Fix the spans that dominate."
+      - text: Lower HNSW's ef to 16 to cut search time.
+        feedback: "That trims a few milliseconds from a 6 ms span and loses recall. It's the wrong span."
+      - text: Leave the index alone and attack the query-embedding span, for example by caching frequent queries or using a local embedding model, and stream the LLM answer.
+        correct: true
+        feedback: "Right. The trace says search isn't the problem. Query embedding (310 ms) and time to first token (450 ms) dominate. Cache embeddings of repeated queries, consider a local or faster embedding model (checking recall), and stream the answer so the crew sees text sooner."
+      - text: Shard the vector index across more machines.
+        feedback: "Sharding helps when one machine can't hold or scan the index fast enough. Here search takes 6 ms, so the extra machines buy nothing."
+    hint: Add up the spans. Which ones are worth optimising?
+
+  - id: slow-at-scale
+    type: sequential
+    title: "Mission: fast and right"
+    context: |
+      ORBIT's archive search will hold 5M vectors of 768 dims. You're testing on a 50,000-vector sample `X` (64 dims, same
+      structure) with 200 real queries `Q`. `projected_latency_ms(frac)` converts the **fraction of vectors a query scans**
+      into production latency (a full scan is 192 ms, plus 2 ms overhead). The budget is **p95 ≤ 60 ms** with
+      **recall@10 ≥ 0.9**. A teammate already built an IVF index: `centroids` (200, unit length) and `lists` (row ids
+      per centroid), and shipped it with `nprobe = 1`. `exact_topk` is imported.
+    pre_code: |
+      import numpy as np
+      from sklearn.cluster import KMeans
+      from kits.embeddings_vector_search import make_vectors, make_queries, exact_topk, projected_latency_ms
+      X = make_vectors(50_000)
+      Q = make_queries(X, 200)
+      _km = KMeans(n_clusters=200, n_init=1, random_state=0, max_iter=25).fit(X[::5])
+      centroids = _km.cluster_centers_ / np.linalg.norm(_km.cluster_centers_, axis=1, keepdims=True)
+      _assign = np.argmax(X @ centroids.T, axis=1)
+      lists = [np.where(_assign == c)[0] for c in range(len(centroids))]
+    steps:
+      - instructions:
+          - "**Measure the baseline.** Store the exact top 10 for every query in `truth` (brute force: `exact_topk(X, Q, 10)`)."
+          - "Brute force scans every vector, so each query's fraction is 1.0. Store the p95 of `projected_latency_ms` over the 200 queries in `brute_p95` and print it next to the 60 ms budget."
+        hint: "`np.percentile(projected_latency_ms(np.ones(len(Q))), 95)`."
+        sample_code: |
+          truth = ____
+          brute_p95 = ____
+          print(f"brute force p95 {brute_p95:.0f} ms vs budget 60 ms")
+        solution: |
+          truth = exact_topk(X, Q, 10)
+          brute_p95 = float(np.percentile(projected_latency_ms(np.ones(len(Q))), 95))
+          print(f"brute force p95 {brute_p95:.0f} ms vs budget 60 ms")
+        tests: |
+          check_equal("truth", msg="`truth` should be `exact_topk(X, Q, 10)`.")
+          check_equal("brute_p95", 194.0, msg="`brute_p95` should be the 95th percentile of `projected_latency_ms` with a fraction of 1.0 for every query: 194 ms.")
+      - instructions:
+          - "**Measure the teammate's fix.** Write `ivf_search(q, nprobe, k=10)` using `centroids` and `lists`. It returns `(top-k ids best first, number scanned)`."
+          - "Write `evaluate(nprobe)` that returns a dict with `recall` (mean recall@10 against `truth`), `p95_ms` (p95 of `projected_latency_ms` of each query's scanned fraction) and `scanned` (mean scanned fraction)."
+          - "Store `evaluate(1)` in `teammate` and print it."
+        hint: |
+          `probe = np.argsort(-(centroids @ q))[:nprobe]`; `cand = np.concatenate([lists[c] for c in probe])`;
+          `top = cand[np.argsort(-(X[cand] @ q))[:k]]`. In `evaluate`, collect `fracs = [n / len(X) ...]` and
+          `recalls = [len(set(top) & set(truth[i])) / 10 ...]`.
+        sample_code: |
+          def ivf_search(q, nprobe, k=10):
+              probe = ____
+              cand = ____
+              top = ____
+              return top, len(cand)
+
+          def evaluate(nprobe):
+              runs = [ivf_search(q, nprobe) for q in Q]
+              recalls = ____
+              fracs = ____
+              return {"recall": float(np.mean(recalls)),
+                      "p95_ms": float(np.percentile(projected_latency_ms(fracs), 95)),
+                      "scanned": float(np.mean(fracs))}
+
+          teammate = evaluate(1)
+          print(teammate)
+        solution: |
+          def ivf_search(q, nprobe, k=10):
+              probe = np.argsort(-(centroids @ q))[:nprobe]
+              cand = np.concatenate([lists[c] for c in probe])
+              top = cand[np.argsort(-(X[cand] @ q))[:k]]
+              return top, len(cand)
+
+          def evaluate(nprobe):
+              runs = [ivf_search(q, nprobe) for q in Q]
+              recalls = [len(set(top) & set(truth[i])) / 10 for i, (top, _) in enumerate(runs)]
+              fracs = [n / len(X) for _, n in runs]
+              return {"recall": float(np.mean(recalls)),
+                      "p95_ms": float(np.percentile(projected_latency_ms(fracs), 95)),
+                      "scanned": float(np.mean(fracs))}
+
+          teammate = evaluate(1)
+          print(teammate)
+        tests: |
+          t = check_object("teammate")
+          for key in ["recall", "p95_ms", "scanned"]:
+              assert key in t, f"`evaluate` should return a dict with key {key!r}."
+              assert abs(t[key] - sol["teammate"][key]) < 1e-6, f"`teammate[{key!r}]` should be {sol['teammate'][key]:.3f}, got {t[key]:.3f}."
+          f = check_object("evaluate")
+          e = f(4)
+          w = sol["evaluate"](4)
+          assert all(abs(e[k] - w[k]) < 1e-6 for k in w), "`evaluate(4)` gives different numbers from a correct implementation. Check `ivf_search` probes the nprobe best centroids."
+      - instructions:
+          - "**Diagnose.** The teammate's index is fast but finds only about a third of the true neighbours: `nprobe = 1` scans one bucket and misses neighbours just across the boundary. Sweep the knob."
+          - "Store `{p: evaluate(p) for p in [1, 4, 16, 32, 48, 64, 96]}` in `sweep`, and print one line per nprobe with recall, p95 and scanned fraction."
+        hint: A dict comprehension over the list, then a loop over `sweep.items()` to print.
+        sample_code: |
+          sweep = ____
+          for p, r in sweep.items():
+              print(f"nprobe={p:3d}  recall@10 {r['recall']:.3f}  p95 {r['p95_ms']:6.1f} ms  scanned {r['scanned']:.1%}")
+        solution: |
+          sweep = {p: evaluate(p) for p in [1, 4, 16, 32, 48, 64, 96]}
+          for p, r in sweep.items():
+              print(f"nprobe={p:3d}  recall@10 {r['recall']:.3f}  p95 {r['p95_ms']:6.1f} ms  scanned {r['scanned']:.1%}")
+        tests: |
+          s = check_object("sweep")
+          assert sorted(s) == [1, 4, 16, 32, 48, 64, 96], "`sweep` should have one entry for each nprobe in [1, 4, 16, 32, 48, 64, 96]."
+          for p in s:
+              assert abs(s[p]["recall"] - sol["sweep"][p]["recall"]) < 1e-6, f"`sweep[{p}]` should be `evaluate({p})`."
+      - instructions:
+          - "**Fix and verify.** Store the **smallest** nprobe in `sweep` that meets both budgets (recall ≥ 0.9 and p95 ≤ 60 ms) in `best_nprobe`."
+          - "Store `evaluate(best_nprobe)` in `final` and print it next to the brute-force p95. Tests also require the scanned fraction to be under 30%."
+        hint: "`min(p for p, r in sweep.items() if r['recall'] >= 0.9 and r['p95_ms'] <= 60)`."
+        sample_code: |
+          best_nprobe = ____
+          final = ____
+          print(f"nprobe={best_nprobe}: recall@10 {final['recall']:.3f}, p95 {final['p95_ms']:.1f} ms (brute force {brute_p95:.0f} ms), scanned {final['scanned']:.1%}")
+        solution: |
+          best_nprobe = min(p for p, r in sweep.items() if r["recall"] >= 0.9 and r["p95_ms"] <= 60)
+          final = evaluate(best_nprobe)
+          print(f"nprobe={best_nprobe}: recall@10 {final['recall']:.3f}, p95 {final['p95_ms']:.1f} ms (brute force {brute_p95:.0f} ms), scanned {final['scanned']:.1%}")
+        tests: |
+          b = check_object("best_nprobe")
+          f = check_object("final")
+          fresh = user["evaluate"](b)
+          assert all(abs(f[k] - fresh[k]) < 1e-6 for k in fresh), "`final` should be `evaluate(best_nprobe)`."
+          assert fresh["recall"] >= 0.9, f"recall@10 is {fresh['recall']:.3f} at nprobe={b}; it must be at least 0.9. Pick a larger nprobe."
+          assert fresh["p95_ms"] <= 60, f"p95 is {fresh['p95_ms']:.1f} ms at nprobe={b}; it must be at most 60 ms. Pick a smaller nprobe."
+          assert fresh["scanned"] < 0.3, f"The index scans {fresh['scanned']:.1%} of the vectors; keep it under 30%."
+          check_equal("best_nprobe", msg="`best_nprobe` should be the smallest nprobe in `sweep` that meets both budgets.")
+    timeout: 120
+    success_msg: From 194 ms with exact results, and 5 ms with a third of the right answers, to about 52 ms with over 92% recall, scanning a quarter of the vectors. You picked the cheapest point on the curve that meets both budgets and can show the numbers. If the budget tightens, the next levers are more lists (nlist), int8 with rescoring, or HNSW.

@@ -1,0 +1,378 @@
+title: Let the model think, when it pays
+description: Why writing out steps makes models more accurate on multi-step problems, what it costs, and how to use it only where it helps.
+exercises:
+  - id: reasoning-slides
+    type: video
+    title: Thinking is computation you pay for
+    slides: |
+      # Why "think step by step" works
+
+      Each output token gets a fixed amount of computation: one pass through the model. A question like
+
+      > The potable tank holds 2,400 L and 6 crew use 15 L each per day. How many full days does it last?
+
+      needs several dependent steps (6 × 15 = 90, then 2,400 / 90 = 26.7, then round down). Answering in **one token**
+      means doing all of that in a single pass, and models often guess. When the model writes the steps out first, each step
+      becomes text it can read back, so later tokens build on earlier results. More tokens means more computation.
+
+      It doesn't help lookups ("what's the CO2 alert level?") or simple classification. There's nothing to work out,
+      so the extra tokens are pure cost.
+
+      ---
+
+      ## Three ways to get reasoning
+
+      **1. Ask for it in the prompt** (works with any model):
+
+      ```python
+      system = ("Think step by step inside <thinking></thinking> tags. "
+                "Then give only the final number inside <answer></answer> tags.")
+      ```
+
+      **2. Extended thinking** (models that support it): the API runs a separate reasoning phase with a token budget, and
+      returns `thinking` blocks before the `text` blocks.
+
+      ```python
+      response = client.messages.create(
+          model="claude-sonnet-5-5", max_tokens=8000,
+          thinking={"type": "enabled", "budget_tokens": 4000},   # must be below max_tokens
+          messages=[{"role": "user", "content": question}],
+      )
+      answer = next(b.text for b in response.content if b.type == "text")
+      ```
+
+      **3. No reasoning:** answer directly. This is right for lookups, extraction and simple labels.
+
+      Either way, **reasoning tokens are billed as output** and add decode time. Show users only the answer.
+
+      ---
+
+      ## The trade-off
+
+      | | direct answer | prompted reasoning | extended thinking |
+      | --- | --- | --- | --- |
+      | multi-step accuracy | low | high | highest; budget is tunable |
+      | output tokens | few | 3-10× more | budget-sized, can be thousands |
+      | latency | lowest | higher | highest |
+      | parsing | simple | strip `<thinking>` | read the `text` blocks |
+      | control | n/a | you see and shape the steps | the budget, not the content |
+
+      Reasoning **wins** on arithmetic, multi-hop questions, planning and tricky instructions. It **loses** on lookups,
+      labels, short extraction and anything latency-critical where accuracy is already high.
+
+      ---
+
+      ## Playbook: wrong on hard questions, or slow on easy ones
+
+      **Symptom: wrong answers on multi-step questions.**
+      Measure accuracy **by question type**. If the multi-step types fail and the model answers in one line, add reasoning
+      to those types. Verify that accuracy rises, and record the latency and token cost you paid for it.
+
+      **Symptom: simple requests are slow and expensive.**
+      Check the output tokens per request. If a lookup or label produces a paragraph of reasoning, remove the reasoning
+      instruction for that request type. Verify that accuracy holds and latency drops.
+
+      **Route** when both kinds of traffic share one endpoint: reason only when the request needs it. The router can be a
+      cheap rule (several numbers in the question) or a small classifier.
+
+  - id: reasoning-tradeoff
+    type: coding
+    title: Measure what reasoning buys and costs
+    context: |
+      `QUESTIONS` holds 10 station-arithmetic questions and `ANSWERS` the correct answers. Some are one-step lookups, others
+      need several steps. `DIRECT` asks for the answer in `<answer>` tags; `COT` asks for reasoning in `<thinking>` tags first.
+      Each fake reply has `.latency_ms`, the simulated duration of the call (in real code you'd time it yourself).
+    instructions:
+      - "Write `evaluate(choose)`: for each question, call the model with `system=choose(question)` and `max_tokens=500`, extract the `<answer>` content, and return a dict with `accuracy`, `mean_latency_ms` and `mean_output_tokens`."
+      - "Store `evaluate(lambda q: DIRECT)` in `direct` and `evaluate(lambda q: COT)` in `cot`."
+      - "Write `route(question)`: return `COT` when the question contains at least 2 numbers, otherwise `DIRECT`. Store `evaluate(route)` in `routed`."
+    hint: |
+      `re.search(r"<answer>(.*?)</answer>", text, re.S).group(1).strip()` gets the answer. Count numbers with
+      `len(re.findall(r"\d+", question))`.
+    pre_code: |
+      import re
+      import aikit
+      from kits.llm_apis_prompting import station_math, STATION_MATH, MODEL
+      client = aikit.FakeClaude(station_math(), clock=aikit.VirtualClock())
+      QUESTIONS = [row[0] for row in STATION_MATH]
+      ANSWERS = [row[1] for row in STATION_MATH]
+      DIRECT = "You are ORBIT. Give only the final answer inside <answer></answer> tags."
+      COT = "You are ORBIT. Think step by step inside <thinking></thinking> tags, then give only the final answer inside <answer></answer> tags."
+    sample_code: |
+      def evaluate(choose):
+          correct, latency, out_tokens = 0, 0.0, 0
+          for q, a in zip(QUESTIONS, ANSWERS):
+              r = client.messages.create(model=MODEL, max_tokens=500, system=____,
+                                         messages=[{"role": "user", "content": q}])
+              got = ____
+              correct += got == a
+              latency += r.latency_ms
+              out_tokens += r.usage.output_tokens
+          n = len(QUESTIONS)
+          return {"accuracy": ____, "mean_latency_ms": ____, "mean_output_tokens": ____}
+
+      direct = evaluate(lambda q: DIRECT)
+      cot = evaluate(lambda q: COT)
+
+      def route(question):
+          return ____
+
+      routed = evaluate(route)
+      for name, res in [("direct", direct), ("cot", cot), ("routed", routed)]:
+          print(name, res)
+    solution: |
+      def evaluate(choose):
+          correct, latency, out_tokens = 0, 0.0, 0
+          for q, a in zip(QUESTIONS, ANSWERS):
+              r = client.messages.create(model=MODEL, max_tokens=500, system=choose(q),
+                                         messages=[{"role": "user", "content": q}])
+              got = re.search(r"<answer>(.*?)</answer>", r.content[0].text, re.S).group(1).strip()
+              correct += got == a
+              latency += r.latency_ms
+              out_tokens += r.usage.output_tokens
+          n = len(QUESTIONS)
+          return {"accuracy": correct / n, "mean_latency_ms": latency / n, "mean_output_tokens": out_tokens / n}
+
+      direct = evaluate(lambda q: DIRECT)
+      cot = evaluate(lambda q: COT)
+
+      def route(question):
+          return COT if len(re.findall(r"\d+", question)) >= 2 else DIRECT
+
+      routed = evaluate(route)
+      for name, res in [("direct", direct), ("cot", cot), ("routed", routed)]:
+          print(name, res)
+    tests: |
+      for name in ["direct", "cot", "routed"]:
+          check_object(name)
+          assert set(user[name]) >= {"accuracy", "mean_latency_ms", "mean_output_tokens"}, f"`{name}` should be a dict with accuracy, mean_latency_ms and mean_output_tokens."
+      assert user["direct"]["accuracy"] == 0.4, f"Direct answers should get 40% right; you got {user['direct']['accuracy']}. Compare the stripped <answer> text with the answer string."
+      assert user["cot"]["accuracy"] == 1.0, "With reasoning every question should be right. Use `system=choose(q)`."
+      assert user["cot"]["mean_output_tokens"] > 3 * user["direct"]["mean_output_tokens"], "Reasoning should cost several times more output tokens. Sum `r.usage.output_tokens` and divide by the number of questions."
+      assert user["cot"]["mean_latency_ms"] > user["direct"]["mean_latency_ms"], "Compute `mean_latency_ms` from `r.latency_ms`."
+      check_object("route")
+      assert user["route"]("How many scrubbers does Helios-7 have?") == user["DIRECT"], "`route` should send questions with fewer than 2 numbers to DIRECT."
+      assert user["routed"]["accuracy"] == 1.0, "The routed version should still get every question right."
+      assert user["routed"]["mean_latency_ms"] < user["cot"]["mean_latency_ms"], "Routing should be faster on average than reasoning on everything."
+    success_msg: |
+      Reasoning took accuracy from 40% to 100% but cost about 8 times the output tokens and more than doubled the latency.
+      Routing kept the 100% for less time and money, because lookups never needed the extra thinking.
+
+  - id: when-to-reason
+    type: mc
+    title: Where should reasoning go?
+    question: |
+      ORBIT has three request types. Which ones should get a reasoning step?
+
+      | request type | volume | latency target | accuracy now (direct) |
+      | --- | --- | --- | --- |
+      | sensor alert labels ("normal" / "warning" / "critical") | 50,000/day | under 1 s | 98% |
+      | EVA timeline planning (several constraints) | 20/day | under 30 s | 55% |
+      | handbook lookups with citations | 2,000/day | under 3 s | 94% |
+    options:
+      - text: All three. Reasoning always improves answers.
+        feedback: Alert labels are already at 98% with a tight latency target and huge volume. Reasoning there multiplies cost and latency for little or no gain.
+      - text: Only EVA timeline planning.
+        correct: true
+        feedback: Right. It's a multi-step task, accuracy is poor, volume is tiny and the latency budget is loose. That's exactly where extra thinking pays. Leave the other two direct, and keep measuring the lookup misses.
+      - text: Only the sensor alert labels, because they're the most important.
+        feedback: Importance doesn't make a task multi-step. Alert labelling is already accurate, and reasoning would put the 1 s target at risk on 50,000 calls a day.
+      - text: None. Reasoning is too expensive.
+        feedback: For 20 requests a day the cost is trivial, and a 45% error rate on EVA timelines is a real risk. Decide per request type, not globally.
+    hint: Reasoning pays where the task is multi-step, accuracy is low and the latency and volume budgets have room.
+
+  - id: triage-desk
+    type: sequential
+    title: "Mission: fix ORBIT's triage desk"
+    context: |
+      ORBIT's ticket triage v0 is live, and the crew says tickets end up in the wrong queue. Measure it, fix it with
+      everything from this chapter, and decide whether reasoning is worth it. `pool` (100 tickets, for examples) and `test`
+      (60 held-out tickets) have `text` and `category` columns. `CATEGORIES` lists the five valid labels, and `client` is the triage model.
+    pre_code: |
+      import re
+      import pandas as pd
+      import aikit
+      from kits.llm_apis_prompting import ticket_triager, split_tickets, CATEGORIES, MODEL
+      client = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+      pool, test = split_tickets()
+      V0_SYSTEM = "You are ORBIT. Route this crew ticket to the right team."
+    steps:
+      - instructions:
+          - "Write `label(reply)`: return the content of the last `<category>` tag, lower-cased; if there's no tag, the stripped lower-cased reply. Return `None` unless the result is in `CATEGORIES`."
+          - "Write `run(system, tickets)`: classify every ticket (`<ticket>{text}</ticket>` as the user message, `max_tokens=200`) and return `(labels, mean_output_tokens)`."
+          - "**Measure v0:** store the share of `test` tickets where `label` isn't `None` under `V0_SYSTEM` in `v0_parse_rate`."
+        hint: |
+          `found = re.findall(r"<category>\s*(\w+)\s*</category>", reply)`, then `lab = (found[-1] if found else reply.strip()).lower()`.
+          For the parse rate: `sum(l is not None for l in labels) / len(labels)`.
+        sample_code: |
+          def label(reply):
+              found = re.findall(r"<category>\s*(\w+)\s*</category>", reply)
+              lab = ____
+              return lab if lab in CATEGORIES else None
+
+          def run(system, tickets):
+              labels, out_tokens = [], 0
+              for text in tickets.text:
+                  r = client.messages.create(model=MODEL, max_tokens=200, system=system,
+                                             messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}])
+                  labels.append(____)
+                  out_tokens += r.usage.output_tokens
+              return labels, out_tokens / len(tickets)
+
+          v0_labels, _ = run(V0_SYSTEM, test)
+          v0_parse_rate = ____
+          print(v0_parse_rate)
+        solution: |
+          def label(reply):
+              found = re.findall(r"<category>\s*(\w+)\s*</category>", reply)
+              lab = (found[-1] if found else reply.strip()).lower()
+              return lab if lab in CATEGORIES else None
+
+          def run(system, tickets):
+              labels, out_tokens = [], 0
+              for text in tickets.text:
+                  r = client.messages.create(model=MODEL, max_tokens=200, system=system,
+                                             messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}])
+                  labels.append(label(r.content[0].text))
+                  out_tokens += r.usage.output_tokens
+              return labels, out_tokens / len(tickets)
+
+          v0_labels, _ = run(V0_SYSTEM, test)
+          v0_parse_rate = sum(l is not None for l in v0_labels) / len(v0_labels)
+          print(v0_parse_rate)
+        tests: |
+          check_object("label")
+          f = user["label"]
+          assert f("<thinking>hmm</thinking>\n<category>IT</category>") == "it", "`label` should return the lower-cased content of the last <category> tag."
+          assert f(" medical ") == "medical", "Without a tag, `label` should accept a bare label (stripped, lower-cased)."
+          assert f("This looks like a plumbing issue.") is None, "`label` should return None when the reply isn't a valid category."
+          check_equal("v0_parse_rate", 0, msg="`v0_parse_rate` is the share of v0 labels that aren't None.")
+      - instructions:
+          - "Write `SYSTEM_V1`: a clear system prompt that names all five categories and asks for the answer inside `<category></category>` tags."
+          - "Store its accuracy on `test` in `v1_acc`."
+        hint: List the labels literally (`maintenance, it, supplies, scheduling or medical`), and show the tag format, e.g. `Reply with only <category>LABEL</category>`.
+        sample_code: |
+          SYSTEM_V1 = ____
+          v1_labels, _ = run(SYSTEM_V1, test)
+          v1_acc = ____
+          print(v1_acc)
+        solution: |
+          SYSTEM_V1 = ("You are ORBIT and you triage crew tickets on Helios-7. Classify each ticket into exactly one "
+                       "category: maintenance, it, supplies, scheduling or medical. Reply with only <category>LABEL</category>.")
+          v1_labels, _ = run(SYSTEM_V1, test)
+          v1_acc = sum(l == c for l, c in zip(v1_labels, test.category)) / len(test)
+          print(v1_acc)
+        tests: |
+          import re
+          check_object("SYSTEM_V1")
+          s = user["SYSTEM_V1"].lower()
+          missing = [c for c in user["CATEGORIES"] if not re.search(rf"\b{c}\b", s)]
+          assert not missing, f"`SYSTEM_V1` should name every category; missing: {missing}."
+          assert "<category>" in s, "Ask for the answer inside <category></category> tags."
+          check_equal("v1_acc", 0.65, msg="`v1_acc` is the share of test labels equal to `test.category`. With the categories listed it should be 0.65.")
+      - instructions:
+          - "**Fix with examples:** pick at most 10 `(text, category)` pairs from `pool` that `SYSTEM_V1` gets wrong, and build `SYSTEM_V2` = `SYSTEM_V1` plus one `<example><ticket>...</ticket><category>...</category></example>` line per pair."
+          - "Store the test accuracy in `v2_acc` and the accuracy per category (a dict: category to share correct) in `per_category`."
+        hint: |
+          Get the misses with `run(SYSTEM_V1, pool)`, keep pool rows where the label is wrong, then `drop_duplicates("text")`.
+          Per category: `pd.Series([l == c for l, c in zip(v2_labels, test.category)]).groupby(test.category.values).mean().to_dict()`.
+        sample_code: |
+          pool_labels, _ = run(SYSTEM_V1, pool)
+          misses = pool[[l != c for l, c in zip(pool_labels, pool.category)]].drop_duplicates("text")
+          picked = ____
+          examples = list(zip(picked.text, picked.category))
+          SYSTEM_V2 = SYSTEM_V1 + "\n" + "\n".join(____ for t, c in examples)
+
+          v2_labels, v2_tokens = run(SYSTEM_V2, test)
+          v2_acc = ____
+          per_category = ____
+          print(v2_acc, per_category)
+        solution: |
+          pool_labels, _ = run(SYSTEM_V1, pool)
+          misses = pool[[l != c for l, c in zip(pool_labels, pool.category)]].drop_duplicates("text")
+          picked = misses.groupby("category").head(2)
+          examples = list(zip(picked.text, picked.category))
+          SYSTEM_V2 = SYSTEM_V1 + "\n" + "\n".join(f"<example><ticket>{t}</ticket><category>{c}</category></example>" for t, c in examples)
+
+          v2_labels, v2_tokens = run(SYSTEM_V2, test)
+          v2_acc = sum(l == c for l, c in zip(v2_labels, test.category)) / len(test)
+          per_category = pd.Series([l == c for l, c in zip(v2_labels, test.category)]).groupby(test.category.values).mean().to_dict()
+          print(v2_acc, per_category)
+        tests: |
+          check_object("examples")
+          ex = list(user["examples"])
+          assert 1 <= len(ex) <= 10 and all(t in set(user["pool"].text) for t, _ in ex), "Use 1-10 examples, all taken from `pool`."
+          assert user["v2_acc"] >= 0.9, f"`v2_acc` is {user['v2_acc']:.0%}; target 90%. Pick varied misses (one or two per category) rather than repeats of one pattern."
+          pc = user["per_category"]
+          assert isinstance(pc, dict) and set(pc) == set(user["CATEGORIES"]), "`per_category` should map each of the five categories to its accuracy."
+      - instructions:
+          - "**Diagnose and fix the weakest category:** find the category with the lowest accuracy, look at its wrong test tickets, and add **one** pool example that covers the pattern. Store the new prompt in `SYSTEM_V2B`, keeping 10 examples or fewer in total."
+          - "Store `v2b_acc` and `per_category_b`. Every category must reach at least 0.8, and overall at least 0.9."
+        hint: |
+          `worst = min(per_category, key=per_category.get)`, then print the test tickets of that category whose label was wrong.
+          Find a pool ticket with the same phrasing and append it as one more `<example>` line.
+        sample_code: |
+          worst = min(per_category, key=per_category.get)
+          wrong = [t for t, l, c in zip(test.text, v2_labels, test.category) if c == worst and l != c]
+          print(worst, wrong)
+
+          extra = pool[____].head(1)
+          examples_b = examples + list(zip(extra.text, extra.category))
+          SYSTEM_V2B = SYSTEM_V1 + "\n" + "\n".join(f"<example><ticket>{t}</ticket><category>{c}</category></example>" for t, c in examples_b)
+          v2b_labels, v2b_tokens = run(SYSTEM_V2B, test)
+          v2b_acc = ____
+          per_category_b = ____
+          print(v2b_acc, per_category_b)
+        solution: |
+          worst = min(per_category, key=per_category.get)
+          wrong = [t for t, l, c in zip(test.text, v2_labels, test.category) if c == worst and l != c]
+          print(worst, wrong)
+
+          extra = pool[pool.text.str.startswith("Out of")].head(1)
+          examples_b = examples + list(zip(extra.text, extra.category))
+          SYSTEM_V2B = SYSTEM_V1 + "\n" + "\n".join(f"<example><ticket>{t}</ticket><category>{c}</category></example>" for t, c in examples_b)
+          v2b_labels, v2b_tokens = run(SYSTEM_V2B, test)
+          v2b_acc = sum(l == c for l, c in zip(v2b_labels, test.category)) / len(test)
+          per_category_b = pd.Series([l == c for l, c in zip(v2b_labels, test.category)]).groupby(test.category.values).mean().to_dict()
+          print(v2b_acc, per_category_b)
+        tests: |
+          import re
+          check_object("SYSTEM_V2B")
+          n_ex = len(re.findall(r"<example>", user["SYSTEM_V2B"]))
+          assert 1 <= n_ex <= 10, f"`SYSTEM_V2B` has {n_ex} examples; keep it to 10 or fewer."
+          from kits.llm_apis_prompting import ticket_triager, split_tickets, parse_label, MODEL as M
+          import aikit
+          c = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+          _, t = split_tickets()
+          labs = [parse_label(c.messages.create(model=M, max_tokens=200, system=user["SYSTEM_V2B"], messages=[{"role": "user", "content": f"<ticket>{x}</ticket>"}]).text) for x in t.text]
+          ok = [l == y for l, y in zip(labs, t.category)]
+          acc = sum(ok) / len(ok)
+          worst = min(set(t.category), key=lambda k: sum(o for o, y in zip(ok, t.category) if y == k) / sum(1 for y in t.category if y == k))
+          wacc = sum(o for o, y in zip(ok, t.category) if y == worst) / sum(1 for y in t.category if y == worst)
+          assert acc >= 0.9, f"Overall accuracy with `SYSTEM_V2B` is {acc:.0%}; it must stay at 90% or more."
+          assert wacc >= 0.8, f"`{worst}` is still at {wacc:.0%}. Look at its wrong test tickets and add a pool example with the same phrasing."
+          assert abs(user["v2b_acc"] - acc) < 1e-9, "`v2b_acc` should be the test accuracy of `SYSTEM_V2B`."
+      - instructions:
+          - "**Decide on reasoning:** build `SYSTEM_V3` = `SYSTEM_V2B` plus `Think step by step inside <thinking> tags before you answer.` Run it, and store `v3_acc` and its mean output tokens in `v3_tokens`."
+          - "Set `use_reasoning` to `True` only if reasoning improved accuracy."
+        hint: "`v3_labels, v3_tokens = run(SYSTEM_V3, test)`. Compare `v3_acc` with `v2b_acc`, and `v3_tokens` with `v2b_tokens`."
+        sample_code: |
+          SYSTEM_V3 = ____
+          v3_labels, v3_tokens = run(SYSTEM_V3, test)
+          v3_acc = ____
+          use_reasoning = ____
+          print(f"v2b: {v2b_acc:.0%} at {v2b_tokens:.0f} output tokens | v3: {v3_acc:.0%} at {v3_tokens:.0f}")
+        solution: |
+          SYSTEM_V3 = SYSTEM_V2B + "\nThink step by step inside <thinking> tags before you answer."
+          v3_labels, v3_tokens = run(SYSTEM_V3, test)
+          v3_acc = sum(l == c for l, c in zip(v3_labels, test.category)) / len(test)
+          use_reasoning = v3_acc > v2b_acc
+          print(f"v2b: {v2b_acc:.0%} at {v2b_tokens:.0f} output tokens | v3: {v3_acc:.0%} at {v3_tokens:.0f}")
+        tests: |
+          check_object("v3_tokens")
+          assert user["v3_tokens"] > 3 * user["v2b_tokens"], "With the reasoning instruction, replies should be several times longer. Did you add the sentence to `SYSTEM_V3`?"
+          check_equal("v3_acc", user["v2b_acc"], msg="`v3_acc` should be the test accuracy with `SYSTEM_V3`.")
+          check_equal("use_reasoning", False, msg="Reasoning didn't improve accuracy but multiplied output tokens, so it isn't worth it for triage.")
+    success_msg: |
+      Triage went from 0% parseable to over 90% accurate, with no category left behind. You also showed, with numbers, that
+      reasoning would cost about 6 times the output tokens for zero gain on this task. That's the decision a reviewer wants to see.

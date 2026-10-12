@@ -1,0 +1,43 @@
+title: Evaluating LLM Applications
+description: 'Measure whether an LLM app works: error analysis, golden datasets, code-based and fuzzy
+  metrics, calibrated LLM judges, fair comparisons and regression testing for prompts.'
+level: advanced
+est_hours: 4
+prerequisites:
+- rag-systems
+objectives:
+- Start from error analysis and build a failure taxonomy
+- Build an evaluation dataset with good coverage
+- Score outputs with code, fuzzy metrics and calibrated LLM judges
+- Compare versions fairly and gate changes with regression tests
+requires: []
+chapters:
+- id: eval-basics
+  title: Why and what to evaluate
+  description: Error analysis first, failure taxonomies and golden datasets.
+  lessons:
+  - error-analysis-first
+  - golden-sets
+  - eval-set-lab
+- id: metrics
+  title: Metrics
+  description: Exact match, token F1, semantic similarity and code-based checks.
+  lessons:
+  - exact-and-fuzzy
+  - semantic-similarity
+  - code-based-checks
+  - validate-metrics
+- id: llm-judge
+  title: LLM as judge
+  description: Rubrics, position and verbosity bias, and calibrating judges against humans.
+  lessons:
+  - rubrics
+  - pairwise-bias
+  - calibrate-judge
+- id: regression
+  title: Regression testing
+  description: Eval harnesses, confidence intervals and CI for prompts.
+  lessons:
+  - eval-harness
+  - comparing-fairly
+  - ci-for-prompts

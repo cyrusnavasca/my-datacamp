@@ -1,0 +1,205 @@
+title: Reranking
+description: Retrieve wide, then rerank narrow. Why a cross-encoder is more precise than a vector, what each reranked pair costs, and how to choose the rerank depth.
+exercises:
+  - id: rerank-slides
+    type: video
+    title: Retrieve wide, rerank narrow
+    slides: |
+      # Two kinds of relevance model
+
+      **Bi-encoder** (what you've used so far): the chunk is embedded **once, at index time**, without knowing any
+      question. At query time you embed the question and take dot products. Fast, because the hard work is precomputed.
+      But the chunk vector is a summary made in advance, so it can't focus on what *this* question needs.
+
+      **Cross-encoder**: a model reads the question and the chunk **together** and outputs one relevance score.
+      It can check that "how long" is answered by a number, that "SCR-1" (not SCR-2) is the subject, that the chunk
+      actually answers instead of just sharing words. More precise, but nothing can be precomputed: every
+      (question, chunk) pair is a model call at query time.
+
+      | | bi-encoder | cross-encoder |
+      | --- | --- | --- |
+      | Work at query time | 1 embedding + N dot products | 1 model pass per candidate |
+      | Can scan the whole corpus | yes (with an ANN index) | no: 1M chunks = 1M model passes |
+      | Precision | good | better |
+
+      ---
+
+      ## Two stages
+
+      ```python
+      candidates = hybrid(question, 20)                         # stage 1: cheap, aim for recall
+      scored = [(reranker.score(question, c["text"]), c) for c in candidates]
+      top = [c for s, c in sorted(scored, key=lambda x: -x[0])[:3]]   # stage 2: precise, keep k
+      ```
+
+      - Stage 1 only has to get the answer **somewhere in the top N**, so recall@N is what matters there.
+      - Stage 2 only has to **order N candidates**, so it can afford a slower, smarter model.
+      - The reranker can't recover a chunk stage 1 missed. **Recall@N is the ceiling** of the whole pipeline.
+
+      In production you'd use a hosted rerank endpoint or an open cross-encoder model. An LLM can also score
+      relevance, but that's one LLM call per candidate. The exercises use `CrossEncoder`, an offline stand-in that charges
+      simulated time per pair on a virtual clock.
+
+      ---
+
+      ## Rerank depth N: the cost dial
+
+      Every candidate costs a model pass. Measured on ORBIT (hybrid stage 1, 12 ms per pair, 65 questions, k=3):
+
+      | N | accuracy | rerank latency per question |
+      | --- | --- | --- |
+      | 3 (no real reranking) | 0.846 | 36 ms |
+      | 5 | **0.862** | 60 ms |
+      | 20 | 0.862 | 240 ms |
+      | 40 | 0.862 | 470 ms |
+
+      Here quality plateaus at N=5, because ORBIT's stage 1 already ranks the answer near the top. On a larger,
+      messier corpus the plateau comes later. Typical production values are N=20-100. The rule doesn't change:
+      **sweep N, find the plateau, take the smallest N that reaches it within your latency budget**. Batching pairs
+      into one reranker request cuts the overhead, but not the per-pair compute.
+
+      ---
+
+      ## Reranking also helps downstream
+
+      - **Order**: the best chunk goes first in the prompt, where the model is most likely to use it.
+      - **Fewer chunks**: precise ordering lets you send k=3 instead of k=8, which cuts context tokens.
+      - **A confidence signal**: a cross-encoder score says how well the best chunk answers the question. Raw
+        cosine similarities are a much weaker signal. You'll use it in chapter 4 to decide when ORBIT should refuse.
+
+      **Playbook: "the right doc is retrieved but ranked 4th-10th".** Check recall@20 against recall@3. A big gap means
+      stage 1 finds the answer and ranks it badly, which is exactly the case a reranker fixes. A small recall@20 means
+      the problem is stage 1 (chunking, hybrid, rewriting), and a reranker won't help.
+
+  - id: rerank-top
+    type: coding
+    title: Add a reranking stage
+    context: |
+      `hybrid(query, k)` is ORBIT's hybrid retriever and `reranker` is a `CrossEncoder`: `reranker.score(query, text)`
+      returns a relevance score (higher is better). `evaluate(search, QS, k=3)` scores a search function on the 45
+      handbook questions.
+    instructions:
+      - "Write `rerank(query, candidates, top_n)`: score each candidate's `text` with `reranker.score`, and return the `top_n` candidates with the highest scores, best first (keep the original order for ties)."
+      - "Write `reranked(query, k)`: get 20 candidates from `hybrid`, rerank them, and return the top `k`."
+      - "Store `evaluate(hybrid, QS, k=3)[\"accuracy\"]` in `acc_hybrid` and the same for `reranked` in `acc_reranked`. Print both."
+    hint: |
+      `scored = [(reranker.score(query, c["text"]), i, c) for i, c in enumerate(candidates)]`, then sort by `(-score, i)`
+      and keep `[c for _, _, c in scored[:top_n]]`. Python's `sorted` is stable, so `sorted(..., key=lambda x: -x[0])` also keeps ties in order.
+    pre_code: |
+      from kits.rag_systems import orbit_chunks, HybridIndex, CrossEncoder, evaluate, questions
+      hybrid = HybridIndex(orbit_chunks()).search
+      reranker = CrossEncoder()
+      QS = questions()
+      print(reranker.score("How long did SCR-1 run alone?", "SCR-1 ran alone for 36 hours until the fan was replaced."))
+      print(reranker.score("How long did SCR-1 run alone?", "SCR: CO2 scrubber."))
+    sample_code: |
+      def rerank(query, candidates, top_n):
+          scored = [(____, i, c) for i, c in enumerate(candidates)]
+          scored.sort(key=lambda x: (____, x[1]))
+          return [c for _, _, c in scored[:top_n]]
+
+      def reranked(query, k):
+          return rerank(query, ____, k)
+
+      acc_hybrid = evaluate(hybrid, QS, k=3)["accuracy"]
+      acc_reranked = ____
+      print(acc_hybrid, acc_reranked)
+    solution: |
+      def rerank(query, candidates, top_n):
+          scored = [(reranker.score(query, c["text"]), i, c) for i, c in enumerate(candidates)]
+          scored.sort(key=lambda x: (-x[0], x[1]))
+          return [c for _, _, c in scored[:top_n]]
+
+      def reranked(query, k):
+          return rerank(query, hybrid(query, 20), k)
+
+      acc_hybrid = evaluate(hybrid, QS, k=3)["accuracy"]
+      acc_reranked = evaluate(reranked, QS, k=3)["accuracy"]
+      print(acc_hybrid, acc_reranked)
+    tests: |
+      check_object("rerank")
+      cands = [{"id": "a", "text": "Glossary: SCR: CO2 scrubber."}, {"id": "b", "text": "SCR-1 ran alone for 36 hours."}, {"id": "c", "text": "Dinner is at 19:00."}]
+      out = user["rerank"]("How long did SCR-1 run alone?", cands, 2)
+      assert [c["id"] for c in out] == ["b", "a"], f"`rerank` should put the best-scoring candidate first and return `top_n` of them; got {[c['id'] for c in out]}."
+      check_object("reranked")
+      assert len(user["reranked"]("What time is dinner?", 3)) == 3, "`reranked(query, k)` should return k chunks."
+      check_equal("acc_hybrid")
+      a = check_object("acc_reranked")
+      assert a >= 0.93, f"Reranked accuracy should reach at least 0.93; got {a}. Rerank 20 hybrid candidates and keep the top k."
+    success_msg: |
+      Reranking 20 candidates down to 3 lifted accuracy from 0.91 to 0.93 with the same context size, and fixed q36
+      (the flood cause): its answer chunk was in the top 20 but not the top 3. The cost is 20 reranker passes per question.
+
+  - id: rerank-depth
+    type: coding
+    title: Choose the rerank depth under a latency budget
+    context: |
+      Product's latency budget for reranking is **150 ms per question**. Each `CrossEncoder` pass costs 12 ms on its
+      virtual clock (`ce.clock.now_ms`). `QS` holds 65 questions (handbook, identifier and slang). `pipeline(n, ce)` returns
+      a search function that reranks `n` hybrid candidates with `ce` down to k.
+    instructions:
+      - "For each `n` in `DEPTHS`, make a fresh `CrossEncoder()`, evaluate `pipeline(n, ce)` on `QS` with `k=3`, and store `(accuracy, ms_per_question)` in the dict `sweep[n]`, where `ms_per_question = ce.clock.now_ms / len(QS)`."
+      - "Set `best_n` to the **smallest** `n` whose accuracy equals the best accuracy in the sweep **and** whose `ms_per_question` is at most 150."
+      - Print `sweep` and `best_n`.
+    hint: |
+      `best_acc = max(a for a, ms in sweep.values())`, then
+      `best_n = min(n for n, (a, ms) in sweep.items() if a == best_acc and ms <= 150)`.
+    pre_code: |
+      from kits.rag_systems import orbit_chunks, HybridIndex, CrossEncoder, evaluate, questions, SLANG_QUESTIONS
+      hybrid = HybridIndex(orbit_chunks()).search
+      QS = questions() + SLANG_QUESTIONS
+      DEPTHS = [3, 5, 10, 20, 40]
+
+      def pipeline(n, ce):
+          return lambda q, k: ce.rerank(q, hybrid(q, n), k)
+    sample_code: |
+      sweep = {}
+      for n in DEPTHS:
+          ce = CrossEncoder()
+          r = evaluate(pipeline(n, ce), QS, k=3)
+          sweep[n] = (r["accuracy"], ____)
+
+      best_acc = ____
+      best_n = ____
+      print(sweep)
+      print(best_n)
+    solution: |
+      sweep = {}
+      for n in DEPTHS:
+          ce = CrossEncoder()
+          r = evaluate(pipeline(n, ce), QS, k=3)
+          sweep[n] = (r["accuracy"], ce.clock.now_ms / len(QS))
+
+      best_acc = max(a for a, ms in sweep.values())
+      best_n = min(n for n, (a, ms) in sweep.items() if a == best_acc and ms <= 150)
+      print(sweep)
+      print(best_n)
+    tests: |
+      s = check_object("sweep")
+      assert set(s) == set(user["DEPTHS"]), "`sweep` needs one entry per depth in DEPTHS."
+      for n, (a, ms) in s.items():
+          assert abs(ms - sol["sweep"][n][1]) < 1e-6, f"ms_per_question for n={n} should be {sol['sweep'][n][1]:.1f}; got {ms}. Use a fresh CrossEncoder per n and divide `ce.clock.now_ms` by len(QS)."
+      check_equal("sweep")
+      check_equal("best_n", msg="`best_n` should be the smallest depth that reaches the best accuracy within 150 ms per question.")
+    success_msg: |
+      N=5 reaches the same accuracy as N=40 for an eighth of the latency. N=10 also fits the budget (120 ms) but buys
+      nothing, and N=20 (240 ms) is over it. Re-run this sweep when the corpus grows: a bigger corpus usually pushes the
+      plateau to a larger N.
+
+  - id: why-rerank
+    type: mc
+    title: Why not just retrieve five?
+    question: |
+      A teammate asks: "Our retriever can return 5 chunks directly. Why retrieve 20 and then rerank to 5? And if the
+      reranker is better, why not run it over all 171 chunks?" Which answer is right?
+    options:
+      - text: Reranking is cheaper than vector search, so it saves money to use both.
+        feedback: The opposite. A reranker pass per candidate costs far more than a dot product. That's exactly why you only rerank a short list.
+      - text: Stage 1 is cheap and tuned for recall, so it gets the answer into the top 20. The cross-encoder reads query and chunk together, which is more precise but costs one pass per pair, too slow for the whole corpus at query time.
+        correct: true
+        feedback: "Right. Each stage does what it's cheap at: vectors narrow millions of chunks to N, and the expensive reader orders N. With 171 chunks you *could* rerank everything (171 × 12 ms ≈ 2 s per question), but that cost grows with the corpus and blows any latency budget."
+      - text: Reranking raises recall@20, because it finds chunks the retriever missed.
+        feedback: A reranker only reorders the candidates it's given. It can't add a chunk that stage 1 missed, so recall@N is the ceiling for the whole pipeline.
+      - text: Rerankers use bigger embedding vectors than retrievers, so they're more accurate.
+        feedback: A cross-encoder doesn't produce a chunk vector at all. It scores the (question, chunk) pair jointly, and that's where the precision and the cost come from.
+    hint: Think about what can be precomputed at index time for each model, and what has to happen per question.

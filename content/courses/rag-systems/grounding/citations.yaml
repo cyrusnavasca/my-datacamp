@@ -1,0 +1,330 @@
+title: Citations you can check
+description: Ask for citations, parse them, verify every claim against the chunk it cites, and fix a model that adds unsupported rules.
+exercises:
+  - id: citations-slides
+    type: video
+    title: A citation is a claim you can check
+    slides: |
+      # Why citations
+
+      ```text
+      Two crew members must be present for every airlock cycle. [airlock-procedure]
+      Note that ORBIT can override this in an emergency. [airlock-procedure]
+      ```
+
+      The second sentence is **invented**. Nothing in the airlock procedure says it, and on Helios-7 it's dangerous.
+      But it carries a citation, so it *looks* sourced.
+
+      Citations serve three readers:
+      - **The crew**: "where does it say that?" One click to the source.
+      - **Your code**: every claim can be checked against the chunk it cites, automatically, on every answer.
+      - **You, debugging**: a wrong claim citing the right doc is a generation problem; citing a wrong doc is a retrieval problem.
+
+      Note: accuracy didn't catch this answer. "Two crew members" is right, so `is_correct` passes it. You need a
+      second metric: **faithfulness**, i.e. is everything it says supported?
+
+      ---
+
+      ## Getting citations
+
+      **Prompted markers** work with any model:
+
+      ```python
+      system = SYSTEM + " Cite the document id in square brackets after each sentence, like [doc-id]."
+      ```
+
+      **API-native citations**: the Anthropic Messages API can take documents as `document` content blocks with
+      citations enabled, and returns answer text whose blocks point at the exact cited passages, so you don't have to
+      parse markers. Check the current docs for the block format.
+
+      Either way, parse the answer into **claims**, each with the ids it cites:
+
+      ```python
+      CLAIM_RE = re.compile(r"([^\[\]]+?)\s*((?:\[[^\]]+\]\s*)+)")    # text, then one or more [id] markers
+      [(m.group(1).strip(), re.findall(r"\[([^\]]+)\]", m.group(2))) for m in CLAIM_RE.finditer(answer)]
+      ```
+
+      Text after the last marker is a claim that cites **nothing**, which counts as unsupported.
+
+      ---
+
+      ## Verifying a claim
+
+      A claim is **supported** when:
+
+      1. it cites at least one id,
+      2. every cited id was actually **retrieved** for this question (otherwise the citation itself is invented), and
+      3. the cited chunks **say what the claim says**.
+
+      | support check | cost per claim | catches | misses |
+      | --- | --- | --- | --- |
+      | word overlap (≥ 80% of the claim's words in the cited text) | microseconds | invented rules, wrong-doc citations | paraphrases; claims that reuse the chunk's words but flip the meaning ("must" → "must not") |
+      | NLI model (does the chunk *entail* the claim?) | ms on a small model | paraphrases, many contradictions | subtle multi-sentence reasoning |
+      | LLM judge | an extra LLM call per answer | most cases, with explanations | costs and latency; the judge must itself be validated |
+
+      Use the cheapest check that fits how your model writes. An extractive model that quotes sentences can be
+      checked by word overlap. A model that paraphrases needs NLI or a judge (see the evaluation course).
+
+      ---
+
+      ## Playbook: "ORBIT made up a rule"
+
+      **Measure**: citation-support rate (supported claims ÷ all claims) over the labelled set, *and* the share of
+      answers with at least one unsupported claim. **Diagnose**: read the unsupported claims. Are they invented
+      (no source says it), mis-cited (the right fact, the wrong id) or uncited?
+
+      **Fix, in this order**:
+
+      | fix | effect | cost |
+      | --- | --- | --- |
+      | grounding instruction: "use **only** the documents" | fewer inventions | free; never 100% |
+      | require a citation on every sentence | uncited claims become visible | free |
+      | **post-check**: drop (or flag) unsupported claims; refuse if nothing is left | supported rate → 100% by construction | a check per claim; may drop a true but badly cited claim |
+      | better evidence (reranking, refusal threshold) | less temptation to fill gaps | see the next lesson |
+
+      **Verify**: support rate up, *and* accuracy not down. Dropping claims can drop real facts too.
+
+  - id: parse-citations
+    type: coding
+    title: Parse claims and citations
+    context: |
+      ORBIT writes `[doc-id]` markers after its sentences. `CLAIM_RE` matches a claim followed by one or more markers:
+      `m.group(1)` is the claim text and `m.group(2)` the markers. `samples` holds four answers from the logs.
+    instructions:
+      - "Write `parse_citations(answer)`: return a list of `(claim, ids)` tuples, one per `CLAIM_RE` match, with the claim stripped and `ids` the list of ids inside the brackets."
+      - "If text remains after the last match, add it (stripped) as a claim with `[]`."
+      - "Store `[parse_citations(a) for a in samples]` in `parsed` and print it."
+    hint: |
+      Loop `for m in CLAIM_RE.finditer(answer)`, append `(m.group(1).strip(), re.findall(r"\[([^\]]+)\]", m.group(2)))`
+      and remember `end = m.end()`. After the loop, `tail = answer[end:].strip()`.
+    pre_code: |
+      import re
+      CLAIM_RE = re.compile(r"([^\[\]]+?)\s*((?:\[[^\]]+\]\s*)+)")
+      samples = [
+          "Watering cycles run at 06:00 and 18:00. [hydroponics-schedule]",
+          "Two crew members must be present for every airlock cycle. [airlock-procedure] Note that ORBIT can override this in an emergency. [airlock-procedure]",
+          "Kenji Watanabe owns the hydroponics schedule. [hydroponics-schedule] [crew-roster] He is the botanist.",
+          "I don't know based on the provided documents.",
+      ]
+    sample_code: |
+      def parse_citations(answer):
+          out, end = [], 0
+          for m in CLAIM_RE.finditer(answer):
+              ids = ____
+              out.append((____, ids))
+              end = m.end()
+          tail = ____
+          if tail:
+              out.append((tail, []))
+          return out
+
+      parsed = [parse_citations(a) for a in samples]
+      for p in parsed:
+          print(p)
+    solution: |
+      def parse_citations(answer):
+          out, end = [], 0
+          for m in CLAIM_RE.finditer(answer):
+              ids = re.findall(r"\[([^\]]+)\]", m.group(2))
+              out.append((m.group(1).strip(), ids))
+              end = m.end()
+          tail = answer[end:].strip()
+          if tail:
+              out.append((tail, []))
+          return out
+
+      parsed = [parse_citations(a) for a in samples]
+      for p in parsed:
+          print(p)
+    tests: |
+      check_object("parse_citations")
+      check_equal("parsed", [
+          [("Watering cycles run at 06:00 and 18:00.", ["hydroponics-schedule"])],
+          [("Two crew members must be present for every airlock cycle.", ["airlock-procedure"]), ("Note that ORBIT can override this in an emergency.", ["airlock-procedure"])],
+          [("Kenji Watanabe owns the hydroponics schedule.", ["hydroponics-schedule", "crew-roster"]), ("He is the botanist.", [])],
+          [("I don't know based on the provided documents.", [])],
+      ], msg="`parsed` isn't right yet. Check: claims are stripped, a claim can cite several ids, and trailing text with no marker becomes a claim with [].")
+    success_msg: |
+      Every claim now carries its evidence pointer, and the uncited "He is the botanist." stands out. A claim with no
+      citation can't be checked, so the next exercise treats it as unsupported.
+
+  - id: measure-support
+    type: coding
+    title: "Measure: how much of ORBIT's answer is supported?"
+    context: |
+      **Symptom**: a crew member reports that ORBIT said "ORBIT can override this in an emergency". `answer_all(system)`
+      runs ORBIT on the 41 answerable questions and returns `(question, answer, chunks)` triples. `LOOSE_SYSTEM` is the
+      current prompt. `parse_citations` and `support_score(claim, text)` (the share of the claim's words found in `text`) are ready.
+    instructions:
+      - "Write `is_supported(claim, ids, chunks)`: False if `ids` is empty or any id isn't among the chunks' `doc_id`s; otherwise True when `support_score(claim, text)` is at least 0.8, where `text` joins the `text` of the chunks whose `doc_id` is cited."
+      - "Write `support_rate(results)`: supported claims ÷ all claims, over every answer in `results`."
+      - "Store `support_rate(answer_all(LOOSE_SYSTEM))` in `loose_rate` and the accuracy of those answers (`is_correct(q, answer)`, averaged) in `loose_accuracy`. Print both."
+    hint: |
+      `retrieved = {c["doc_id"] for c in chunks}`. For the rate, loop `for q, answer, chunks in results:` and
+      `for claim, ids in parse_citations(answer):`, counting claims and supported ones.
+    pre_code: |
+      from kits.rag_systems import (orbit_chunks, HybridIndex, make_client, sloppy_reader, format_documents, questions,
+                                    parse_citations, support_score, is_correct, MODEL)
+      search = HybridIndex(orbit_chunks()).search
+      QS = questions(include_unanswerable=False)
+      LOOSE_SYSTEM = "You are ORBIT, the Helios-7 station assistant. Cite the document id in square brackets after each sentence, like [doc-id]."
+
+      def answer_all(system):
+          client = make_client(sloppy_reader())
+          out = []
+          for q in QS:
+              chunks = search(q["question"], 3)
+              r = client.messages.create(model=MODEL, max_tokens=400, system=system, messages=[
+                  {"role": "user", "content": f"{format_documents(chunks)}\n<question>{q['question']}</question>"}])
+              out.append((q, r.content[0].text, chunks))
+          return out
+    sample_code: |
+      def is_supported(claim, ids, chunks):
+          retrieved = {c["doc_id"] for c in chunks}
+          if ____:
+              return False
+          text = " ".join(c["text"] for c in chunks if ____)
+          return ____
+
+      def support_rate(results):
+          total = supported = 0
+          for q, answer, chunks in results:
+              for claim, ids in parse_citations(answer):
+                  total += 1
+                  supported += ____
+          return supported / total
+
+      loose = answer_all(LOOSE_SYSTEM)
+      loose_rate = ____
+      loose_accuracy = ____
+      print(loose_rate, loose_accuracy)
+    solution: |
+      def is_supported(claim, ids, chunks):
+          retrieved = {c["doc_id"] for c in chunks}
+          if not ids or any(i not in retrieved for i in ids):
+              return False
+          text = " ".join(c["text"] for c in chunks if c["doc_id"] in ids)
+          return support_score(claim, text) >= 0.8
+
+      def support_rate(results):
+          total = supported = 0
+          for q, answer, chunks in results:
+              for claim, ids in parse_citations(answer):
+                  total += 1
+                  supported += is_supported(claim, ids, chunks)
+          return supported / total
+
+      loose = answer_all(LOOSE_SYSTEM)
+      loose_rate = support_rate(loose)
+      loose_accuracy = sum(is_correct(q, a) for q, a, _ in loose) / len(loose)
+      print(loose_rate, loose_accuracy)
+    tests: |
+      f = check_object("is_supported")
+      ch = [{"doc_id": "a", "text": "Two crew members must be present for every airlock cycle."}, {"doc_id": "b", "text": "Dinner is at 19:00."}]
+      assert f("Two crew members must be present for every airlock cycle.", ["a"], ch), "A claim copied from the cited chunk should be supported."
+      assert not f("Two crew members must be present for every airlock cycle.", [], ch), "A claim with no citation is not supported."
+      assert not f("Two crew members must be present for every airlock cycle.", ["zzz"], ch), "A claim citing an id that wasn't retrieved is not supported."
+      assert not f("Two crew members must be present for every airlock cycle.", ["b"], ch), "Check the claim against the *cited* chunks only: chunk b doesn't say it."
+      assert not f("ORBIT can override this in an emergency.", ["a"], ch), "An invented claim should not be supported by chunk a."
+      check_equal("loose_rate", msg="`loose_rate` should be supported claims divided by all claims over the 41 answers.")
+      check_equal("loose_accuracy")
+    success_msg: |
+      About 1 claim in 4 is unsupported, yet accuracy is 0.93. The right facts are present, *plus* an invented rule.
+      Accuracy alone would have shipped this. Faithfulness is a separate metric, and now you measure it.
+
+  - id: fix-unsupported
+    type: coding
+    title: "Fix and verify: ground the prompt, check the claims"
+    context: |
+      Same setup as before, with `answer_all`, `support_rate`, `is_supported` (from the kit), `parse_citations` and `is_correct`.
+      `REFUSAL` is ORBIT's "I don't know" sentence. Two fixes: a stricter prompt, then a post-check that drops what the prompt didn't prevent.
+    instructions:
+      - "Set `STRICT_SYSTEM` to a prompt that tells ORBIT to answer using **only** the documents, to say it doesn't know otherwise, and to cite a `[doc-id]` after each sentence. Store `support_rate(answer_all(STRICT_SYSTEM))` in `strict_rate`."
+      - "Write `clean(answer, chunks)`: keep only supported claims, each rebuilt as the claim followed by its `[id]` markers, joined with spaces. If none is left, return `REFUSAL`."
+      - "Clean every strict answer into `cleaned` (a list of `(q, answer, chunks)`), then store `support_rate(cleaned)` in `cleaned_rate`, and the accuracy before and after cleaning in `strict_accuracy` and `cleaned_accuracy`."
+    hint: |
+      `kept = [claim + " " + " ".join(f"[{i}]" for i in ids) for claim, ids in parse_citations(answer) if is_supported(claim, ids, chunks)]`,
+      then `return " ".join(kept) if kept else REFUSAL`.
+    pre_code: |
+      from kits.rag_systems import (orbit_chunks, HybridIndex, make_client, sloppy_reader, format_documents, questions,
+                                    parse_citations, is_supported, is_correct, MODEL, REFUSAL)
+      search = HybridIndex(orbit_chunks()).search
+      QS = questions(include_unanswerable=False)
+
+      def answer_all(system):
+          client = make_client(sloppy_reader())
+          out = []
+          for q in QS:
+              chunks = search(q["question"], 3)
+              r = client.messages.create(model=MODEL, max_tokens=400, system=system, messages=[
+                  {"role": "user", "content": f"{format_documents(chunks)}\n<question>{q['question']}</question>"}])
+              out.append((q, r.content[0].text, chunks))
+          return out
+
+      def support_rate(results):
+          claims = [(c, i, ch) for _, a, ch in results for c, i in parse_citations(a)]
+          return sum(is_supported(c, i, ch) for c, i, ch in claims) / len(claims)
+
+      def accuracy(results):
+          return sum(is_correct(q, a) for q, a, _ in results) / len(results)
+    sample_code: |
+      STRICT_SYSTEM = ____
+      strict = answer_all(STRICT_SYSTEM)
+      strict_rate = support_rate(strict)
+
+      def clean(answer, chunks):
+          kept = [____ for claim, ids in parse_citations(answer) if ____]
+          return ____
+
+      cleaned = [(q, clean(a, ch), ch) for q, a, ch in strict]
+      cleaned_rate = ____
+      strict_accuracy, cleaned_accuracy = accuracy(strict), ____
+      print(strict_rate, cleaned_rate, strict_accuracy, cleaned_accuracy)
+    solution: |
+      STRICT_SYSTEM = ("You are ORBIT, the Helios-7 station assistant. Answer using only the documents. If they don't "
+                       "contain the answer, say you don't know. Cite the document id in square brackets after each sentence, like [doc-id].")
+      strict = answer_all(STRICT_SYSTEM)
+      strict_rate = support_rate(strict)
+
+      def clean(answer, chunks):
+          kept = [claim + " " + " ".join(f"[{i}]" for i in ids) for claim, ids in parse_citations(answer) if is_supported(claim, ids, chunks)]
+          return " ".join(kept) if kept else REFUSAL
+
+      cleaned = [(q, clean(a, ch), ch) for q, a, ch in strict]
+      cleaned_rate = support_rate(cleaned)
+      strict_accuracy, cleaned_accuracy = accuracy(strict), accuracy(cleaned)
+      print(strict_rate, cleaned_rate, strict_accuracy, cleaned_accuracy)
+    tests: |
+      s = check_object("STRICT_SYSTEM")
+      assert "only" in s.lower() and "cite" in s.lower(), "`STRICT_SYSTEM` should tell ORBIT to use *only* the documents and to cite a [doc-id] after each sentence."
+      r = check_object("strict_rate")
+      assert r >= 0.85, f"With a strict grounding instruction the support rate should reach 0.85; got {r:.3f}. Say the model must answer using only the documents."
+      f = check_object("clean")
+      ch = [{"doc_id": "a", "text": "Two crew members must be present for every airlock cycle."}]
+      got = f("Two crew members must be present for every airlock cycle. [a] Note that ORBIT can override this. [a]", ch)
+      assert got.startswith("Two crew members must be present") and "override" not in got and "[a]" in got, f"`clean` should keep supported claims with their [id] markers and drop the rest; got {got!r}."
+      assert f("Note that ORBIT can override this. [a]", ch) == user["REFUSAL"], "When no claim survives, `clean` should return REFUSAL."
+      assert check_object("cleaned_rate") >= 0.999, "After cleaning, every remaining claim should be supported (rate 1.0). Refusals should only appear when nothing is left."
+      assert user["cleaned_accuracy"] >= user["strict_accuracy"] - 1e-9, "Cleaning shouldn't cost accuracy here; check that supported claims keep their full text."
+    success_msg: |
+      The strict prompt cut unsupported claims by about half (0.73 → 0.87), and the post-check removed the rest
+      (1.0), with no loss of accuracy. The prompt lowers the rate and the check enforces it. Neither alone gives a
+      guarantee you can ship to an airlock.
+
+  - id: support-check-choice
+    type: mc
+    title: Choose a support check
+    question: |
+      ORBIT will handle 20,000 questions a day. Its answers are **extractive**: it quotes handbook sentences almost word
+      for word. The verification step has a budget of **50 ms** per answer. Which support check do you deploy first?
+    options:
+      - text: An LLM judge that reads each claim and its cited chunk and says "supported" or "not".
+        feedback: It would work, but at roughly a second and one extra call per answer it blows the 50 ms budget and doubles the LLM bill. For quoted sentences it's also overkill. Keep it for offline audits of a sample.
+      - text: Word overlap between each claim and its cited chunks, with a threshold.
+        correct: true
+        feedback: "Right. Extractive claims share almost all their words with the source, so overlap separates them from inventions in microseconds. Revisit this if ORBIT switches to a model that paraphrases: overlap would then flag true claims, and an NLI model becomes the next step."
+      - text: An NLI (entailment) model on every claim.
+        feedback: NLI is the right upgrade for paraphrasing models and may fit 50 ms on a small model. But here it adds a model to host and monitor for no gain over word overlap on quoted text. Start cheap and measure.
+      - text: No check needed. Requiring citations already guarantees the claims are supported.
+        feedback: The sloppy model cited a real document for an invented rule. A citation is a pointer, not proof. Something has to compare the claim with what it points to.
+    hint: Match the check to how the model writes (quotes or paraphrases), then to the latency budget.

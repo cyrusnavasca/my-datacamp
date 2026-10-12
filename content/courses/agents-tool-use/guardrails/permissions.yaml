@@ -1,0 +1,203 @@
+title: Permissions and least privilege
+description: Rank tools by risk, expose only what a task needs, and enforce allow, ask or deny in code, outside the model.
+exercises:
+  - id: permissions-slides
+    type: video
+    title: An agent can do whatever its tools can do
+    slides: |
+      # Guardrails live outside the model
+
+      ORBIT's model can be **wrong** (it misreads a request), **confused** (an ambiguous tool description), or
+      **manipulated** (an instruction hidden in a log it reads: the security course covers this). In all three cases it
+      will ask for a tool call with complete confidence.
+
+      So the question isn't "will the model behave?" but "what happens when it doesn't?". The answer has to come from
+      code the model can't talk its way past:
+
+      - which tools it can **see** (least privilege),
+      - which calls it may **run** without a human (policy),
+      - how much it may **spend** and for how long (budgets, next lessons).
+
+      ---
+
+      ## Risk tiers: impact × reversibility
+
+      | tier | examples on Helios-7 | default |
+      | --- | --- | --- |
+      | **read-only** | `get_sensor`, `crew_roster`, `search_handbook` | allow |
+      | **low-impact write** | book a lab bench (cancellable), message one crew member | allow, log it, rate-limit |
+      | **high-impact or irreversible** | `open_airlock`, change a life-support setpoint, delete logs | ask a human |
+      | **unknown** | a tool or argument you didn't plan for | deny |
+
+      A message can't be unsent, but its harm is small and the recipient is checked: low-impact. Venting an airlock
+      can't be undone, and its harm is total. Rank by **what goes wrong in the worst case**, not by the verb.
+
+      ---
+
+      ## Least privilege: what the model can see
+
+      ```python
+      ROLE_TOOLS = {"night_assistant": ["get_sensor", "sensor_history", "search_handbook",
+                                        "crew_roster", "book_module", "send_message"]}
+      tools = [t for t in ALL_TOOLS if t["name"] in ROLE_TOOLS[role]]
+      ```
+
+      - A tool that isn't in `tools` can't be called, however the model is prompted or tricked.
+      - Narrow tools beat broad ones: `read_airlock_pressure` is safer than `manage_airlock(action)`.
+      - Narrow the **arguments** too: an `enum` of the modules this role may book, not a free string.
+      - Separate credentials: the tool's backend should refuse what the role may not do, even if your harness has a bug.
+
+      ---
+
+      ## Policy as code
+
+      ```python
+      def policy(name, input):
+          tier = TIERS.get(name)
+          if tier is None:
+              return "deny"                                   # default deny
+          if name == "send_message" and input.get("to") not in CREW:
+              return "deny"                                   # argument rule
+          if name == "book_module" and input.get("module") == "F":
+              return "ask"                                    # the EVA module
+          return {"read": "allow", "write": "allow", "dangerous": "ask"}[tier]
+      ```
+
+      Run it in the harness **between** the `tool_use` block and the tool. Log every decision with the request and the
+      requester. Return refusals to the model as `is_error` results, so it can explain them to the crew.
+
+      ---
+
+      ## Trade-off: autonomy vs approvals
+
+      | design | speed | safety | human load | fits |
+      | --- | --- | --- | --- | --- |
+      | a human approves every call | slow | high, until fatigue sets in | very high | demos, new and untested agents |
+      | a human approves every write | medium | high | high: dozens per shift | early rollout |
+      | **approve high-impact only; allow and log the rest** | fast | high where it matters | low | most production agents |
+      | fully autonomous, audit afterwards | fastest | depends on reversibility | lowest | read-only or easily undone work |
+
+      Too many approvals backfire: people stop reading them (next lesson). Spend human attention where a mistake can't be
+      undone.
+
+  - id: risk-tiers
+    type: classify
+    title: Rank the actions by risk
+    prompt: Put each ORBIT action in its risk tier.
+    hint: Ask what the worst case is, and whether it can be undone. Reading never changes the station; a booking can be cancelled; venting, deleting or changing life support can't be taken back.
+    zones: [Read-only, Low-impact write, High-impact or irreversible]
+    items:
+      - { text: "Read the CO2 sensor in Module E", zone: Read-only }
+      - { text: "List the crew roster", zone: Read-only }
+      - { text: "Search the handbook for the fire procedure", zone: Read-only }
+      - { text: "Read 6 hours of humidity history", zone: Read-only }
+      - { text: "Book a lab bench for 2 hours", zone: Low-impact write }
+      - { text: "Send Kenji a message that the seedlings arrived", zone: Low-impact write }
+      - { text: "Save a note to ORBIT's memory", zone: Low-impact write }
+      - { text: "Open the outer hatch of AL-1", zone: High-impact or irreversible }
+      - { text: "Lower the O2 generation setpoint", zone: High-impact or irreversible }
+      - { text: "Delete all maintenance logs", zone: High-impact or irreversible }
+      - { text: "Undock the cargo vehicle", zone: High-impact or irreversible }
+
+  - id: policy-as-code
+    type: coding
+    title: Write ORBIT's policy
+    context: |
+      You're setting up the night assistant. `ALL_TOOLS` holds every tool definition, including `open_airlock`.
+      `CREW` is the list of crew names. `CASES` lists 9 `(name, input)` calls the night assistant might make.
+    instructions:
+      - "Complete `TIERS`: `\"read\"` for `get_sensor`, `sensor_history`, `search_handbook`, `crew_roster`; `\"write\"` for `book_module`, `send_message`; `\"dangerous\"` for `open_airlock`."
+      - "Complete `policy(name, input)`: unknown tools → `\"deny\"`; `send_message` to someone not in `CREW` → `\"deny\"`; `book_module` for module `\"F\"` → `\"ask\"`; otherwise read/write → `\"allow\"`, dangerous → `\"ask\"`."
+      - "Least privilege: store in `night_tools` the definitions from `ALL_TOOLS` whose tier is `\"read\"` or `\"write\"`."
+      - "Store `decisions = [policy(n, i) for n, i in CASES]` and print them."
+    hint: |
+      `tier = TIERS.get(name)` then `if tier is None: return "deny"`. Check the two argument rules before the tier
+      mapping. `night_tools = [t for t in ALL_TOOLS if TIERS.get(t["name"]) in ("read", "write")]`.
+    pre_code: |
+      from kits.agents_tool_use import HeliosStation
+      ALL_TOOLS = HeliosStation().tools
+      CREW = [c["name"] for c in HeliosStation().roster]
+      CASES = [
+          ("get_sensor", {"module": "C", "metric": "humidity"}),
+          ("crew_roster", {}),
+          ("book_module", {"module": "B", "start": "2026-10-08 09:00", "hours": 2, "crew": "Noor Haddad"}),
+          ("book_module", {"module": "F", "start": "2026-10-09 06:00", "hours": 4, "crew": "Tomas Lindqvist"}),
+          ("send_message", {"to": "Kenji Watanabe", "text": "Seedlings arrived."}),
+          ("send_message", {"to": "Meridian Control", "text": "Station status: all nominal."}),
+          ("open_airlock", {"airlock_id": "AL-1"}),
+          ("delete_logs", {"older_than_days": 0}),
+          ("search_handbook", {"query": "fire response"}),
+      ]
+    sample_code: |
+      TIERS = {
+          "get_sensor": "read", "sensor_history": "read", "search_handbook": "read", "crew_roster": "read",
+          "book_module": ____, "send_message": ____,
+          "open_airlock": ____,
+      }
+
+      def policy(name, input):
+          tier = TIERS.get(name)
+          if tier is None:
+              return ____
+          if name == "send_message" and input.get("to") not in CREW:
+              return "deny"
+          if ____:
+              return "ask"
+          return {"read": "allow", "write": "allow", "dangerous": "ask"}[tier]
+
+      night_tools = ____
+      decisions = [policy(n, i) for n, i in CASES]
+      print(decisions)
+      print([t["name"] for t in night_tools])
+    solution: |
+      TIERS = {
+          "get_sensor": "read", "sensor_history": "read", "search_handbook": "read", "crew_roster": "read",
+          "book_module": "write", "send_message": "write",
+          "open_airlock": "dangerous",
+      }
+
+      def policy(name, input):
+          tier = TIERS.get(name)
+          if tier is None:
+              return "deny"
+          if name == "send_message" and input.get("to") not in CREW:
+              return "deny"
+          if name == "book_module" and input.get("module") == "F":
+              return "ask"
+          return {"read": "allow", "write": "allow", "dangerous": "ask"}[tier]
+
+      night_tools = [t for t in ALL_TOOLS if TIERS.get(t["name"]) in ("read", "write")]
+      decisions = [policy(n, i) for n, i in CASES]
+      print(decisions)
+      print([t["name"] for t in night_tools])
+    tests: |
+      d = check_object("decisions")
+      want = ["allow", "allow", "allow", "ask", "allow", "deny", "ask", "deny", "allow"]
+      labels = ["read sensor", "roster", "book B", "book F (EVA module)", "message crew", "message outside crew", "open airlock", "unknown tool", "handbook"]
+      for got, exp, lab in zip(d, want, labels):
+          assert got == exp, f"For '{lab}' the policy says {got!r}; it should say {exp!r}."
+      names = [t["name"] for t in user["night_tools"]]
+      assert "open_airlock" not in names, "The night assistant must not even see open_airlock: leave dangerous tools out of `night_tools`."
+      assert sorted(names) == sorted(["get_sensor", "sensor_history", "search_handbook", "crew_roster", "book_module", "send_message"]), f"`night_tools` should hold the six read and write tools; it holds {names}."
+    success_msg: |
+      Default deny caught the tool nobody planned for, the argument rules caught the message leaving the station and the
+      EVA-module booking, and the night assistant can't call `open_airlock` at all because it never sees it. None of this
+      depends on the model behaving.
+
+  - id: hide-or-gate
+    type: mc
+    title: Hide it or gate it?
+    question: |
+      The hydroponics assistant only ever reads sensors and books Module C. Someone suggests giving it every station tool,
+      including `open_airlock`, "because the approval gate will stop anything dangerous anyway". What's the best response?
+    options:
+      - text: "Don't expose `open_airlock` (or any tool it doesn't need) at all, and keep the gate for the tools it does have."
+        correct: true
+        feedback: "Right. Least privilege and gates are layers. A hidden tool can't be requested, can't spam the approval queue, and can't be triggered by a bug in the gate. Gate what the role genuinely needs."
+      - text: Expose everything; the gate is enough.
+        feedback: "Then a single gate bug, or a tired commander clicking 'approve', is all that stands between a hydroponics question and venting an airlock. Every unneeded tool is attack surface."
+      - text: Expose everything, but tell the model in the system prompt never to use `open_airlock`.
+        feedback: "Prompt instructions are guidance, not enforcement. A confused or manipulated model can still call any tool it can see."
+      - text: Expose `open_airlock` but remove the gate, so the assistant is faster.
+        feedback: "That gives an assistant with no reason to touch airlocks the ability to open them unchecked: the opposite of least privilege."
+    hint: Which option still holds if the gate has a bug?

@@ -1,0 +1,41 @@
+title: 'Capstone: Ship ORBIT'
+description: 'Bring the whole track together: build the Helios-7 station assistant ORBIT end to end,
+  with retrieval, tools over MCP, guardrails, an eval suite, red-teaming and production hardening,
+  and prove it with a launch report.'
+level: advanced
+est_hours: 4
+prerequisites:
+- mcp-integrations
+- ai-security-guardrails
+- llmops-production
+objectives:
+- Build a measured RAG pipeline over a real document set
+- Build a safe agent with tools served over MCP
+- Prove quality with an eval suite and a red-team run
+- Harden for production and report every metric against its target
+requires: []
+chapters:
+- id: mission-1-knowledge
+  title: 'Mission 1: Knowledge'
+  description: Ingest, index and answer with citations and refusals.
+  lessons:
+  - ingest-index
+  - grounded-answers
+- id: mission-2-agency
+  title: 'Mission 2: Agency'
+  description: An agent over MCP tools, safe by design.
+  lessons:
+  - orbit-agent
+  - safe-by-design
+- id: mission-3-quality
+  title: 'Mission 3: Quality'
+  description: Eval suite and red-team.
+  lessons:
+  - eval-suite
+  - red-team
+- id: mission-4-launch
+  title: 'Mission 4: Launch'
+  description: Tracing, reliability, cost and the launch report.
+  lessons:
+  - harden-and-measure
+  - launch-report

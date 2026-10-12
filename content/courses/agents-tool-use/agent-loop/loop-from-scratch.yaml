@@ -1,0 +1,182 @@
+title: An agent is a loop
+description: "Build the agent loop by hand: call, run tools, send results, repeat until the model stops asking."
+exercises:
+  - id: loop-slides
+    type: video
+    title: The loop behind every agent
+    slides: |
+      # An agent is a loop
+
+      Last chapter you did one round trip by hand. When the model needs **several** tools, and decides which one next from
+      what the last one returned, you keep going until it stops asking:
+
+      ```python
+      def run_agent(task, max_steps=10):
+          messages = [{"role": "user", "content": task}]
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model="claude-sonnet-5-5", max_tokens=1024,
+                                         tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return r                                  # the final answer
+              results = [execute(b) for b in r.content if b.type == "tool_use"]
+              messages.append({"role": "user", "content": results})
+          raise RuntimeError("step cap reached")
+      ```
+
+      That's the core of agent frameworks, coding assistants and ORBIT alike. Everything else (memory, planning,
+      guardrails) goes around these ten lines.
+
+      ---
+
+      ## One run, step by step
+
+      Task: *"Is the humidity in hydroponics normal?"*
+
+      | step | the model sees | it decides |
+      | --- | --- | --- |
+      | 1 | the task | `get_sensor(C, humidity)`: needs the reading |
+      | 2 | task, call 1, result `68.0 %` | `search_handbook("hydroponics humidity normal range")`: needs the limits |
+      | 3 | task, calls 1-2, both results | text: "68% is inside 60-75%, so it's normal" → `end_turn` |
+
+      Nobody wrote "read the sensor, then search the handbook". The model chose each step from the results so far.
+      That's the difference between an **agent** and a **workflow**, where your code fixes the steps (chapter 4).
+
+      ---
+
+      ## Stop reasons and what your loop does with each
+
+      | `stop_reason` | meaning | your loop |
+      | --- | --- | --- |
+      | `tool_use` | it wants tools run | run them, send the results, loop |
+      | `end_turn` | it's done | return the answer |
+      | `max_tokens` | the reply was cut off | if a `tool_use` was cut, its input is incomplete: retry with a larger `max_tokens`, don't run it |
+      | `stop_sequence` | hit one of your stop strings | treat it as done, or parse it |
+      | `pause_turn` | a long server-side tool paused | send the conversation back as it is to continue |
+      | `refusal` | it declined for safety reasons | stop, and show or log the refusal |
+
+      `while r.stop_reason == "tool_use"` alone treats a cut-off reply as a final answer. Handle the others explicitly.
+
+      ---
+
+      ## What a step costs
+
+      Every step resends **everything so far**: the system prompt, the tool definitions, the task, every call and every
+      result. If each step adds $t$ tokens to a base of $b$, step $n$ sends about $b + n t$ input tokens, and a run of
+      $N$ steps sends
+
+      $$N b + t \frac{N(N+1)}{2}$$
+
+      in total. Long runs get expensive fast, and long tool results make it worse (chapter 3). Latency adds up too: each
+      step is a full model call, and the user waits for all of them.
+
+  - id: loop-parsons
+    type: parsons
+    title: Assemble the loop
+    prompt: |
+      Arrange the lines into an agent loop that returns the full transcript (`messages`) when the model stops asking for
+      tools, and `None` if it runs out of steps.
+    hint: The model's turn has to be in `messages` before you return the transcript, and before you send results that point at it.
+    lines:
+      - "def run_agent(task, max_steps=10):"
+      - "    messages = [{\"role\": \"user\", \"content\": task}]"
+      - "    for step in range(max_steps):"
+      - "        r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)"
+      - "        messages.append({\"role\": \"assistant\", \"content\": r.content})"
+      - "        if r.stop_reason != \"tool_use\":"
+      - "            return messages"
+      - "        results = [execute(b) for b in r.content if b.type == \"tool_use\"]"
+      - "        messages.append({\"role\": \"user\", \"content\": results})"
+      - "    return None"
+
+  - id: humidity-agent
+    type: coding
+    title: ORBIT's first agent run
+    context: |
+      Kenji asks whether hydroponics humidity is normal. ORBIT needs the live reading **and** the normal range from the
+      handbook, so it takes two tool calls before it can answer. `execute(block)` runs one `tool_use` block on `station`
+      and returns its `tool_result` block. Write the loop.
+    instructions:
+      - "In `run_agent`, call the model with `messages` and `tools=TOOLS`, then append its turn to `messages`."
+      - "If `stop_reason` isn't `\"tool_use\"`, return `{\"answer\": <reply text>, \"steps\": step, \"messages\": messages}`."
+      - Otherwise run every `tool_use` block with `execute` and append all the results as one user message.
+      - Run it on `task`, store the result in `run`, and print the answer and the step count.
+    hint: |
+      Inside the loop:
+      `r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)`, then
+      `messages.append({"role": "assistant", "content": r.content})`. The results are
+      `[execute(b) for b in r.content if b.type == "tool_use"]`.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, orbit_agent, tool_result, ToolError, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      client = aikit.FakeClaude(orbit_agent(), clock=aikit.VirtualClock())
+      task = "Is the humidity in hydroponics normal?"
+
+      def execute(block):
+          try:
+              return tool_result(block.id, station.run_tool(block.name, block.input))
+          except ToolError as e:
+              return tool_result(block.id, f"Error: {e}", is_error=True)
+    sample_code: |
+      def run_agent(task, max_steps=10):
+          messages = [{"role": "user", "content": task}]
+          for step in range(1, max_steps + 1):
+              r = ____
+              messages.append(____)
+              if r.stop_reason != "tool_use":
+                  return {"answer": r.content[0].text, "steps": step, "messages": messages}
+              results = ____
+              messages.append(____)
+          return {"answer": None, "steps": max_steps, "messages": messages}
+
+      run = run_agent(task)
+      print(run["answer"])
+      print("steps:", run["steps"])
+    solution: |
+      def run_agent(task, max_steps=10):
+          messages = [{"role": "user", "content": task}]
+          for step in range(1, max_steps + 1):
+              r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return {"answer": r.content[0].text, "steps": step, "messages": messages}
+              results = [execute(b) for b in r.content if b.type == "tool_use"]
+              messages.append({"role": "user", "content": results})
+          return {"answer": None, "steps": max_steps, "messages": messages}
+
+      run = run_agent(task)
+      print(run["answer"])
+      print("steps:", run["steps"])
+    tests: |
+      from kits.agents_tool_use import task_ok
+      run = check_object("run")
+      tools_used = [a["tool"] for a in user["station"].actions]
+      assert tools_used == ["get_sensor", "search_handbook"], f"ORBIT should read the sensor, then search the handbook. The station saw: {tools_used}. Are you sending every result back and looping?"
+      assert run["steps"] == 3, f"The run should take 3 model calls (two tool steps and the answer); it took {run['steps']}."
+      roles = [m["role"] for m in run["messages"]]
+      assert roles == ["user", "assistant", "user", "assistant", "user", "assistant"], f"The transcript should alternate user/assistant and end with the final assistant turn; got {roles}."
+      assert task_ok(user["task"], run["answer"]), f"The answer should say whether the humidity is inside the normal range. Got: {run['answer']!r}"
+    success_msg: |
+      Two tools, chosen one after the other, and an answer neither result gave on its own. Print `run["messages"]` to see
+      how the context grew: by the last call the model was re-reading both results.
+
+  - id: max-tokens-mid-call
+    type: mc
+    title: A reply cut off mid-call
+    question: |
+      Your loop is `while r.stop_reason == "tool_use": ...`. A request comes back with `stop_reason == "max_tokens"`,
+      and its last block is a `tool_use` for `book_module` whose `input` is missing `crew` and `hours`. What should the
+      loop do?
+    options:
+      - text: Don't run the tool; retry the same request with a larger `max_tokens` (and log it, since it suggests the limit is too low).
+        correct: true
+        feedback: "Right. A truncated tool call is incomplete, so running it would act on half an instruction. Retrying with more room is cheap and safe. If it keeps happening, raise the default limit."
+      - text: Return the reply as the final answer, since the stop reason isn't `tool_use`.
+        feedback: "That's what the `while` loop does by accident: the crew gets a half-finished reply and the booking never happens. Handle `max_tokens` explicitly."
+      - text: Run `book_module` with the input it has and let the tool's validation complain.
+        feedback: "Acting on a cut-off instruction is risky. Here validation would catch it, but a truncated `send_message` text would go out half-written. Don't run incomplete calls."
+      - text: Send a `tool_result` saying the input was incomplete.
+        feedback: "The API only wants results for calls that finished. More importantly, the model didn't do anything wrong: your token limit cut it off. Give it room and retry."
+    hint: Was the tool call finished when the reply stopped?

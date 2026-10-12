@@ -1,0 +1,338 @@
+title: Rate limits
+description: How provider rate limits work, a token bucket built by hand, and surviving a 200-request burst without a single 429.
+exercises:
+  - id: rate-limits-slides
+    type: video
+    title: Stay under the limit instead of bouncing off it
+    slides: |
+      # How provider limits work
+
+      Providers limit each organisation, per model, on several axes at once:
+
+      - **requests per minute** (RPM)
+      - **input tokens per minute** and **output tokens per minute**
+
+      Capacity refills **continuously** (a token bucket on their side), not all at once on the minute. Go over and you
+      get a **429** with a `retry-after` header. Response headers also report what is left, so a client can slow down
+      *before* it hits the wall.
+
+      A 429 means **you** are sending too much. A 529 means the provider is overloaded. They need different fixes.
+
+      ---
+
+      ## Reacting vs preventing
+
+      | approach | 429s | wall time | wasted calls | with many workers |
+      | --- | --- | --- | --- | --- |
+      | fire everything, retry on 429 (honour `retry-after`) | many | can be fine for one client | one per 429 | storms: everyone retries together |
+      | **client-side limiter** (pace requests under the limit) | none | close to the minimum | none | needs one shared limiter |
+      | limiter **and** retry as a safety net | none, and safe if one slips | close to the minimum | rare | the production answer |
+
+      The minimum time is set by the limit: 200 requests at 50 RPM take at least 4 minutes, however clever the code.
+
+      ---
+
+      ## A token bucket by hand
+
+      A bucket holds up to `capacity` tokens and refills at `rate` tokens per second. Each request takes one token;
+      if the bucket is empty, wait until it has one.
+
+      ```python
+      class TokenBucket:
+          def __init__(self, rate_per_s, capacity, clock):
+              self.rate, self.capacity, self.clock = rate_per_s, capacity, clock
+              self.tokens, self.updated = capacity, clock.now()
+
+          def acquire(self, n=1):
+              self._refill()                                    # add rate x elapsed, up to capacity
+              if self.tokens < n:
+                  self.clock.sleep((n - self.tokens) / self.rate)   # exactly long enough
+                  self._refill()
+              self.tokens -= n
+      ```
+
+      `capacity` is the burst you allow; `rate` is the sustained pace. For a token-per-minute limit, call
+      `acquire(estimated_tokens)` on a second bucket.
+
+      ---
+
+      ## Headroom, workers and priorities
+
+      - Set the pace to about **90% of the limit**. Clock skew, latency jitter and other jobs sharing the key would
+        push you over at exactly 100%.
+      - **Four workers with a 50 RPM limiter each** send up to 200 RPM. Share one limiter (for example in Redis)
+        or give each worker a quarter.
+      - When demand exceeds the limit, a limiter turns 429s into **queueing**. Use a priority queue so emergency
+        questions do not wait behind the weekly report, and move offline work to the batch API.
+
+      ---
+
+      ## Playbook: 429s under load
+
+      1. **Symptom:** a burst of "ORBIT is busy" replies (day 11 in the traces).
+      2. **Measure:** errors by type per minute, and attempted requests per minute vs your limit.
+      3. **Diagnose:** a traffic burst? Retries multiplying the load? Several workers each assuming the full limit?
+      4. **Fix, in order:** backoff with jitter (stop making it worse) → a shared client-side limiter at ~90% →
+         a queue with priorities → fewer or smaller requests (caching, batching) → ask for a higher limit.
+      5. **Verify:** zero 429s at the same load, and total time close to the minimum the limit allows.
+
+  - id: token-bucket
+    type: coding
+    title: Build a token bucket
+    context: |
+      Build the limiter on a virtual clock: `clock.now()` gives seconds and `clock.sleep(s)` moves time forward.
+    instructions:
+      - "Write `_refill()`: add `(now - self.updated) * self.rate` tokens, never more than `capacity`, then set `self.updated = now`."
+      - "Write `acquire(n=1)`: refill; if fewer than `n` tokens are left, sleep exactly long enough for the missing ones to arrive, and refill again; then take `n` tokens."
+      - "Use it to pace 6 requests at 2 per second with capacity 1: store the clock time at each `acquire` in `times`."
+    hint: |
+      The wait is `(n - self.tokens) / self.rate`. `self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)`.
+    pre_code: |
+      import aikit
+      clk = aikit.VirtualClock()
+    sample_code: |
+      class TokenBucket:
+          def __init__(self, rate_per_s, capacity, clock):
+              self.rate, self.capacity, self.clock = rate_per_s, capacity, clock
+              self.tokens = capacity
+              self.updated = clock.now()
+
+          def _refill(self):
+              now = self.clock.now()
+              self.tokens = ____
+              self.updated = now
+
+          def acquire(self, n=1):
+              self._refill()
+              if self.tokens < n:
+                  self.clock.sleep(____)
+                  self._refill()
+              self.tokens -= n
+
+      bucket = TokenBucket(rate_per_s=2, capacity=1, clock=clk)
+      times = []
+      for _ in range(6):
+          bucket.acquire()
+          times.append(____)
+      print(times)
+    solution: |
+      class TokenBucket:
+          def __init__(self, rate_per_s, capacity, clock):
+              self.rate, self.capacity, self.clock = rate_per_s, capacity, clock
+              self.tokens = capacity
+              self.updated = clock.now()
+
+          def _refill(self):
+              now = self.clock.now()
+              self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+              self.updated = now
+
+          def acquire(self, n=1):
+              self._refill()
+              if self.tokens < n:
+                  self.clock.sleep((n - self.tokens) / self.rate)
+                  self._refill()
+              self.tokens -= n
+
+      bucket = TokenBucket(rate_per_s=2, capacity=1, clock=clk)
+      times = []
+      for _ in range(6):
+          bucket.acquire()
+          times.append(clk.now())
+      print(times)
+    tests: |
+      import aikit
+      check_object("times")
+      assert all(abs(a - b) < 1e-9 for a, b in zip(user["times"], [0, 0.5, 1.0, 1.5, 2.0, 2.5])) and len(user["times"]) == 6, f"At 2 per second with capacity 1, the 6 acquires should happen at 0, 0.5, ... 2.5 s; got {user['times']}."
+      TB = user["TokenBucket"]
+      c = aikit.VirtualClock()
+      b = TB(rate_per_s=1.0, capacity=3, clock=c)
+      for _ in range(3):
+          b.acquire()
+      assert c.now() == 0, "A full bucket of 3 should allow 3 acquires without waiting."
+      b.acquire()
+      assert abs(c.now() - 1.0) < 1e-9, f"The 4th acquire at 1 token/s should wait exactly 1 s; the clock is at {c.now()}."
+      c.sleep(100)
+      for _ in range(3):
+          b.acquire()
+      assert abs(c.now() - 101.0) < 1e-9, "After a long idle time the bucket should hold `capacity` tokens (3), not more and not fewer."
+      b.acquire()
+      assert abs(c.now() - 102.0) < 1e-9, "Once the refilled tokens are used up, wait for the next one: the bucket must never go above `capacity`."
+      c2 = aikit.VirtualClock()
+      b2 = TB(rate_per_s=0.5, capacity=2, clock=c2)
+      b2.acquire(2)
+      b2.acquire(2)
+      assert abs(c2.now() - 4.0) < 1e-9, "`acquire(n)` should wait for n tokens: 2 tokens at 0.5/s take 4 s."
+    success_msg: |
+      Six requests, evenly spaced 0.5 s apart, with no wasted calls and no 429s. Capacity sets how big a burst is
+      allowed; rate sets the long-run pace.
+
+  - id: burst-mission
+    type: sequential
+    title: "Mission: the 200-request burst"
+    context: |
+      At 07:00 every module's display asks ORBIT for its morning status: **200 requests at once**. ORBIT's key allows
+      **50 requests per minute** (`client` enforces it on the virtual clock `clk`). Last time, most displays showed
+      "ORBIT is busy". Measure the problem, size the fix, and prove zero 429s. `TokenBucket` (your limiter) and
+      `call_with_retry` (backoff with jitter, `retry-after` as a floor) are ready.
+    pre_code: |
+      import random
+      from kits.llmops_production import OpsClaude, VirtualClock, SMALL, SYSTEM, CONCISE, EVAL, RateLimitError
+      QUESTIONS = [EVAL[i % len(EVAL)]["question"] for i in range(200)]
+      LIMIT_RPM = 50
+
+      def make_kwargs(q):
+          return {"model": SMALL, "max_tokens": 300, "system": SYSTEM + "\n" + CONCISE,
+                  "messages": [{"role": "user", "content": q}]}
+
+      class TokenBucket:
+          def __init__(self, rate_per_s, capacity, clock):
+              self.rate, self.capacity, self.clock = rate_per_s, capacity, clock
+              self.tokens, self.updated = capacity, clock.now()
+          def _refill(self):
+              now = self.clock.now()
+              self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+              self.updated = now
+          def acquire(self, n=1):
+              self._refill()
+              if self.tokens < n:
+                  self.clock.sleep((n - self.tokens) / self.rate)
+                  self._refill()
+              self.tokens -= n
+
+      def call_with_retry(client, clock, max_attempts=6, **kwargs):
+          for attempt in range(max_attempts):
+              try:
+                  return client.messages.create(**kwargs)
+              except RateLimitError as e:
+                  if attempt == max_attempts - 1:
+                      raise
+                  clock.sleep(max(random.uniform(0, min(8, 0.5 * 2 ** attempt)), e.retry_after or 0))
+
+      clk = VirtualClock()
+      client = OpsClaude(rpm_limit=LIMIT_RPM, clock=clk)
+    steps:
+      - instructions:
+          - "**Measure.** Send all 200 `QUESTIONS` as fast as possible with `client.messages.create(**make_kwargs(q))`, catching `RateLimitError` (no retries). Count the successes in `answered`."
+          - "Store `error_rate` (failed calls / all calls in `client.calls`) and `attempt_rpm` (all calls divided by the elapsed minutes, `clk.now() / 60`)."
+        hint: |
+          `try: client.messages.create(**make_kwargs(q)); answered += 1` / `except RateLimitError: pass`. Failed calls
+          have a non-empty `"error"` in `client.calls`.
+        sample_code: |
+          answered = 0
+          for q in QUESTIONS:
+              try:
+                  ____
+                  answered += 1
+              except RateLimitError:
+                  pass
+
+          calls = client.calls
+          error_rate = ____
+          attempt_rpm = ____
+          print(f"{answered} answered; {error_rate:.0%} of calls got 429; attempted {attempt_rpm:.0f} requests/min vs a limit of {LIMIT_RPM}")
+        solution: |
+          answered = 0
+          for q in QUESTIONS:
+              try:
+                  client.messages.create(**make_kwargs(q))
+                  answered += 1
+              except RateLimitError:
+                  pass
+
+          calls = client.calls
+          error_rate = sum(1 for c in calls if c["error"]) / len(calls)
+          attempt_rpm = len(calls) / (clk.now() / 60)
+          print(f"{answered} answered; {error_rate:.0%} of calls got 429; attempted {attempt_rpm:.0f} requests/min vs a limit of {LIMIT_RPM}")
+        tests: |
+          check_equal("answered", msg="Count the requests that did not raise RateLimitError.")
+          check_equal("error_rate", tol=1e-6, msg="`error_rate` is the share of `client.calls` with an error.")
+          check_equal("attempt_rpm", tol=1e-6, msg="`attempt_rpm` is len(client.calls) / (clk.now() / 60).")
+      - instructions:
+          - "**Diagnose and size.** Store `overload`: `attempt_rpm / LIMIT_RPM`, and `min_minutes`: the least time 200 requests can take at the limit."
+          - "Choose the limiter: store `rate_per_s` at 90% of the limit (in requests per second) and `capacity` as a small burst, 5 at most."
+        hint: |
+          `min_minutes = len(QUESTIONS) / LIMIT_RPM`. 90% of 50 per minute is 45 per minute, which is `0.9 * LIMIT_RPM / 60` per second.
+        sample_code: |
+          overload = ____
+          min_minutes = ____
+          rate_per_s = ____
+          capacity = ____
+          print(f"{overload:.0f}x over the limit; at best {min_minutes:.1f} min; pacing at {rate_per_s * 60:.0f}/min")
+        solution: |
+          overload = attempt_rpm / LIMIT_RPM
+          min_minutes = len(QUESTIONS) / LIMIT_RPM
+          rate_per_s = 0.9 * LIMIT_RPM / 60
+          capacity = 1
+          print(f"{overload:.0f}x over the limit; at best {min_minutes:.1f} min; pacing at {rate_per_s * 60:.0f}/min")
+        tests: |
+          check_equal("overload", tol=1e-6)
+          check_equal("min_minutes", tol=1e-6, msg="At 50 requests per minute, 200 requests take at least 200 / 50 minutes.")
+          check_object("rate_per_s")
+          assert 0.6 <= user["rate_per_s"] <= 0.8, f"`rate_per_s` is {user['rate_per_s']:.3f} requests per second. The limit is 50/60 = 0.83 per second; pace a little below it (about 0.75)."
+          assert 1 <= user["capacity"] <= 5, "Keep `capacity` between 1 and 5: a big burst on top of the steady rate can break the per-minute limit."
+      - instructions:
+          - "**Fix.** With a fresh clock `clk2` and client `client2` (created for you) and `bucket = TokenBucket(rate_per_s, capacity, clk2)`, send every question: `bucket.acquire()`, then `call_with_retry(client2, clk2, **make_kwargs(q))`. Collect the replies in `replies`."
+        hint: |
+          `for q in QUESTIONS: bucket.acquire(); replies.append(call_with_retry(client2, clk2, **make_kwargs(q)))`.
+        sample_code: |
+          clk2 = VirtualClock()
+          client2 = OpsClaude(rpm_limit=LIMIT_RPM, clock=clk2)
+          bucket = ____
+          replies = []
+          for q in QUESTIONS:
+              ____
+              replies.append(call_with_retry(client2, clk2, **make_kwargs(q)))
+          print(f"{len(replies)} replies in {clk2.now() / 60:.1f} min")
+        solution: |
+          clk2 = VirtualClock()
+          client2 = OpsClaude(rpm_limit=LIMIT_RPM, clock=clk2)
+          bucket = TokenBucket(rate_per_s, capacity, clk2)
+          replies = []
+          for q in QUESTIONS:
+              bucket.acquire()
+              replies.append(call_with_retry(client2, clk2, **make_kwargs(q)))
+          print(f"{len(replies)} replies in {clk2.now() / 60:.1f} min")
+        tests: |
+          check_object("replies")
+          assert len(user["replies"]) == 200, "Every one of the 200 questions should get a reply."
+          n429 = sum(1 for c in user["client2"].calls if c["error"] == "rate_limit")
+          assert n429 == 0, f"{n429} calls still got a 429. Call `bucket.acquire()` before every request, and pace below the limit."
+          minutes = user["clk2"].now() / 60
+          assert minutes <= 5.0, f"The burst took {minutes:.1f} minutes; it should finish within 5 (the limit allows 4). Is the rate too low?"
+      - instructions:
+          - "**Verify.** Store `max_in_window`: the largest number of successful calls in `client2.calls` whose `t` falls in any 60-second window (start each window at a call's `t`)."
+          - "Store `report`: a dict with `errors_before` (the 429 count from step 1), `errors_after` (0 if all went well) and `minutes_after`."
+        hint: |
+          `ts = sorted(c["t"] for c in client2.calls if not c["error"])`, then for each `t0` in `ts` count
+          `sum(1 for t in ts if t0 <= t < t0 + 60)` and take the max.
+        sample_code: |
+          ts = sorted(c["t"] for c in client2.calls if not c["error"])
+          max_in_window = ____
+          report = {
+              "errors_before": ____,
+              "errors_after": ____,
+              "minutes_after": clk2.now() / 60,
+          }
+          print(max_in_window, report)
+        solution: |
+          ts = sorted(c["t"] for c in client2.calls if not c["error"])
+          max_in_window = max(sum(1 for t in ts if t0 <= t < t0 + 60) for t0 in ts)
+          report = {
+              "errors_before": sum(1 for c in client.calls if c["error"] == "rate_limit"),
+              "errors_after": sum(1 for c in client2.calls if c["error"] == "rate_limit"),
+              "minutes_after": clk2.now() / 60,
+          }
+          print(max_in_window, report)
+        tests: |
+          check_equal("max_in_window", msg="For each successful call time t0, count the successful calls with t0 <= t < t0 + 60, and take the largest count.")
+          assert user["max_in_window"] <= 50, "No 60-second window may hold more than 50 calls."
+          check_object("report")
+          r = user["report"]
+          assert r.get("errors_before") == sol["report"]["errors_before"], f"`errors_before` should be the number of 429s in step 1: {sol['report']['errors_before']}."
+          assert r.get("errors_after") == 0, "`errors_after` should be 0."
+          assert abs(r.get("minutes_after", -1) - user["clk2"].now() / 60) < 1e-9, "`minutes_after` is clk2.now() / 60."
+    success_msg: |
+      From 150 "busy" errors to none, in under 5 minutes against a hard floor of 4. You measured the overload
+      (about 13x the limit), sized the limiter from the limit with headroom, and verified with the metric the provider
+      enforces: no 60-second window above 50 calls. The retry stays as a safety net, not as the plan.

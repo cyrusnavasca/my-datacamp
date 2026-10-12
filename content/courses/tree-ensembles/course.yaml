@@ -1,0 +1,30 @@
+title: Tree-Based Models and Boosting
+description: 'Decision trees, random forests and gradient boosting: how they work, how to tune them and
+  how to explain them.'
+level: advanced
+est_hours: 4
+prerequisites:
+- feature-engineering-evaluation
+objectives:
+- Train and interpret decision trees
+- Use bagging and random forests
+- Tune gradient boosting models
+- Explain predictions with feature importance and partial dependence
+requires: []
+chapters:
+- id: trees
+  title: Decision trees
+  description: Splits, impurity, depth and overfitting.
+  lessons: []
+- id: bagging-forests
+  title: Bagging and random forests
+  description: Bootstrap aggregation and out-of-bag scores.
+  lessons: []
+- id: boosting
+  title: Gradient boosting
+  description: AdaBoost, gradient boosting and HistGradientBoosting.
+  lessons: []
+- id: interpretation
+  title: Interpreting models
+  description: Permutation importance and partial dependence.
+  lessons: []

@@ -1,0 +1,316 @@
+title: Caching and model routing
+description: How prompt caching works and what silently breaks it, why semantic caches can lie, routing vs cascades, then a budget-meter challenge.
+exercises:
+  - id: caching-routing-slides
+    type: video
+    title: Do less work, or cheaper work
+    slides: |
+      # Prompt caching, underneath
+
+      Before writing a reply, the model computes internal state (keys and values) for every prompt token: that is
+      prefill. With **prompt caching** the provider stores that state for a prefix of your prompt. The next request
+      that starts with **exactly the same prefix** reuses it instead of recomputing it.
+
+      ```python
+      r = client.messages.create(
+          model="claude-sonnet-5-5", max_tokens=600,
+          system=[{"type": "text", "text": RULES + HANDBOOK,
+                   "cache_control": {"type": "ephemeral"}}],      # cache everything up to here
+          messages=[{"role": "user", "content": question}],
+      )
+      r.usage.cache_creation_input_tokens   # written to the cache on this call (1.25x input price)
+      r.usage.cache_read_input_tokens       # read from the cache (0.1x input price)
+      ```
+
+      - The prefix is built in order: **tools → system → messages**. The match is exact, token for token.
+      - There is a minimum cacheable length (1,024 tokens here; it depends on the model).
+      - Entries expire after about 5 minutes unused (each hit refreshes them). Longer lifetimes exist at a higher write price.
+
+      ---
+
+      ## Break-even, and what breaks caching
+
+      For $n$ calls within the lifetime, the prefix costs $1.25 + 0.1(n-1)$ input-prices instead of $n$.
+      It pays off from the **second** call.
+
+      Things that silently turn every call into a cache **write** (so you pay 25% *more* than no caching):
+
+      | mistake | fix |
+      | --- | --- |
+      | a timestamp, request id or user name at the top of the system prompt | move it to the end (the user message) |
+      | tools listed in a different order per request | sort them once |
+      | editing one document in the middle of the prefix | everything after the change misses; put volatile docs last |
+      | traffic too sparse for the lifetime | caching does not help; check the hit rate |
+
+      **Measure the hit rate**: the share of calls with `cache_read_input_tokens > 0`.
+
+      ---
+
+      ## Response caching: skip the call entirely
+
+      | | exact cache | semantic cache |
+      | --- | --- | --- |
+      | key | normalised question (lowercase, no punctuation) + model + prompt version + handbook version | the question's embedding; hit if cosine ≥ threshold |
+      | hits | exact repeats only | paraphrases too |
+      | failure mode | stale answers if the key misses a version | **wrong answers** for questions that look alike but differ in one detail |
+
+      With the course embedder, *"leak-check hold on **AL-1**"* vs *"... on **AL-2**"* score a cosine of **1.00**.
+      Similar wording, different airlock. Semantic caches suit FAQ-style traffic where near-duplicates really
+      do have the same answer; guard them with exact checks on the details that matter (ids, numbers, names).
+
+      ---
+
+      ## Routing vs cascades
+
+      | | router | cascade |
+      | --- | --- | --- |
+      | how | decide the model **before** the call (rules or a classifier on the question) | call the **small model first**; escalate when it is not confident |
+      | cost | $c_\text{small}$ or $c_\text{large}$ per request | $c_\text{small} + e \cdot c_\text{large}$ ($e$ = escalation rate) |
+      | latency | one call | escalated requests pay for two calls |
+      | fails when | the router misjudges a hard question as easy | the small model is **confidently wrong** |
+      | needs | features that predict difficulty | a confidence signal: an UNSURE reply, a failed validation, a judge |
+
+      ---
+
+      ## ORBIT's cost levers, measured on the eval set
+
+      | change | cost vs baseline | accuracy | p95 |
+      | --- | --- | --- | --- |
+      | baseline (Sonnet, verbose, no cache) | 100% | 100% | 5.1 s |
+      | brief answers | 82% | 100% | 0.9 s |
+      | prompt caching | 30% | 100% | 4.9 s |
+      | everything on Haiku | 33% | 73% | 2.2 s |
+      | keyword router (multi-part or "why/what should" → Sonnet) | 50% | 95% | 4.2 s |
+      | cascade (Haiku first, escalate on UNSURE) | 59% | 95% | |
+
+      No single lever gets cost below a quarter at 90% accuracy. **Levers stack**, because they shrink different
+      buckets. The last exercise asks you to combine them.
+
+  - id: prompt-cache
+    type: coding
+    title: "Troubleshoot: the cache that never hits"
+    context: |
+      ORBIT already sets `cache_control`, yet the bill did not drop. `ask_current(q)` is the production code: it puts
+      the station time at the top of the system prompt. `measure(ask)` runs 10 eval questions through `ask` and
+      returns the number of cache hits, the cost, the mean TTFT and the number of correct answers.
+    instructions:
+      - "Store `current = measure(ask_current)`."
+      - "Write `ask_fixed(q)`: the same call, but with the cache breakpoint on `SYSTEM` alone and the station time moved to the start of the user message."
+      - "Store `fixed = measure(ask_fixed)` and `saving`: `1 - fixed[\"cost\"] / current[\"cost\"]`."
+    hint: |
+      `system=[{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]` and
+      `"content": f"Station time: {clk.now():.1f} s\n{q}"`.
+    pre_code: |
+      from kits.llmops_production import make_client, MODEL, SYSTEM, EVAL, grade, VirtualClock
+      clk = VirtualClock()
+      client = make_client(clock=clk)
+
+      def ask_current(q):
+          system = [{"type": "text", "text": f"Station time: {clk.now():.1f} s\n" + SYSTEM,
+                     "cache_control": {"type": "ephemeral"}}]
+          return client.messages.create(model=MODEL, max_tokens=600, system=system,
+                                        messages=[{"role": "user", "content": q}])
+
+      def measure(ask):
+          start, correct = len(client.calls), 0
+          for item in EVAL[:10]:
+              correct += grade(item, ask(item["question"]).text)
+          calls = client.calls[start:]
+          return {"hits": sum(c["cache_read_input_tokens"] > 0 for c in calls),
+                  "cost": sum(c["cost"] for c in calls),
+                  "ttft_ms": sum(c["ttft_ms"] for c in calls) / len(calls),
+                  "correct": correct}
+    sample_code: |
+      current = ____
+      print("current:", current)
+
+      def ask_fixed(q):
+          system = [{"type": "text", "text": ____, "cache_control": {"type": "ephemeral"}}]
+          return client.messages.create(model=MODEL, max_tokens=600, system=system,
+                                        messages=[{"role": "user", "content": ____}])
+
+      fixed = ____
+      saving = ____
+      print("fixed:  ", fixed)
+      print(f"saving: {saving:.0%}")
+    solution: |
+      current = measure(ask_current)
+      print("current:", current)
+
+      def ask_fixed(q):
+          system = [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}]
+          return client.messages.create(model=MODEL, max_tokens=600, system=system,
+                                        messages=[{"role": "user", "content": f"Station time: {clk.now():.1f} s\n{q}"}])
+
+      fixed = measure(ask_fixed)
+      saving = 1 - fixed["cost"] / current["cost"]
+      print("fixed:  ", fixed)
+      print(f"saving: {saving:.0%}")
+    tests: |
+      check_object("current")
+      assert user["current"]["hits"] == 0, "`current` should come from `measure(ask_current)`: the timestamp makes every prefix different, so it gets 0 hits."
+      check_object("fixed")
+      f = user["fixed"]
+      assert f["hits"] == 9, f"`fixed` should get 9 cache hits out of 10 (the first call writes the cache); it got {f['hits']}. Put only SYSTEM in the cached block and move the time into the user message."
+      assert f["correct"] == 10, "All 10 answers should still be correct: keep the question in the user message."
+      check_equal("saving", tol=1e-3, msg="`saving` is 1 - fixed cost / current cost.")
+    success_msg: |
+      The "cached" production code was the most expensive option of all: every call paid the 25% write premium and
+      none ever read. Moving one line cut the cost by about two thirds and TTFT by about 130 ms, with identical
+      answers. When caching "doesn't work", check the hit rate before anything else.
+
+  - id: semantic-cache-trap
+    type: mc
+    title: When a semantic cache lies
+    question: |
+      A semantic cache holds ORBIT's answer to *"When do the hydroponics watering cycles run?"* (**06:00 and 18:00**).
+      It serves that answer to any new question whose cosine similarity is at or above a threshold. The console
+      prints the similarity of three incoming questions. Which threshold makes this cache safe?
+    pre_code: |
+      import aikit
+      cached_q = "When do the hydroponics watering cycles run?"
+      incoming = ["What time do the hydroponics watering cycles run?",   # same question, reworded
+                  "When do the hydroponics watering cycles stop?",       # different question
+                  "How often are scrubber beds swapped?"]                # unrelated
+      def sim(a, b):
+          return float(aikit.embed(a) @ aikit.embed(b))
+      for q in incoming:
+          print(f"{sim(cached_q, q):.3f}  {q}")
+    options:
+      - text: "0.90"
+        feedback: The reworded question (0.954) gets the right answer, but the "stop" question (0.976) also gets the start times, which is wrong.
+      - text: "0.95"
+        feedback: Same problem. The wrong question scores 0.976, higher than the true paraphrase at 0.954, so any threshold that admits the paraphrase admits the wrong one too.
+      - text: "0.97"
+        feedback: This is the worst of both worlds. The true paraphrase (0.954) misses the cache, and the wrong question (0.976) still hits it.
+      - text: No threshold is safe here. Add an exact check on the words that change the meaning, or only use semantic caching for vetted FAQ entries.
+        correct: true
+        feedback: "Right. Embeddings capture topic, not every detail: 'run' vs 'stop', 'AL-1' vs 'AL-2' (cosine 1.00 with this embedder). When the wrong match outranks the right one, no threshold can separate them. Common guards: require the same entities and numbers, cache only curated questions, or use the semantic hit as a suggestion that a cheap model verifies."
+    hint: Run the console. Is there any number that is above the paraphrase's score but below the wrong question's? Which way round would it need to be?
+
+  - id: cascade
+    type: coding
+    title: A small-first cascade
+    context: |
+      A cascade tries the small, cheap model first and escalates to Sonnet only when the small model is unsure.
+      `orbit_model` lets the small model reply `UNSURE` if the system prompt allows it. `BASELINE` is the summary of
+      the all-Sonnet run (`BASELINE["cost"]` is its total cost).
+    instructions:
+      - "Complete `cascade(question)`: call `SMALL` with `SYSTEM + \"\\n\" + UNSURE_RULE`. If the reply text is exactly `UNSURE` (after `.strip()`), call `MODEL` with plain `SYSTEM` and return `(text, MODEL)`; otherwise return `(text, SMALL)`."
+      - "Run it on every EVAL question. Store `accuracy` (share graded correct), `escalation_rate` (share answered by `MODEL`) and `cost_ratio` (`client.total_cost() / BASELINE[\"cost\"]`)."
+      - "Store `missed`: the ids of the questions the cascade got wrong."
+    hint: |
+      Both calls use `max_tokens=600`. Loop with `for item in EVAL:` and keep lists of answers and models; compare
+      with `grade(item, text)`.
+    pre_code: |
+      from kits.llmops_production import make_client, run_eval, summarize, MODEL, SMALL, SYSTEM, EVAL, grade
+      BASELINE = summarize(run_eval(make_client()))
+      client = make_client()
+      UNSURE_RULE = "If you are not certain of the answer, reply with only the word UNSURE."
+    sample_code: |
+      def cascade(question):
+          msgs = [{"role": "user", "content": question}]
+          r = client.messages.create(model=SMALL, max_tokens=600, system=SYSTEM + "\n" + UNSURE_RULE, messages=msgs)
+          if ____:
+              r = client.messages.create(model=____, max_tokens=600, system=SYSTEM, messages=msgs)
+              return r.text, MODEL
+          return r.text, SMALL
+
+      results = [cascade(item["question"]) for item in EVAL]
+      accuracy = ____
+      escalation_rate = ____
+      cost_ratio = ____
+      missed = ____
+      print(f"accuracy {accuracy:.0%}, escalated {escalation_rate:.0%}, cost {cost_ratio:.0%} of baseline")
+      print("missed:", missed)
+    solution: |
+      def cascade(question):
+          msgs = [{"role": "user", "content": question}]
+          r = client.messages.create(model=SMALL, max_tokens=600, system=SYSTEM + "\n" + UNSURE_RULE, messages=msgs)
+          if r.text.strip() == "UNSURE":
+              r = client.messages.create(model=MODEL, max_tokens=600, system=SYSTEM, messages=msgs)
+              return r.text, MODEL
+          return r.text, SMALL
+
+      results = [cascade(item["question"]) for item in EVAL]
+      accuracy = sum(grade(item, text) for item, (text, _) in zip(EVAL, results)) / len(EVAL)
+      escalation_rate = sum(model == MODEL for _, model in results) / len(EVAL)
+      cost_ratio = client.total_cost() / BASELINE["cost"]
+      missed = [item["id"] for item, (text, _) in zip(EVAL, results) if not grade(item, text)]
+      print(f"accuracy {accuracy:.0%}, escalated {escalation_rate:.0%}, cost {cost_ratio:.0%} of baseline")
+      print("missed:", missed)
+    tests: |
+      check_object("cascade")
+      check_equal("accuracy", tol=1e-6, msg="`accuracy` is the share of EVAL questions whose cascade answer passes `grade`. If it is low, check that you escalate when the text is exactly 'UNSURE'.")
+      check_equal("escalation_rate", tol=1e-6, msg="`escalation_rate` is the share of questions answered by MODEL.")
+      check_equal("cost_ratio", tol=1e-6, msg="`cost_ratio` is client.total_cost() / BASELINE['cost'].")
+      check_equal("missed", msg=f"`missed` should list the ids answered wrongly: {sol['missed']}.")
+    success_msg: |
+      95% accuracy at about 59% of the cost, with 11 of 41 questions escalated. The two misses (q14, q17) are where
+      the small model was **confidently wrong**: a cascade is only as good as its confidence signal. The escalated
+      requests also paid for two calls, so their latency went up.
+
+  - id: budget-meter
+    type: coding
+    title: "Budget meter: cut the cost by 75%"
+    context: |
+      Command's order: ORBIT must cost **at most 25% of the baseline** (`BASELINE_COST`, about $0.593 for the eval set)
+      while staying **at least 90% accurate**. Every call through `client` is metered. Any approach that meets both
+      targets passes: combine what you learned in this chapter.
+    instructions:
+      - "Fill in `pick_model`, `build_system` and `max_tokens`, or rewrite `answer(question)` completely. It must return ORBIT's answer text and use only `client` (any models, prompts, caching, routing or cascades you like)."
+      - "Keep the last two lines: they answer every EVAL question once and print the meter."
+    hint: |
+      Look at the measured levers on the last slide: caching shrinks the handbook bucket, brevity the output bucket,
+      routing or a cascade the price per token. Two of them together are enough. For caching, pass
+      `system=[{"type": "text", "text": ..., "cache_control": {"type": "ephemeral"}}]`.
+    pre_code: |
+      import re
+      from kits.llmops_production import (make_client, run_eval, summarize, MODEL, SMALL, SYSTEM, CONCISE,
+                                          EVAL, grade)
+      BASELINE_COST = summarize(run_eval(make_client()))["cost"]
+      client = make_client()
+    sample_code: |
+      def pick_model(question):
+          # return MODEL or SMALL (or always MODEL)
+          return ____
+
+      def build_system():
+          # a string, or a list of blocks with "cache_control"
+          return ____
+
+      def answer(question):
+          r = client.messages.create(model=pick_model(question), max_tokens=____, system=build_system(),
+                                     messages=[{"role": "user", "content": question}])
+          return r.text
+
+      answers = [answer(item["question"]) for item in EVAL]
+      print(f"cost {client.total_cost() / BASELINE_COST:.0%} of baseline, "
+            f"accuracy {sum(grade(i, a) for i, a in zip(EVAL, answers)) / len(EVAL):.0%}")
+    solution: |
+      HARD = re.compile(r"\band\b|\bshould\b|\bhappens?\b|\bcaused?\b|\bwhy\b", re.I)
+      CACHED_SYSTEM = [{"type": "text", "text": SYSTEM + "\n" + CONCISE, "cache_control": {"type": "ephemeral"}}]
+
+      def answer(question):
+          model = MODEL if HARD.search(question) else SMALL
+          r = client.messages.create(model=model, max_tokens=300, system=CACHED_SYSTEM,
+                                     messages=[{"role": "user", "content": question}])
+          return r.text
+
+      answers = [answer(item["question"]) for item in EVAL]
+      print(f"cost {client.total_cost() / BASELINE_COST:.0%} of baseline, "
+            f"accuracy {sum(grade(i, a) for i, a in zip(EVAL, answers)) / len(EVAL):.0%}")
+    tests: |
+      check_object("answers")
+      ans = user["answers"]
+      assert len(ans) == 41, "Keep the line that answers every EVAL question once."
+      ok_calls = [c for c in user["client"].calls if not c["error"]]
+      assert len(ok_calls) >= 41, "Every answer has to come from a call to `client`, at least one per question."
+      EVAL, grade = user["EVAL"], user["grade"]
+      acc = sum(grade(i, str(a)) for i, a in zip(EVAL, ans)) / len(EVAL)
+      ratio = user["client"].total_cost() / user["BASELINE_COST"]
+      assert acc >= 0.90, f"Accuracy is {acc:.0%}; it must be at least 90%. If you route to the small model, keep hard (multi-part, why/what-should) questions on Sonnet, or escalate on UNSURE."
+      assert ratio <= 0.25, f"Cost is {ratio:.0%} of the baseline; it must be at most 25%. Which bucket is still big? Cache the handbook prefix, ask for brief answers, or send easy questions to the small model, and combine them."
+    success_msg: |
+      Under budget and still accurate. Note which levers you combined and how much each contributed: that table is
+      what you would show the commander, and the eval set is how you prove nothing broke.

@@ -1,0 +1,30 @@
+title: Python for Data Science
+description: 'The Python you need for data work: variables and types, lists and dictionaries, functions
+  and packages, and fast numeric arrays with NumPy.'
+level: beginner
+est_hours: 4
+prerequisites: []
+objectives:
+- Write and run small Python scripts with confidence
+- Store and slice data in lists and dictionaries
+- Use functions, methods and packages
+- Do vectorised maths on NumPy arrays
+requires: []
+chapters:
+- id: python-basics
+  title: Python basics
+  description: Values, variables, types and doing arithmetic.
+  lessons:
+  - first-steps
+- id: lists-and-dicts
+  title: Lists and dictionaries
+  description: Store collections, slice them, and look things up by key.
+  lessons: []
+- id: functions-packages
+  title: Functions and packages
+  description: Call built-ins and methods, write your own functions, import packages.
+  lessons: []
+- id: numpy
+  title: NumPy arrays
+  description: Fast arrays, boolean masks, 2D arrays and summary statistics.
+  lessons: []

@@ -1,0 +1,48 @@
+feature,area,priority,original,clone,notes
+Dashboard with resume-where-you-left-off,dashboard,must,yes,yes,
+Tracks list with progress,catalog,must,yes,yes,Data Science/ML and AI Engineering first
+Track detail with ordered courses,catalog,must,yes,yes,
+Course detail with chapter/lesson outline,catalog,must,yes,yes,
+Exercise player shell (header progress dots XP next/prev),player,must,yes,yes,
+Video/slides exercise (markdown slides),player,must,yes,yes,original uses recorded video; clone uses markdown slides; markdown slides with math; no recorded video
+Coding exercise: context instructions sample code,player,must,yes,yes,
+Code editor with syntax highlighting,player,must,yes,yes,"CodeMirror 6, ____ blanks highlighted"
+Run code and show console output,player,must,yes,yes,local Python runner; fresh process per run; 30s timeout
+Submit code checked by tests (SCT),player,must,yes,yes,python test helpers in runner/harness.py
+Feedback message on wrong submission,player,must,yes,yes,
+Success message and XP on correct submission,player,must,yes,yes,
+Hint with XP penalty,player,must,yes,yes,-30%
+Show solution with XP penalty,player,must,yes,yes,"-70%; only after hint, like the original"
+Multiple choice exercise with per-option feedback,player,must,yes,yes,
+Progress saved per exercise,progress,must,yes,yes,SQLite data/progress.db
+Chapter and course completion,progress,must,yes,yes,chapter modal + course complete page
+XP total,progress,must,yes,yes,
+Content loaded from files a lesson-builder agent writes,content,must,no,yes,clone-only; content/*.yaml read per request
+Content validation command,content,must,no,yes,clone-only; catches bad lesson files; npm run content:check runs every solution
+Daily streak,progress,should,yes,yes,
+Daily XP goal,progress,should,yes,yes,
+Drag and drop: order and parsons,player,should,yes,yes,dnd-kit with keyboard sorting
+Drag and drop: classify,player,should,yes,partial,click/keyboard group buttons instead of dragging cards
+Multiple choice with console,player,should,yes,yes,
+Sequential exercise (multi-step),player,should,yes,yes,
+Plot output (matplotlib images),player,should,yes,yes,
+DataFrame output as table,player,should,yes,partial,"shown as text repr, not an HTML table"
+Course outline drawer inside player,player,should,yes,yes,
+Progress page (XP history streak calendar),progress,should,yes,yes,26-week calendar; no XP chart
+Settings (goal theme reset progress),settings,should,yes,yes,
+Iterative exercise,player,could,yes,no,not built; sequential covers most uses
+SQL exercises,player,could,yes,no,
+Keyboard shortcuts (ctrl+enter run ctrl+shift+enter submit),player,could,yes,yes,
+Dark mode,design,could,yes,yes,system/light/dark
+Lesson-builder agent definition,content,could,no,yes,clone-only; next phase; .claude/agents/lesson-builder.md
+Search across courses,catalog,could,yes,no,
+Notes per lesson,player,could,no,no,clone-only idea
+DataCamp course content (videos slides exercises datasets),content,skip,yes,skip,owned content; all lessons written fresh
+Recorded instructor video and audio,content,skip,yes,skip,owned content and people
+Certifications,career,skip,yes,skip,their credential network
+Teams and B2B admin,team,skip,yes,skip,single user tool
+Leaderboards vs other users,social,skip,yes,skip,the network
+Billing and premium gating,billing,skip,yes,skip,personal tool
+Mobile apps,platform,skip,yes,skip,personal local tool
+DataLab hosted notebooks,product,skip,yes,skip,separate product
+DataCamp name logo mascot and copy,brand,skip,yes,skip,their brand

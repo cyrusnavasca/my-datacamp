@@ -1,0 +1,244 @@
+title: Error analysis first
+description: Read ORBIT's failed traces, name what went wrong, build a failure taxonomy and count it before you pick a single metric.
+exercises:
+  - id: error-analysis-slides
+    type: video
+    title: Look at the data before you measure it
+    slides: |
+      # "ORBIT is kind of bad"
+
+      ORBIT, the Helios-7 assistant you built in the RAG course, is live. The crew's feedback is vague:
+      *"it doesn't know things"*, *"it made something up about the cargo vehicle"*.
+
+      The tempting move is to tweak the prompt and try a few questions by hand. That's **whack-a-mole**: you fix the
+      question in front of you and break two you aren't looking at.
+
+      The loop that works:
+
+      1. **Look**: read real traces, failures first.
+      2. **Name**: write down what went wrong in each.
+      3. **Count**: group the notes into categories and count them.
+      4. **Fix** the biggest category, then **measure again** with a metric aimed at it.
+
+      Metrics come *after* step 3. Until you know how ORBIT fails, you don't know what to measure.
+
+      ---
+
+      ## Read traces, write one note each
+
+      A **trace** is everything about one request: the question, the retrieved document ids, the prompt, the answer, and
+      the gold answer if you have one.
+
+      **Open coding**: read 30-100 failing traces and write one short note per trace about the **first thing that went
+      wrong**, the upstream-most error. Fixing it often removes what comes after it.
+
+      | question | retrieved | answer | note |
+      | --- | --- | --- | --- |
+      | Where is the defibrillator? | `medical-emergencies` | "I don't know..." | right doc, still refused |
+      | What time does the crew wake up? | `orbit-assistant-policy` | describes ORBIT | wrong doc retrieved |
+      | How much does the Tern cost to launch? | `cargo-resupply`, ... | describes the Tern's schedule | answered the unanswerable |
+
+      Don't use categories yet. Fresh notes catch failures that a ready-made list would hide.
+
+      ---
+
+      ## From notes to a taxonomy
+
+      Next, group the notes (**axial coding**). A useful category has a clear definition and points to **one stage** of
+      the pipeline, so it implies a fix:
+
+      | category | definition | stage | first fixes to try |
+      | --- | --- | --- | --- |
+      | retrieval miss | gold doc not retrieved | retrieval | hybrid search, bigger k, query rewriting |
+      | stale document | a superseded doc was used | knowledge base | drop or down-rank superseded docs |
+      | over-refusal | gold doc retrieved, model still refused | generation | prompt, refusal threshold |
+      | incomplete answer | right doc, answer misses part of it | generation | prompt, multi-hop retrieval |
+      | hallucination | claims the documents don't support | generation | grounding rules, refuse on empty context |
+
+      4-7 categories is the sweet spot. One giant "other" bucket means you need another category.
+
+      ---
+
+      ## Count, then prioritise
+
+      ```python
+      counts = fails["cause"].value_counts()              # frequency
+      share = fails["cause"].value_counts(normalize=True)
+
+      # Is it retrieval or generation? For refusals, check whether the gold doc was there.
+      refusals = fails[fails["answer"].str.contains("I don't know")]
+      refusals["gold_retrieved"].mean()                     # high -> the model refused with the answer in front of it
+      ```
+
+      Frequency is only half of it. Weight by **severity**: a wrong answer about the airlock matters more than one
+      about dinner. Also group by **root cause**: if 8 hallucinations all come from one retrieval outage, that's one fix
+      (refuse when nothing is retrieved), not eight.
+
+      ---
+
+      ## Playbook: who reads, and when to stop
+
+      | who labels | quality | cost | failure mode |
+      | --- | --- | --- | --- |
+      | domain expert (the crew medic, the commander) | best: knows what's actually wrong | slow, scarce | becomes a bottleneck |
+      | the engineer | fast, knows the pipeline | cheap | misses domain errors ("6.5 h sounds right") |
+      | an LLM clustering your notes | scales to thousands | cheapest | invents tidy categories; check its work |
+
+      In practice: an expert and an engineer label the first 50 together, then the engineer continues and an LLM helps
+      cluster.
+
+      **Stop reading** at saturation: once about 20 traces in a row add no new category. Repeat after every big change,
+      because new versions fail in new ways.
+
+  - id: name-the-failure
+    type: classify
+    title: Name the failure
+    prompt: |
+      Each item is a failed ORBIT trace. Sort it into the failure category that describes the **first thing that went wrong**.
+    hint: |
+      First ask whether the gold document was retrieved. If it wasn't, it's a retrieval miss. If it was, look at what
+      the model did with it: refused, answered partly, or claimed something the documents don't support.
+    zones: [Retrieval miss, Over-refusal, Incomplete answer, Hallucination]
+    items:
+      - { text: "Where is the defibrillator? Retrieved medical-emergencies (correct doc). Answer: I don't know.", zone: Over-refusal }
+      - { text: "What does ECLSS stand for? Retrieved glossary (correct doc). Answer: I don't know.", zone: Over-refusal }
+      - { text: "What time does the crew wake up? Retrieved orbit-assistant-policy only. Answer: describes what ORBIT does.", zone: Retrieval miss }
+      - { text: "Where does the crew gather if a fire is not out in two minutes? Retrieved depressurisation-response only. Answer: I don't know.", zone: Retrieval miss }
+      - { text: "How long is a spacewalk at most? Retrieved glossary only. Answer: I don't know.", zone: Retrieval miss }
+      - { text: "Who owns the hydroponics schedule and what is their role? Retrieved both docs. Answer: gives the name, not the role.", zone: Incomplete answer }
+      - { text: "Who can book the glovebox, and in which module is it? Answer: two names, no module.", zone: Incomplete answer }
+      - { text: "What is the Wi-Fi password? Answer: Passwords are rotated every 30 days.", zone: Hallucination }
+      - { text: "How often is lettuce harvested? Search was down, nothing retrieved. Answer: 6 minutes, per standard station procedure.", zone: Hallucination }
+      - { text: "What is the commander's favourite food? Answer: quotes the galley rules and names the commander.", zone: Hallucination }
+
+  - id: failure-breakdown
+    type: coding
+    title: Count the failures
+    context: |
+      `fails` holds 33 failed ORBIT traces that a crew member and you open-coded and grouped. Columns include `version`,
+      `question`, `type`, `answer`, `retrieved`, `gold_retrieved` (was every gold document retrieved?) and `cause` (the
+      category you assigned).
+    instructions:
+      - Store how many traces fall in each `cause` in `counts` (a Series, largest first).
+      - Store the share of traces per cause in `share` (values between 0 and 1).
+      - Store the most common cause (a string) in `top_cause`.
+      - Among traces whose answer contains `"I don't know"`, store the fraction with `gold_retrieved == True` in `refusal_gold_share`.
+    hint: |
+      `fails["cause"].value_counts()` sorts largest first; add `normalize=True` for shares and use `.idxmax()` for the top one.
+      For refusals: `fails[fails["answer"].str.contains("I don't know")]["gold_retrieved"].mean()`.
+    pre_code: |
+      import pandas as pd
+      from kits.llm_evaluation import failures
+      fails = failures()
+    sample_code: |
+      counts = ____
+      share = ____
+      top_cause = ____
+      print(counts)
+
+      refusals = fails[fails["answer"].str.contains(____)]
+      refusal_gold_share = ____
+      print(top_cause, round(refusal_gold_share, 2))
+    solution: |
+      counts = fails["cause"].value_counts()
+      share = fails["cause"].value_counts(normalize=True)
+      top_cause = counts.idxmax()
+      print(counts)
+
+      refusals = fails[fails["answer"].str.contains("I don't know")]
+      refusal_gold_share = refusals["gold_retrieved"].mean()
+      print(top_cause, round(refusal_gold_share, 2))
+    tests: |
+      import pandas as pd
+      check_object("counts")
+      c = user["counts"]
+      assert isinstance(c, pd.Series), "`counts` should be a pandas Series, e.g. from `.value_counts()`."
+      assert dict(c) == dict(sol["counts"]), "`counts` should have one entry per `cause` with its number of traces. Use `fails['cause'].value_counts()`."
+      check_object("share")
+      assert abs(float(user["share"].sum()) - 1) < 1e-6 and dict(user["share"].round(6)) == dict(sol["share"].round(6)), "`share` should be the fraction of traces per cause, summing to 1. Try `value_counts(normalize=True)`."
+      check_equal("top_cause", msg="`top_cause` should be the cause with the most traces (a string). `counts.idxmax()` gives it.")
+      check_equal("refusal_gold_share", msg="Filter the traces whose answer contains \"I don't know\", then take the mean of `gold_retrieved`.")
+    success_msg: |
+      Hallucinations top the list, and 10 of 12 refusals happened with the gold document right there in the prompt.
+      Most refusals are a generation problem, not a retrieval one, so buying a better retriever wouldn't fix them.
+
+  - id: root-cause-priority
+    type: coding
+    title: Severity and root causes
+    context: |
+      Counting treats every failure the same. `fails` also has a `safety` column: `True` when the question is about a
+      safety procedure (airlock, fire, depressurisation, ammonia, EVA). The crew agreed that a safety failure counts
+      **3 times** as much as any other.
+    instructions:
+      - Add a column `weight` to `fails`, equal to 3 where `safety` is `True` and 1 otherwise.
+      - Store the total weight per `cause` in `priority`, sorted from highest to lowest.
+      - Store the cause with the highest priority in `fix_first`.
+      - Of the `"hallucination"` traces, store the fraction whose `version` is `"v2 (outage)"` in `outage_share`.
+    hint: |
+      `np.where(fails["safety"], 3, 1)` builds the weights. Then
+      `fails.groupby("cause")["weight"].sum().sort_values(ascending=False)`.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      from kits.llm_evaluation import failures
+      fails = failures()
+    sample_code: |
+      fails["weight"] = ____
+      priority = ____
+      fix_first = ____
+      print(priority)
+
+      halluc = fails[fails["cause"] == "hallucination"]
+      outage_share = ____
+      print(fix_first, round(outage_share, 2))
+    solution: |
+      fails["weight"] = np.where(fails["safety"], 3, 1)
+      priority = fails.groupby("cause")["weight"].sum().sort_values(ascending=False)
+      fix_first = priority.idxmax()
+      print(priority)
+
+      halluc = fails[fails["cause"] == "hallucination"]
+      outage_share = (halluc["version"] == "v2 (outage)").mean()
+      print(fix_first, round(outage_share, 2))
+    tests: |
+      check_object("fails")
+      assert "weight" in user["fails"].columns, "Add a `weight` column to `fails`."
+      assert list(user["fails"]["weight"]) == list(sol["fails"]["weight"]), "`weight` should be 3 for safety questions and 1 for the rest: `np.where(fails['safety'], 3, 1)`."
+      check_object("priority")
+      assert dict(user["priority"]) == dict(sol["priority"]), "`priority` should be the sum of `weight` per `cause`."
+      assert list(user["priority"].values) == sorted(user["priority"].values, reverse=True), "Sort `priority` from highest to lowest."
+      check_equal("fix_first", msg="`fix_first` should be the cause with the highest weighted total.")
+      check_equal("outage_share", msg="Take the hallucination rows and compute the fraction where `version == 'v2 (outage)'`.")
+    success_msg: |
+      Weighted by severity, over-refusal edges past hallucination: many refusals hit safety questions. And 8 of the 13
+      hallucinations came from one retrieval outage. One fix ("refuse when nothing is retrieved") clears most of that
+      bucket, which a plain count would never tell you.
+
+  - id: upstream-first
+    type: mc
+    title: Which note do you write?
+    question: |
+      A crew member asks "How long is a spacewalk at most?". Retrieval returns only `glossary`, which says nothing
+      about spacewalk length. ORBIT answers "Spacewalks last up to 8 hours." (the handbook says 6.5). Which note goes in
+      your open-coding log?
+    options:
+      - text: "Hallucination: ORBIT invented a number."
+        feedback: |
+          It did invent a number, but that's the second thing that went wrong. The model never saw the right document.
+          Code the upstream-most error: if retrieval had found `eva-prep-checklist`, the made-up answer probably
+          wouldn't have happened.
+      - text: "Retrieval miss: the document with the answer was never retrieved."
+        correct: true
+        feedback: |
+          Right. Note the first failure in the chain. Retrieval misses should go to the retrieval fix list (hybrid search,
+          query rewriting). You can add a secondary note, "answered instead of refusing on weak context", which is a
+          separate generation fix.
+      - text: "Both, counted once in each category."
+        feedback: |
+          Double-counting inflates whichever downstream category retrieval misses feed, and points you at the wrong fix.
+          Keep one primary code per trace (the upstream-most error) and record extras as secondary notes.
+      - text: "Nothing: one wrong number is within normal model variance."
+        feedback: |
+          A confident wrong safety limit is exactly the failure the crew complained about. Error analysis exists to catch
+          these, not to explain them away.
+    hint: Follow the pipeline in order (retrieve, then generate) and stop at the first stage that went wrong.

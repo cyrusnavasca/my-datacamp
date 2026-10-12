@@ -1,0 +1,284 @@
+title: DPO in practice
+description: "Train a policy with DPO, pick beta under a drift budget, and troubleshoot the classic failure: preference data that secretly rewards long answers."
+exercises:
+  - id: intro
+    type: video
+    title: A policy you can see all of
+    slides: |
+      # A toy with the real loss
+
+      A real LLM's distribution over replies is too big to inspect. **StylePolicy** keeps the same maths
+      but enumerates everything. For each of 41 Helios questions there are 6 candidate replies:
+
+      | style | correct | cited | filler ("Great question! ... Let me know...") | words |
+      | --- | --- | --- | --- | --- |
+      | concise_cited | ✓ | ✓ | | ~4 |
+      | concise | ✓ | | | ~4 |
+      | chatty_cited | ✓ | ✓ | ✓ | ~57 |
+      | chatty | ✓ | | ✓ | ~57 |
+      | wrong_cited | | ✓ | | ~4 |
+      | wrong_chatty | | | ✓ | ~57 |
+
+      $\log\pi(y|x) = $ log-softmax of `ref_logit(style) + w · [correct, cited, filler]`, with `w = 0` at
+      the start, so the policy **is** the reference (like LoRA's B = 0). DPO learns `w`. `policy.logprob(prompt_ids, replies)`
+      returns the log-probs, exactly the inputs the loss needs.
+
+      ---
+
+      ## The training loop
+
+      ```python
+      policy, ref = StylePolicy(), StylePolicy()
+      with torch.no_grad():                                   # reference: computed once
+          ref_w = ref.logprob(pairs.prompt_id, pairs.chosen)
+          ref_l = ref.logprob(pairs.prompt_id, pairs.rejected)
+      opt = torch.optim.Adam(policy.parameters(), lr=0.05)
+      for step in range(200):
+          loss = dpo_loss(policy.logprob(pairs.prompt_id, pairs.chosen),
+                          policy.logprob(pairs.prompt_id, pairs.rejected), ref_w, ref_l, beta)
+          opt.zero_grad(); loss.backward(); opt.step()
+
+      policy_report(policy, ref)   # on 11 held-out questions: p_correct, p_cited, mean_words, kl
+      ```
+
+      With an LLM, `logprob` is `seq_logprob` over the reply tokens, and libraries such as TRL's
+      `DPOTrainer` run this loop for you.
+
+      ---
+
+      ## The beta trade-off
+
+      | β | KL from reference | preference fit | what can go wrong |
+      | --- | --- | --- | --- |
+      | small | large: the policy moves a lot | strong | drift; it exploits quirks in the pairs |
+      | medium | moderate | good | none in particular |
+      | large | small | weak | barely changes behaviour |
+
+      Treat KL as a **budget**. Decide how far the tuned model may move from the SFT model, which
+      already passed your general and safety suites, then take the β that gets the most quality
+      inside that budget.
+
+      ---
+
+      ## Playbook: "after DPO, the replies got long"
+
+      **Symptom:** average reply length nearly doubles; the crew complain about padding.
+
+      **Measure:** in the *preference data*, how often is the chosen reply longer? Among pairs that differ
+      only in filler, how often does the filler one win? Then check what the policy learned (`w`).
+
+      **Diagnose:** DPO learns whatever separates chosen from rejected. If raters reward length, length is
+      what you get. This bias is common in human and LLM-judge preferences alike.
+
+      | fix | how | cost |
+      | --- | --- | --- |
+      | Length-matched pairs | keep pairs whose lengths are close | loses data |
+      | Rebalance | subsample so the longer reply wins about half the time | loses data |
+      | Length-aware loss | normalise log-probs by length, or add a length penalty to the margin | one more knob |
+      | Fix the raters | guidelines, relabel | slow and expensive, but fixes the source |
+
+      **Verify:** length back near the reference, with correctness and citations still improved. Evaluate
+      with a length-controlled comparison, so the judge isn't fooled by the same bias.
+
+  - id: pick-beta
+    type: coding
+    title: Pick beta under a drift budget
+    context: |
+      `pairs` holds 450 preference pairs with **no** length bias (`prompt_id`, `chosen`, `rejected`, ...).
+      Loaded: `StylePolicy`, `policy_report(policy, ref)` (returns `p_correct`, `p_cited`, `mean_words`,
+      `kl`), a reference `dpo_loss`, `torch` and `pd`.
+    instructions:
+      - "Write `train_dpo(pairs, beta, steps=200, lr=0.05)` that returns `(policy, ref)`, following the slides: two `StylePolicy()`s, reference log-probs under `torch.no_grad()`, then Adam steps on the DPO loss."
+      - "For each β in `[0.1, 0.5, 2.0]`, train and record `beta`, `kl`, `p_cited` and `p_correct` from `policy_report`. Store the DataFrame in `beta_table`."
+      - "The drift budget is `kl <= 0.9`. Store the β with the highest `p_cited` within budget in `chosen_beta`."
+    hint: "`r = policy_report(policy, ref)`, then `rows.append({\"beta\": beta, \"kl\": r[\"kl\"], ...})`. Filter with `beta_table[beta_table.kl <= 0.9]` and take `.loc[...p_cited.idxmax(), \"beta\"]`."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      import pandas as pd
+      from kits.fine_tuning_llms import StylePolicy, policy_report, preference_pairs
+      pairs = preference_pairs(length_bias=0.0)
+      def dpo_loss(pi_w, pi_l, ref_w, ref_l, beta):
+          return -F.logsigmoid(beta * ((pi_w - ref_w) - (pi_l - ref_l))).mean()
+    sample_code: |
+      def train_dpo(pairs, beta, steps=200, lr=0.05):
+          policy, ref = StylePolicy(), StylePolicy()
+          with torch.no_grad():
+              ref_w = ref.logprob(pairs.prompt_id, pairs.chosen)
+              ref_l = ____
+          opt = torch.optim.Adam(policy.parameters(), lr=lr)
+          for _ in range(steps):
+              loss = dpo_loss(____, ____, ref_w, ref_l, beta)
+              opt.zero_grad()
+              loss.backward()
+              opt.step()
+          return policy, ref
+
+      rows = []
+      for beta in [0.1, 0.5, 2.0]:
+          policy, ref = train_dpo(pairs, beta)
+          r = policy_report(policy, ref)
+          rows.append({"beta": beta, "kl": r["kl"], "p_cited": r["p_cited"], "p_correct": r["p_correct"]})
+      beta_table = pd.DataFrame(rows)
+      within = ____
+      chosen_beta = ____
+      print(beta_table.round(3))
+      print("chosen beta:", chosen_beta)
+    solution: |
+      def train_dpo(pairs, beta, steps=200, lr=0.05):
+          policy, ref = StylePolicy(), StylePolicy()
+          with torch.no_grad():
+              ref_w = ref.logprob(pairs.prompt_id, pairs.chosen)
+              ref_l = ref.logprob(pairs.prompt_id, pairs.rejected)
+          opt = torch.optim.Adam(policy.parameters(), lr=lr)
+          for _ in range(steps):
+              loss = dpo_loss(policy.logprob(pairs.prompt_id, pairs.chosen),
+                              policy.logprob(pairs.prompt_id, pairs.rejected), ref_w, ref_l, beta)
+              opt.zero_grad()
+              loss.backward()
+              opt.step()
+          return policy, ref
+
+      rows = []
+      for beta in [0.1, 0.5, 2.0]:
+          policy, ref = train_dpo(pairs, beta)
+          r = policy_report(policy, ref)
+          rows.append({"beta": beta, "kl": r["kl"], "p_cited": r["p_cited"], "p_correct": r["p_correct"]})
+      beta_table = pd.DataFrame(rows)
+      within = beta_table[beta_table.kl <= 0.9]
+      chosen_beta = float(within.loc[within.p_cited.idxmax(), "beta"])
+      print(beta_table.round(3))
+      print("chosen beta:", chosen_beta)
+    tests: |
+      import numpy as np
+      t = check_object("beta_table")
+      assert list(t.beta) == [0.1, 0.5, 2.0], "`beta_table` should have one row per beta: 0.1, 0.5, 2.0."
+      ok = np.allclose(t.kl, sol["beta_table"].kl, atol=1e-4) and np.allclose(t.p_cited, sol["beta_table"].p_cited, atol=1e-4)
+      assert ok, "Your KL and p_cited values differ from the reference. Check `train_dpo`: reference log-probs of chosen AND rejected, the policy's log-probs inside the loop, 200 Adam steps at lr 0.05."
+      check_equal("chosen_beta", msg="`chosen_beta` is the beta with the highest `p_cited` among rows with `kl <= 0.9`.")
+    timeout: 60
+    success_msg: "β = 0.1 fits the preferences best but drifts past the budget. β = 2.0 barely moves. β = 0.5 cites in about 94% of replies at a KL of 0.87, the best result inside the budget."
+
+  - id: boss-length-bias
+    type: sequential
+    title: "Mission: ORBIT won't stop talking"
+    context: |
+      The team ran DPO (β = 0.5) on 450 crew preference pairs, and ORBIT's replies now come wrapped in
+      cheerful filler. Loaded: the team's `pairs` (columns `prompt_id`, `chosen`, `rejected`,
+      `chosen_style`, `rejected_style`, `chosen_words`, `rejected_words`), `train_dpo(pairs, beta)`
+      returning `(policy, ref)`, `policy_report`, `StylePolicy`, `torch`, `pd`.
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      import pandas as pd
+      from kits.fine_tuning_llms import StylePolicy, policy_report, preference_pairs
+      pairs = preference_pairs(length_bias=1.5)
+      def dpo_loss(pi_w, pi_l, ref_w, ref_l, beta):
+          return -F.logsigmoid(beta * ((pi_w - ref_w) - (pi_l - ref_l))).mean()
+      def train_dpo(pairs, beta=0.5, steps=200, lr=0.05):
+          policy, ref = StylePolicy(), StylePolicy()
+          with torch.no_grad():
+              ref_w = ref.logprob(pairs.prompt_id, pairs.chosen)
+              ref_l = ref.logprob(pairs.prompt_id, pairs.rejected)
+          opt = torch.optim.Adam(policy.parameters(), lr=lr)
+          for _ in range(steps):
+              loss = dpo_loss(policy.logprob(pairs.prompt_id, pairs.chosen),
+                              policy.logprob(pairs.prompt_id, pairs.rejected), ref_w, ref_l, beta)
+              opt.zero_grad()
+              loss.backward()
+              opt.step()
+          return policy, ref
+    steps:
+      - instructions:
+          - "**Measure.** `team, ref = train_dpo(pairs, beta=0.5)`. Store `policy_report(ref)` in `before` and `policy_report(team, ref)` in `after`."
+          - "Store `length_growth = after[\"mean_words\"] / before[\"mean_words\"]`."
+        hint: "`policy_report(ref)` with no second argument reports the reference itself."
+        sample_code: |
+          team, ref = train_dpo(pairs, beta=0.5)
+          before = ____
+          after = ____
+          length_growth = ____
+          print(f"mean words {before['mean_words']:.1f} -> {after['mean_words']:.1f} (x{length_growth:.2f})")
+          print(f"p_correct {before['p_correct']:.2f} -> {after['p_correct']:.2f}, p_cited {before['p_cited']:.2f} -> {after['p_cited']:.2f}")
+        solution: |
+          team, ref = train_dpo(pairs, beta=0.5)
+          before = policy_report(ref)
+          after = policy_report(team, ref)
+          length_growth = after["mean_words"] / before["mean_words"]
+          print(f"mean words {before['mean_words']:.1f} -> {after['mean_words']:.1f} (x{length_growth:.2f})")
+          print(f"p_correct {before['p_correct']:.2f} -> {after['p_correct']:.2f}, p_cited {before['p_cited']:.2f} -> {after['p_cited']:.2f}")
+        tests: |
+          check_equal("length_growth", tol=1e-4, msg="`length_growth` = `after[\"mean_words\"] / before[\"mean_words\"]`, with `before = policy_report(ref)`.")
+          b = check_object("before")
+          assert "kl" not in b, "`before` should be `policy_report(ref)`, the reference on its own."
+      - instructions:
+          - "**Diagnose the data.** Store the share of pairs whose chosen reply has more words in `chosen_longer`."
+          - "Among pairs where exactly one reply contains `\"chatty\"` in its style, store the share where the chatty one was chosen in `filler_win_rate`."
+          - "Store what the team policy learned for the filler trait, `team.w[2].item()`, in `w_filler`."
+        hint: "`a = pairs.chosen_style.str.contains(\"chatty\")`, `b = pairs.rejected_style.str.contains(\"chatty\")`; the pairs that differ are `a != b`; among them, `a.mean()` is the filler win rate."
+        sample_code: |
+          chosen_longer = ____
+          a = pairs.chosen_style.str.contains("chatty")
+          b = pairs.rejected_style.str.contains("chatty")
+          filler_win_rate = ____
+          w_filler = ____
+          print(f"chosen is longer in {chosen_longer:.0%} of pairs; filler wins {filler_win_rate:.0%} of filler-vs-plain pairs")
+          print(f"learned weights [correct, cited, filler]: {team.w.detach().numpy().round(2)}")
+        solution: |
+          chosen_longer = (pairs.chosen_words > pairs.rejected_words).mean()
+          a = pairs.chosen_style.str.contains("chatty")
+          b = pairs.rejected_style.str.contains("chatty")
+          filler_win_rate = a[a != b].mean()
+          w_filler = team.w[2].item()
+          print(f"chosen is longer in {chosen_longer:.0%} of pairs; filler wins {filler_win_rate:.0%} of filler-vs-plain pairs")
+          print(f"learned weights [correct, cited, filler]: {team.w.detach().numpy().round(2)}")
+        tests: |
+          check_equal("chosen_longer", tol=1e-9, msg="`chosen_longer` is the share of pairs with `chosen_words > rejected_words`.")
+          check_equal("filler_win_rate", tol=1e-9, msg="Among pairs where exactly one style contains 'chatty', `filler_win_rate` is the share where the chosen one is the chatty one.")
+          check_equal("w_filler", tol=1e-4, msg="`w_filler` is `team.w[2].item()`.")
+      - instructions:
+          - "**Fix.** Build a `fixed_pairs` DataFrame from `pairs` that removes the length signal: for example keep only length-matched pairs (`abs(chosen_words - rejected_words) <= 10`), or rebalance. Then `fixed, ref2 = train_dpo(fixed_pairs, beta=0.5)`."
+          - "Store `policy_report(fixed, ref2)` in `fixed_report`. Targets: `mean_words` at most **1.1 ×** the reference's, `p_correct` at least **0.95** and `p_cited` at least **0.80**."
+        hint: "`pairs[(pairs.chosen_words - pairs.rejected_words).abs() <= 10]` keeps pairs where length can't be what decided the preference."
+        sample_code: |
+          fixed_pairs = ____
+          fixed, ref2 = train_dpo(fixed_pairs, beta=0.5)
+          fixed_report = ____
+          print(f"{len(fixed_pairs)} pairs kept of {len(pairs)}")
+          print({k: round(v, 3) for k, v in fixed_report.items()})
+        solution: |
+          fixed_pairs = pairs[(pairs.chosen_words - pairs.rejected_words).abs() <= 10]
+          fixed, ref2 = train_dpo(fixed_pairs, beta=0.5)
+          fixed_report = policy_report(fixed, ref2)
+          print(f"{len(fixed_pairs)} pairs kept of {len(pairs)}")
+          print({k: round(v, 3) for k, v in fixed_report.items()})
+        tests: |
+          from kits.fine_tuning_llms import policy_report
+          fp = check_object("fixed_pairs")
+          assert len(fp) >= 50, "Keep at least 50 pairs, or there is too little left to learn from."
+          r = policy_report(user["fixed"], user["ref2"])
+          ref_words = policy_report(user["ref2"])["mean_words"]
+          assert r["mean_words"] <= 1.1 * ref_words, f"Mean reply length is {r['mean_words']:.1f} words against {ref_words:.1f} for the reference. Your pairs still reward filler; remove the pairs where length decided the preference."
+          assert r["p_correct"] >= 0.95, f"p_correct is {r['p_correct']:.2f}; the target is 0.95. Keep the pairs that teach correctness."
+          assert r["p_cited"] >= 0.8, f"p_cited is {r['p_cited']:.2f}; the target is 0.80. Keep the pairs that teach citing."
+          fr = check_object("fixed_report")
+          assert abs(fr["mean_words"] - r["mean_words"]) < 1e-6, "`fixed_report` should be `policy_report(fixed, ref2)`."
+      - instructions:
+          - "**Verify.** Store a dict `summary` with `team_words`, `fixed_words`, `team_cited` and `fixed_cited` (mean words and p_cited of the team policy and of yours) and print it."
+        hint: "`after[\"mean_words\"]` and `fixed_report[\"mean_words\"]`."
+        sample_code: |
+          summary = {"team_words": ____, "fixed_words": ____,
+                     "team_cited": ____, "fixed_cited": ____}
+          print({k: round(v, 2) for k, v in summary.items()})
+        solution: |
+          summary = {"team_words": after["mean_words"], "fixed_words": fixed_report["mean_words"],
+                     "team_cited": after["p_cited"], "fixed_cited": fixed_report["p_cited"]}
+          print({k: round(v, 2) for k, v in summary.items()})
+        tests: |
+          s = check_object("summary")
+          assert set(s) == {"team_words", "fixed_words", "team_cited", "fixed_cited"}, "`summary` needs exactly the four keys."
+          assert abs(s["team_words"] - user["after"]["mean_words"]) < 1e-6 and abs(s["fixed_words"] - user["fixed_report"]["mean_words"]) < 1e-6, "Take the word counts from `after` and `fixed_report`."
+          assert abs(s["team_cited"] - user["after"]["p_cited"]) < 1e-6 and abs(s["fixed_cited"] - user["fixed_report"]["p_cited"]) < 1e-6, "Take p_cited from `after` and `fixed_report`."
+          assert s["fixed_words"] < 0.6 * s["team_words"], "The fixed policy should write far shorter replies than the team's."
+    timeout: 60
+    success_msg: "The raters picked the chatty reply 98% of the time it was on offer, so DPO learned 'add filler' with a weight bigger than 'be correct'. Training on length-matched pairs keeps correctness and citations and brings replies back to the reference's length or shorter. Fix the data, not the model."

@@ -1,0 +1,268 @@
+title: Autograd and the computational graph
+description: How PyTorch computes gradients, why they accumulate, and what to do when a gradient is missing.
+exercises:
+  - id: intro
+    type: video
+    title: How autograd works
+    slides: |
+      # Three ways to get a derivative
+
+      Training needs $\frac{\partial \text{loss}}{\partial w}$ for every weight $w$: how much the loss
+      moves when $w$ moves a little.
+
+      | method | how | cost for $P$ parameters | accuracy |
+      | --- | --- | --- | --- |
+      | by hand | calculus, then code the formula | your time; error-prone | exact |
+      | finite differences | $\frac{f(w+h) - f(w-h)}{2h}$ | $2P$ forward passes | approximate |
+      | autograd | record the ops, apply the chain rule backwards | about **one** extra pass | exact |
+
+      With a million weights, finite differences need two million forward passes. Autograd gets every
+      gradient for roughly the cost of one. Finite differences are still the best way to **test**
+      a gradient you are unsure about.
+
+      ---
+
+      ## The graph is recorded as you compute
+
+      ```python
+      x = torch.tensor(2.0, requires_grad=True)   # a leaf: PyTorch tracks it
+      y = x ** 2 + 3 * x                          # each op records how to undo itself
+      y.grad_fn                                   # <AddBackward0>
+      y.grad_fn.next_functions                    # ((PowBackward0, 0), (MulBackward0, 0))
+      y.backward()                                # walk the graph from y back to the leaves
+      x.grad                                      # tensor(7.) = 2*2 + 3
+      ```
+
+      Every result of an op on a tracked tensor gets a `grad_fn`. `backward()` visits them in
+      reverse, multiplying local derivatives (the chain rule), and **adds** the result into the
+      `.grad` of each leaf.
+
+      ---
+
+      ## The chain rule, one node at a time
+
+      For a prediction $p = wx + b$ and loss $L = (p - y)^2$:
+
+      $$\frac{\partial L}{\partial w} = \underbrace{2(p - y)}_{\partial L / \partial p} \cdot \underbrace{x}_{\partial p / \partial w}
+      \qquad \frac{\partial L}{\partial b} = 2(p - y) \cdot 1$$
+
+      Autograd does exactly this: `PowBackward` supplies $2(p-y)$, `MulBackward` supplies $x$,
+      `AddBackward` passes the gradient through unchanged. Over a batch with a mean loss, each
+      example's gradient is divided by $N$ and summed.
+
+      ---
+
+      ## Three rules that cause most autograd surprises
+
+      1. **Gradients accumulate.** A second `backward()` adds to `.grad`. That is deliberate (it lets
+         you sum gradients over several losses or mini-batches), so training loops must zero them.
+      2. **The graph is freed after `backward()`.** Calling it twice on the same graph errors unless
+         you pass `retain_graph=True`.
+      3. **Only leaves get `.grad`.** Intermediate results have `grad_fn` but `.grad` stays `None`
+         (use `t.retain_grad()` if you need one).
+
+      `with torch.no_grad():` and `t.detach()` switch tracking off. Use them for evaluation and for
+      weight updates, never in the forward pass you want to train.
+
+      ---
+
+      ## Playbook: "my gradient is None"
+
+      **Symptom:** `w.grad` is `None`, or `backward()` raises
+      `element 0 of tensors does not require grad and does not have a grad_fn`.
+
+      **Measure:** print `loss.requires_grad` and `loss.grad_fn`, then the same for each intermediate
+      going backwards. The first tensor with `grad_fn=None` is where the graph broke.
+
+      | usual cause | what it looks like | fix |
+      | --- | --- | --- |
+      | left the graph | `.item()`, `.tolist()`, `.numpy()`, then `torch.tensor(...)` again | stay in torch ops end to end |
+      | detached on purpose, by accident | `.detach()` or `.data` in the forward pass | remove it |
+      | tracking switched off | forward pass inside `torch.no_grad()` | move it out |
+      | never tracked | parameter made without `requires_grad=True` | set it, or use `nn.Parameter` |
+
+      **Verify:** `loss.grad_fn` is not `None` and `w.grad` matches a finite-difference estimate.
+
+  - id: grad-three-ways
+    type: coding
+    title: One derivative, three ways
+    context: |
+      Take $f(x) = x^2 + 3x$ at $x = 2$. You will get its derivative by hand, by finite
+      differences and with autograd, and check that they agree.
+    instructions:
+      - Work out $f'(2)$ by hand and store the number in `manual`.
+      - "Store the central finite difference `(f(2 + h) - f(2 - h)) / (2 * h)` with `h = 1e-3` in `numeric`."
+      - Make `x` a tensor holding `2.0` that requires grad, call `backward()` on `f(x)`, and store `x.grad.item()` in `auto`.
+      - Print all three.
+    hint: |
+      $f'(x) = 2x + 3$. For autograd: `x = torch.tensor(2.0, requires_grad=True)`, then
+      `f(x).backward()`.
+    pre_code: |
+      import torch
+    sample_code: |
+      def f(x):
+          return x ** 2 + 3 * x
+
+      manual = ____
+
+      h = 1e-3
+      numeric = ____
+
+      x = torch.tensor(____, requires_grad=____)
+      f(x).backward()
+      auto = ____
+
+      print(manual, numeric, auto)
+    solution: |
+      def f(x):
+          return x ** 2 + 3 * x
+
+      manual = 2 * 2 + 3
+
+      h = 1e-3
+      numeric = (f(2 + h) - f(2 - h)) / (2 * h)
+
+      x = torch.tensor(2.0, requires_grad=True)
+      f(x).backward()
+      auto = x.grad.item()
+
+      print(manual, numeric, auto)
+    tests: |
+      check_equal("manual", 7, msg="`manual` should be $f'(2) = 2 \\cdot 2 + 3$.")
+      check_equal("numeric", 7, tol=1e-4, msg="`numeric` should be `(f(2 + h) - f(2 - h)) / (2 * h)`, close to 7.")
+      check_equal("auto", 7, tol=1e-5, msg="`auto` should be `x.grad.item()` after calling `f(x).backward()` once.")
+    success_msg: All three agree. Finite differences are how you test a gradient you do not trust.
+
+  - id: grad-accumulates
+    type: mc
+    title: Predict the gradient after two backward calls
+    question: |
+      The console ran this code. What is `x.grad` now?
+
+      ```python
+      x = torch.tensor(2.0, requires_grad=True)
+      (x ** 2 + 3 * x).backward()
+      (x ** 2 + 3 * x).backward()
+      ```
+    context: Predict first, then type `x.grad` in the console.
+    pre_code: |
+      import torch
+      x = torch.tensor(2.0, requires_grad=True)
+      (x ** 2 + 3 * x).backward()
+      (x ** 2 + 3 * x).backward()
+    options:
+      - text: "`tensor(7.)`"
+        feedback: "That is the gradient of one call. `backward()` adds into `.grad` rather than overwriting it."
+      - text: "`tensor(14.)`"
+        correct: true
+        feedback: "Right: 7 + 7. Gradients accumulate, which is why every training step starts with `optimizer.zero_grad()`."
+      - text: "`tensor(0.)`"
+        feedback: "Nothing reset the gradient. It would only be zero after `x.grad.zero_()` or `optimizer.zero_grad()`."
+      - text: It raises an error because the graph was freed
+        feedback: "Each line builds a **new** graph, so each `backward()` has its own. The error only happens when you call `backward()` twice on the same result."
+    hint: Does `backward()` overwrite `.grad` or add to it?
+
+  - id: chain-rule-by-hand
+    type: coding
+    title: Check autograd against the chain rule
+    context: |
+      A one-feature linear model predicts `pred = w * x + b` for 50 points, with loss
+      `L = mean((pred - y) ** 2)`. By the chain rule,
+      $\frac{\partial L}{\partial w} = \text{mean}(2(p - y)\,x)$ and $\frac{\partial L}{\partial b} = \text{mean}(2(p - y))$.
+      `x`, `y`, `w` and `b` already exist; `w` and `b` require grad.
+    instructions:
+      - Compute `pred` and `loss`, then call `loss.backward()`.
+      - Compute `dw_manual` and `db_manual` from the formulas above (use `pred.detach()` so they are plain numbers, not part of the graph).
+      - Print `dw_manual`, `w.grad`, `db_manual` and `b.grad`.
+    hint: |
+      `err = pred.detach() - y`, then `dw_manual = (2 * err * x).mean()` and
+      `db_manual = (2 * err).mean()`.
+    pre_code: |
+      import torch
+      torch.manual_seed(0)
+      x = torch.randn(50)
+      y = 3 * x - 1 + 0.1 * torch.randn(50)
+      w = torch.tensor(0.5, requires_grad=True)
+      b = torch.tensor(0.0, requires_grad=True)
+    sample_code: |
+      pred = ____
+      loss = ____
+      loss.backward()
+
+      err = pred.detach() - y
+      dw_manual = ____
+      db_manual = ____
+
+      print(dw_manual, w.grad)
+      print(db_manual, b.grad)
+    solution: |
+      pred = w * x + b
+      loss = ((pred - y) ** 2).mean()
+      loss.backward()
+
+      err = pred.detach() - y
+      dw_manual = (2 * err * x).mean()
+      db_manual = (2 * err).mean()
+
+      print(dw_manual, w.grad)
+      print(db_manual, b.grad)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      assert user["w"].grad is not None, "`w.grad` is still None. Did you call `loss.backward()`?"
+      check_tensor({"g": user["w"].grad}, {"g": sol["w"].grad}, "g", msg="`w.grad` is off. Check `pred = w * x + b` and the mean squared error, and call `backward()` only once.")
+      check_tensor(user, sol, "dw_manual", msg="`dw_manual` should be `(2 * (pred - y) * x).mean()`.")
+      check_tensor(user, sol, "db_manual", msg="`db_manual` should be `(2 * (pred - y)).mean()`.")
+    success_msg: Your hand-derived gradients match autograd exactly. That is all `backward()` does, at scale.
+
+  - id: grad-is-none
+    type: coding
+    title: "Fix it: the gradient that never arrives"
+    context: |
+      A colleague's logistic model will not train: `loss.backward()` raises
+      `element 0 of tensors does not require grad`. `X` (64 x 3) and the 0/1 labels `y` already
+      exist. Run the code first to see the symptom, then follow the playbook.
+    instructions:
+      - "Measure: run the code and read what the `print` shows for `scores.requires_grad` and `scores.grad_fn` inside `predict`."
+      - "Diagnose and fix `predict` so the scores stay connected to `w`. Keep `w` and the loss as they are."
+      - Call `loss.backward()` and store a copy of `w.grad` in `grad`.
+    hint: |
+      `scores.tolist()` turns the tensor into plain Python numbers, and `torch.tensor(...)` builds a
+      brand-new tensor with no history. Delete that line; `torch.sigmoid(X @ w)` stays in the graph.
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.randn(64, 3)
+      y = (X @ torch.tensor([1.5, -2.0, 0.5]) > 0).float()
+    sample_code: |
+      w = torch.tensor([0.1, 0.1, 0.1], requires_grad=True)
+
+      def predict(X):
+          scores = X @ w
+          scores = torch.tensor(scores.tolist())   # copy the scores so we can log them
+          print("requires_grad:", scores.requires_grad, "grad_fn:", scores.grad_fn)
+          return torch.sigmoid(scores)
+
+      loss = F.binary_cross_entropy(predict(X), y)
+      loss.backward()
+      grad = ____
+      print(grad)
+    solution: |
+      w = torch.tensor([0.1, 0.1, 0.1], requires_grad=True)
+
+      def predict(X):
+          scores = X @ w
+          print("requires_grad:", scores.requires_grad, "grad_fn:", scores.grad_fn)
+          return torch.sigmoid(scores)
+
+      loss = F.binary_cross_entropy(predict(X), y)
+      loss.backward()
+      grad = w.grad.clone()
+      print(grad)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      assert user["loss"].grad_fn is not None, "`loss.grad_fn` is still None, so the graph is broken. Find the line in `predict` that leaves torch."
+      check_tensor(user, sol, "grad", msg="`grad` should be `w.grad` after one `loss.backward()`, with `w` starting at `[0.1, 0.1, 0.1]`.")
+    success_msg: |
+      Found and fixed. Anything that leaves torch (`.item()`, `.tolist()`, `.numpy()`) cuts the graph;
+      log with `scores.detach()` instead, which leaves the original tensor connected.

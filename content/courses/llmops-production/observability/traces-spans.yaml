@@ -1,0 +1,317 @@
+title: Traces and spans
+description: What one ORBIT request really does, how a tracer records it, and which traces are worth keeping.
+exercises:
+  - id: traces-spans-slides
+    type: video
+    title: What happened inside that request?
+    slides: |
+      # One request, many steps
+
+      ORBIT is live on Helios-7. Lucía reports: *"ORBIT took ages to answer me at 14:02."*
+      Answering one crew question involves several steps:
+
+      ```
+      trace tr0217                         total 4,310 ms
+      ├─ retrieve          118 ms   search the handbook
+      ├─ rerank             61 ms   reorder the hits
+      ├─ tool:get_sensor    92 ms   read a sensor
+      └─ llm             4,039 ms   claude-sonnet-5-5 · in 3,120 tok · out 142 tok
+      ```
+
+      - A **trace** is the record of one request, from the moment it arrives to the moment the reply leaves.
+      - A **span** is one timed step inside it. Spans can nest (a tool span inside an agent step).
+
+      Without a trace you have four separate logs and no way to tell which step made Lucía wait.
+
+      ---
+
+      ## What a span records, and why
+
+      | field | answers the question |
+      | --- | --- |
+      | `trace_id`, `parent_id` | which request is this part of, and inside which step? |
+      | `name`, `start`, `duration_ms` | where did the time go? |
+      | `model`, `input_tokens`, `output_tokens`, cache tokens | where did the money go? |
+      | `ttft_ms`, `stop_reason` | was it slow to start, or slow to finish? Was the answer cut off? |
+      | `prompt_version` | which release produced this? (chapter 4) |
+      | `error` | what failed, and was it retried? |
+
+      Record the span **even when the step fails**. Failed spans are the ones you will be asked about.
+
+      ---
+
+      ## A tracer by hand
+
+      The mechanism is small: read the clock before and after, and write a record in a `finally` block,
+      so it runs whether the step returns or raises.
+
+      ```python
+      import contextlib
+
+      spans = []
+
+      @contextlib.contextmanager
+      def span(name, trace_id):
+          rec = {"trace_id": trace_id, "name": name, "error": None}
+          start = clock.now_ms
+          try:
+              yield rec                       # the step runs here; it can add fields to rec
+          except Exception as e:
+              rec["error"] = type(e).__name__
+              raise                           # record it, but never swallow it
+          finally:
+              rec["duration_ms"] = clock.now_ms - start
+              spans.append(rec)
+
+      with span("llm", "tr0217") as rec:
+          r = client.messages.create(...)
+          rec["output_tokens"] = r.usage.output_tokens
+      ```
+
+      A **decorator** does the same around a whole function, so you instrument once instead of at every call site.
+      Real tracers keep the current trace id in a `contextvars.ContextVar`, so nested and async code can find it.
+
+      ---
+
+      ## The real thing: OpenTelemetry
+
+      In production you use a tracing library rather than a list. OpenTelemetry is the common standard, and its
+      **GenAI semantic conventions** name the LLM attributes so any backend can read them:
+
+      ```python
+      from opentelemetry import trace
+
+      tracer = trace.get_tracer("orbit")
+      with tracer.start_as_current_span("chat claude-sonnet-5-5") as s:
+          s.set_attribute("gen_ai.request.model", "claude-sonnet-5-5")
+          r = client.messages.create(model="claude-sonnet-5-5", max_tokens=600, system=SYSTEM, messages=msgs)
+          s.set_attribute("gen_ai.usage.input_tokens", r.usage.input_tokens)
+          s.set_attribute("gen_ai.usage.output_tokens", r.usage.output_tokens)
+      ```
+
+      Spans are exported to a backend (an OpenTelemetry collector, or an LLM-focused tool) that draws the tree
+      and lets you query across requests. The GenAI conventions are still evolving: check the current spec.
+
+      ---
+
+      ## Trade-off: which traces do you keep?
+
+      Full LLM traces are big (prompts, retrieved documents, answers) and may contain personal data.
+
+      | policy | storage | catches rare errors? | catches slow outliers? | complexity |
+      | --- | --- | --- | --- | --- |
+      | keep everything | highest | yes | yes | low |
+      | **head sampling** (decide at the start, e.g. keep 5%) | low | only 5% of them | only 5% of them | low |
+      | **tail sampling** (decide at the end: keep all errors, all slow ones, plus a few % of the rest) | low | yes | yes | medium: needs a buffer until the trace ends |
+      | metrics only, no traces | lowest | you know *that* it failed, not *why* | same | low |
+
+      Keep **metadata** (timings, tokens, ids) for every request: it is tiny. Be choosy about **payloads** (full prompts
+      and answers): sample them, redact them, and give them a short retention period.
+
+  - id: span-decorator
+    type: coding
+    title: Build a span recorder
+    context: |
+      ORBIT's request handler `handle(trace_id, question)` calls `retrieve`, `rerank` and `call_llm`. They advance
+      the virtual clock `clk` as they work. `ctx["trace_id"]` holds the current trace id. The third LLM call
+      will fail with a rate-limit error.
+    instructions:
+      - "Complete `traced(name)`: a decorator factory whose wrapper appends one dict per call to `spans`, with keys `trace_id` (from `ctx`), `name`, `duration_ms` (from `clk.now_ms`), `input_tokens`, `output_tokens` (from the result's `.usage` if it has one, else 0) and `error` (`None`, or the exception's class name)."
+      - The wrapper must re-raise any exception after recording it, and record the span in both cases.
+      - "Wrap `retrieve`, `rerank` and `call_llm` (span names `retrieve`, `rerank`, `llm`), then run `handle` for each question in `QUESTIONS` with trace ids `tr0`, `tr1`, `tr2`, catching `aikit.APIError`."
+    hint: |
+      Put `spans.append(rec)` and the duration in a `finally:` block. In `except Exception as e:` set
+      `rec["error"] = type(e).__name__` and then `raise`. Use `getattr(result, "usage", None)` to find token counts.
+    pre_code: |
+      import aikit
+      from kits.llmops_production import make_client, MODEL, SYSTEM, CONCISE
+      clk = aikit.VirtualClock()
+      client = make_client(clock=clk, fail_on_calls=[2])
+      ctx = {"trace_id": None}
+
+      def retrieve(question):
+          clk.advance_ms(100 + len(question))      # stands in for a vector search
+          return ["airlock-procedure", "eva-prep-checklist"]
+
+      def rerank(question, doc_ids):
+          clk.advance_ms(55)
+          return doc_ids[:1]
+
+      def call_llm(question):
+          return client.messages.create(model=MODEL, max_tokens=300, system=SYSTEM + " " + CONCISE,
+                                        messages=[{"role": "user", "content": question}])
+
+      def handle(trace_id, question):
+          ctx["trace_id"] = trace_id
+          docs = rerank(question, retrieve(question))
+          return call_llm(question)
+
+      QUESTIONS = ["How long is the leak-check hold when depressurising AL-1?",
+                   "What time is dinner?", "Who is the flight engineer?"]
+    sample_code: |
+      spans = []
+
+      def traced(name):
+          def decorate(fn):
+              def wrapper(*args, **kwargs):
+                  rec = {"trace_id": ctx["trace_id"], "name": name, "error": None,
+                         "input_tokens": 0, "output_tokens": 0}
+                  start = clk.now_ms
+                  try:
+                      result = fn(*args, **kwargs)
+                      usage = getattr(result, "usage", None)
+                      if usage is not None:
+                          rec["input_tokens"] = ____
+                          rec["output_tokens"] = ____
+                      return result
+                  except Exception as e:
+                      rec["error"] = ____
+                      ____
+                  finally:
+                      rec["duration_ms"] = ____
+                      spans.append(rec)
+              return wrapper
+          return decorate
+
+      retrieve = traced("retrieve")(retrieve)
+      rerank = ____
+      call_llm = ____
+
+      for i, q in enumerate(QUESTIONS):
+          try:
+              handle(____, q)
+          except aikit.APIError as e:
+              print("request failed:", type(e).__name__)
+
+      for s in spans:
+          print(s)
+    solution: |
+      spans = []
+
+      def traced(name):
+          def decorate(fn):
+              def wrapper(*args, **kwargs):
+                  rec = {"trace_id": ctx["trace_id"], "name": name, "error": None,
+                         "input_tokens": 0, "output_tokens": 0}
+                  start = clk.now_ms
+                  try:
+                      result = fn(*args, **kwargs)
+                      usage = getattr(result, "usage", None)
+                      if usage is not None:
+                          rec["input_tokens"] = usage.input_tokens
+                          rec["output_tokens"] = usage.output_tokens
+                      return result
+                  except Exception as e:
+                      rec["error"] = type(e).__name__
+                      raise
+                  finally:
+                      rec["duration_ms"] = clk.now_ms - start
+                      spans.append(rec)
+              return wrapper
+          return decorate
+
+      retrieve = traced("retrieve")(retrieve)
+      rerank = traced("rerank")(rerank)
+      call_llm = traced("llm")(call_llm)
+
+      for i, q in enumerate(QUESTIONS):
+          try:
+              handle(f"tr{i}", q)
+          except aikit.APIError as e:
+              print("request failed:", type(e).__name__)
+
+      for s in spans:
+          print(s)
+    tests: |
+      check_object("spans")
+      got, exp = user["spans"], sol["spans"]
+      assert len(got) == len(exp), f"Expected {len(exp)} spans (3 requests x retrieve, rerank, llm), got {len(got)}. Wrap all three functions and record a span even when the call raises (use `finally`)."
+      for g, e in zip(got, exp):
+          for k in ("trace_id", "name", "input_tokens", "output_tokens", "error"):
+              assert g.get(k) == e[k], f"Span {e['name']!r} of {e['trace_id']}: `{k}` should be {e[k]!r}, got {g.get(k)!r}."
+          assert abs(g.get("duration_ms", -1) - e["duration_ms"]) < 0.01, f"Span {e['name']!r} of {e['trace_id']}: `duration_ms` should be {e['duration_ms']:.1f}, got {g.get('duration_ms')}. Use `clk.now_ms` after the call minus `clk.now_ms` before it."
+      def _boom():
+          raise ValueError("sensor offline")
+      raised = False
+      try:
+          user["traced"]("boom")(_boom)()
+      except ValueError:
+          raised = True
+      assert raised, "Your wrapper swallowed the exception. After recording `error`, re-raise it with a bare `raise`."
+    success_msg: |
+      You now see where every millisecond and token went, including the failed call: its span shows
+      `RateLimitError` after 40 ms. In the output, notice how the llm span dwarfs retrieval.
+
+  - id: trace-summary
+    type: coding
+    title: From spans to traces
+    context: |
+      `t` holds two weeks of ORBIT production spans (one row per span) from `traces()`. Here the steps of a request
+      run one after another, so a request's latency is the sum of its spans.
+    instructions:
+      - "Build `per_trace`: one row per `trace_id` with columns `total_ms` (sum of `duration_ms`) and `llm_ms` (the `duration_ms` of the span named `llm`)."
+      - "Add a column `llm_share = llm_ms / total_ms` and store its median in `median_llm_share`."
+      - "Store in `slowest` a dict mapping span name to the number of traces in which that span was the slowest one."
+    hint: |
+      `t.groupby("trace_id")["duration_ms"].sum()` gives totals; filter `t[t["span"] == "llm"]` and set its index to
+      `trace_id` for `llm_ms`. For `slowest`, `t.loc[t.groupby("trace_id")["duration_ms"].idxmax(), "span"].value_counts()`, then `dict(...)`.
+    pre_code: |
+      import pandas as pd
+      from kits.llmops_production import traces
+      t = traces()
+    sample_code: |
+      per_trace = pd.DataFrame({
+          "total_ms": ____,
+          "llm_ms": t[t["span"] == "llm"].set_index("trace_id")["duration_ms"],
+      })
+      per_trace["llm_share"] = ____
+      median_llm_share = ____
+
+      slowest = dict(____)
+      print(per_trace.head())
+      print(median_llm_share, slowest)
+    solution: |
+      per_trace = pd.DataFrame({
+          "total_ms": t.groupby("trace_id")["duration_ms"].sum(),
+          "llm_ms": t[t["span"] == "llm"].set_index("trace_id")["duration_ms"],
+      })
+      per_trace["llm_share"] = per_trace["llm_ms"] / per_trace["total_ms"]
+      median_llm_share = per_trace["llm_share"].median()
+
+      slowest = dict(t.loc[t.groupby("trace_id")["duration_ms"].idxmax(), "span"].value_counts())
+      print(per_trace.head())
+      print(median_llm_share, slowest)
+    tests: |
+      check_object("per_trace")
+      pt = user["per_trace"]
+      assert len(pt) == 300, f"`per_trace` should have one row per trace (300), it has {len(pt)}. Group by `trace_id`."
+      for col in ("total_ms", "llm_ms", "llm_share"):
+          assert col in pt.columns, f"`per_trace` needs a `{col}` column."
+      check_equal("median_llm_share", tol=1e-6, msg="`median_llm_share` should be the median of `llm_ms / total_ms` over all traces.")
+      check_object("slowest")
+      got = {k: int(v) for k, v in dict(user["slowest"]).items()}
+      exp = {k: int(v) for k, v in sol["slowest"].items()}
+      assert got == exp, f"`slowest` should be {exp}, got {got}. For each trace find the span with the largest `duration_ms` (idxmax), then count span names."
+    success_msg: |
+      In the median request the LLM call is about 95% of the time, and it is the slowest span in 299 of 300 traces
+      (the exception is a call that was rate-limited and failed fast). Speeding up retrieval would barely help:
+      the LLM span is where to look.
+
+  - id: sampling-decision
+    type: mc
+    title: Which traces do you keep?
+    question: |
+      ORBIT will roll out to five sister stations: **400,000 requests a day**. A full trace with prompt and answer is
+      about 40 KB, and your storage budget fits **20,000 full traces a day**. About **0.3%** of requests fail and you
+      must be able to debug every failure and the slowest 1% of requests. Which policy fits?
+    options:
+      - text: Keep every full trace.
+        feedback: That is 400,000 traces a day, 20 times the budget. It also keeps far more personal data than you need.
+      - text: Head sampling at 5%, decided when each request starts.
+        feedback: It fits the budget (20,000 a day), but the decision is made before you know how the request ends. You would keep only 5% of the 1,200 daily failures and of the slow requests, so most incidents would have no trace.
+      - text: "Tail sampling: decide when the trace ends; keep all errors, all requests in the slowest 1%, and 2% of the rest."
+        correct: true
+        feedback: "Right. That is about 1,200 errors + 4,000 slow + 7,900 random = about 13,000 traces, within budget, and every failure and outlier is kept. The random 2% gives you a baseline of normal requests to compare against. The cost is a collector that buffers spans until each trace finishes."
+      - text: Keep only metrics (latency, tokens, error counts), no traces.
+        feedback: Cheapest, and metrics tell you that the error rate rose. But they cannot tell you which step failed or what the prompt was, so you could not debug a single failure.
+    hint: For each option, count how many traces a day it keeps, and whether a failing request is guaranteed to be among them.

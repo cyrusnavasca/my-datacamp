@@ -1,0 +1,249 @@
+title: Retrieve, then generate
+description: Why RAG exists, the two halves of the loop, and your first answer grounded in the Helios-7 handbook.
+exercises:
+  - id: rtg-slides
+    type: video
+    title: The retrieve-then-generate loop
+    slides: |
+      # ORBIT doesn't know the handbook
+
+      The crew asks ORBIT: *"How long is the leak-check hold on AL-1?"*
+
+      A language model only knows what was in its training data, and the Helios-7 handbook wasn't in it. Asked
+      anyway, it does what models do: it writes a fluent, plausible and **wrong** answer.
+
+      **Retrieval-augmented generation (RAG)** fixes that in two moves:
+
+      1. **Retrieve**: find the handful of handbook passages most related to the question.
+      2. **Generate**: paste them into the prompt and tell the model to answer *only* from them.
+
+      The model stops being a source of facts and becomes a **reader**. The facts come from your documents, which
+      you can update, audit and cite.
+
+      ---
+
+      ## Two halves: index once, query many times
+
+      ```text
+      OFFLINE (when documents change)          ONLINE (every question)
+      load docs -> chunk -> embed -> store      embed question -> top-k by similarity
+                                                -> build prompt (chunks + question)
+                                                -> call the model -> answer + sources
+      ```
+
+      - **Offline** work is paid once per document change. Embedding 10,000 chunks is slow, so you never do it per question.
+      - **Online** work is paid on every question: one embedding, one similarity search, one model call.
+      - The pieces are separable, so each one can fail on its own, and each one can be measured on its own. That idea runs through this whole course.
+
+      In this chapter a "chunk" is a whole handbook document. Chapter 2 splits documents into smaller pieces.
+
+      ---
+
+      ## Retrieval, by hand
+
+      You built semantic search in the previous course. RAG reuses it unchanged:
+
+      ```python
+      import numpy as np
+      import aikit
+
+      docs = aikit.helios.handbook()                       # 35 dicts: id, title, section, updated, text
+      doc_vecs = aikit.embed([d["text"] for d in docs])    # (35, 64), each row has length 1
+
+      def retrieve(question, k=3):
+          q = aikit.embed(question)                        # (64,)
+          scores = doc_vecs @ q                            # cosine similarity, since rows are unit vectors
+          top = np.argsort(-scores)[:k]                    # best first
+          return [docs[i] for i in top]
+      ```
+
+      `aikit.embed` stands in for an embedding API (a real system would call one, with the same shape of result).
+      Retrieval is a matrix-vector product and a sort, which is why it's fast and cheap compared with the model call.
+
+      ---
+
+      ## Generation: the real API call
+
+      ```python
+      import anthropic
+      client = anthropic.Anthropic()                       # reads ANTHROPIC_API_KEY
+
+      context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in retrieve(question))
+      response = client.messages.create(
+          model="claude-sonnet-5-5",
+          max_tokens=400,
+          system="You are ORBIT. Answer using only the documents. If they don't say, say you don't know.",
+          messages=[{"role": "user", "content": f"{context}\n<question>{question}</question>"}],
+      )
+      print(response.content[0].text)
+      ```
+
+      In the exercises, `client` is an offline **FakeClaude** with the same interface. Its model is a strict
+      *extractive reader*: it answers only with sentences from the `<document>` blocks you send, so **bad retrieval
+      gives a visibly bad answer**. That makes it a good lab instrument.
+
+      ---
+
+      ## Prompt, RAG or fine-tune?
+
+      RAG isn't the only way to give a model knowledge. Compare the options before you build:
+
+      | | Put it all in the prompt | RAG | Fine-tune |
+      | --- | --- | --- | --- |
+      | Keeping facts fresh | edit the prompt | re-index changed docs (minutes) | retrain (hours to days) |
+      | Corpus size | must fit the context window | any size; only top-k per call | facts blur, hard to update |
+      | Cost per question | every token, every call (caching helps) | k chunks + retrieval | short prompts, but training costs |
+      | Citations | possible | natural: each chunk has an id | none |
+      | Typical failure | cost, "lost in the middle" | wrong chunks → wrong or "I don't know" | confident, outdated facts |
+      | Wins when | text is small, stable, always needed | knowledge is large, changing, must be cited | you need a *behaviour* or format, not facts |
+
+      The Helios handbook is only about 3,000 tokens, so stuffing it would work today. RAG pays off once the
+      station adds daily maintenance logs and incident reports, or when every answer has to say where it came from.
+      We use a small corpus so you can see every moving part.
+
+  - id: pipeline-order
+    type: order
+    title: Order the RAG pipeline
+    prompt: Put the steps of a RAG system in order, from the offline indexing work to the answer the crew member sees.
+    hint: Everything about documents happens before any question arrives. The model is called last.
+    items:
+      - Load the handbook documents
+      - Split the documents into chunks
+      - Embed every chunk and store the vectors
+      - Embed the crew member's question
+      - Score every chunk against the question and keep the top k
+      - Put the top chunks and the question into the prompt
+      - Call the model and return its answer with the sources
+
+  - id: retrieve-by-hand
+    type: coding
+    title: Retrieve the top documents
+    context: |
+      `docs` holds the 35 Helios handbook documents and `doc_vecs` their embeddings, one unit-length row per document,
+      in the same order. `aikit.embed(text)` embeds one string into a vector of the same length.
+    instructions:
+      - "Write `retrieve(question, k=3)`: embed the question, score every document with a dot product against `doc_vecs`, and return the `k` best documents (the dicts from `docs`), best first."
+      - "Store the ids of `retrieve(\"How long do spacewalkers prebreathe oxygen?\")` in `hits`."
+      - Print `hits`.
+    hint: |
+      `scores = doc_vecs @ aikit.embed(question)` gives one score per document. `np.argsort(-scores)[:k]` gives the
+      positions of the k highest scores, best first. Then `[docs[i] for i in top]`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      docs = aikit.helios.handbook()
+      doc_vecs = aikit.embed([d["text"] for d in docs])
+    sample_code: |
+      def retrieve(question, k=3):
+          q = ____
+          scores = ____
+          top = ____
+          return [docs[i] for i in top]
+
+      hits = [d["id"] for d in ____]
+      print(hits)
+    solution: |
+      def retrieve(question, k=3):
+          q = aikit.embed(question)
+          scores = doc_vecs @ q
+          top = np.argsort(-scores)[:k]
+          return [docs[i] for i in top]
+
+      hits = [d["id"] for d in retrieve("How long do spacewalkers prebreathe oxygen?")]
+      print(hits)
+    tests: |
+      check_object("retrieve")
+      check_equal("hits", msg="`hits` should be the ids of the 3 documents `retrieve` returns for the prebreathe question, best first.")
+      f, g = user["retrieve"], sol["retrieve"]
+      for q, k in [("What time is dinner?", 1), ("Where do we shelter during a radiation storm?", 2), ("How often are scrubber beds swapped?", 5)]:
+          got = [d["id"] for d in f(q, k)]
+          want = [d["id"] for d in g(q, k)]
+          assert len(got) == k, f"`retrieve(question, k={k})` should return exactly {k} documents; it returned {len(got)}."
+          assert got == want, f"For {q!r} with k={k} expected {want}, got {got}. Sort by score from highest to lowest (`np.argsort(-scores)`)."
+      assert isinstance(f("What time is dinner?", 1)[0], dict), "Return the document dicts themselves (`docs[i]`), not their positions or ids."
+    success_msg: |
+      The prebreathe question pulls up the EVA prep checklist first. Notice the second and third results: oxygen generation
+      and the robotic arm share words with the question but don't answer it. Retrieval ranks by similarity, not truth.
+
+  - id: first-rag-answer
+    type: coding
+    title: ORBIT's first grounded answer
+    context: |
+      `retrieve(question, k)` is the function you just wrote. `client` is a FakeClaude whose model answers only from
+      `<document id="...">...</document>` blocks in the prompt. `SYSTEM` holds ORBIT's grounding instructions and
+      `MODEL` the model id.
+    instructions:
+      - "Write `rag_answer(question, k=3)`: retrieve `k` documents and join them into `context`, one `<document id=\"ID\">TEXT</document>` per document."
+      - "Call `client.messages.create` with `model=MODEL`, `max_tokens=400`, `system=SYSTEM` and one user message containing `context`, then the question. Return the reply text."
+      - "Store `rag_answer(\"How long do spacewalkers prebreathe oxygen?\")` in `answer` and print it."
+    hint: |
+      `context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in retrieve(question, k))`.
+      The user content can be `f"{context}\n<question>{question}</question>"`. The reply text is `response.content[0].text`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.rag_systems import make_client, MODEL, SYSTEM
+      docs = aikit.helios.handbook()
+      doc_vecs = aikit.embed([d["text"] for d in docs])
+      client = make_client()
+
+      def retrieve(question, k=3):
+          scores = doc_vecs @ aikit.embed(question)
+          return [docs[i] for i in np.argsort(-scores)[:k]]
+    sample_code: |
+      def rag_answer(question, k=3):
+          context = "\n".join(____ for d in retrieve(question, k))
+          response = client.messages.create(
+              model=MODEL,
+              max_tokens=400,
+              system=SYSTEM,
+              messages=[{"role": "user", "content": ____}],
+          )
+          return ____
+
+      answer = rag_answer("How long do spacewalkers prebreathe oxygen?")
+      print(answer)
+    solution: |
+      def rag_answer(question, k=3):
+          context = "\n".join(f'<document id="{d["id"]}">{d["text"]}</document>' for d in retrieve(question, k))
+          response = client.messages.create(
+              model=MODEL,
+              max_tokens=400,
+              system=SYSTEM,
+              messages=[{"role": "user", "content": f"{context}\n<question>{question}</question>"}],
+          )
+          return response.content[0].text
+
+      answer = rag_answer("How long do spacewalkers prebreathe oxygen?")
+      print(answer)
+    tests: |
+      check_object("rag_answer")
+      check_object("answer")
+      assert isinstance(user["answer"], str), "`rag_answer` should return the reply text (`response.content[0].text`), not the whole response."
+      assert "2 hours" in user["answer"], f"The answer should say the prebreathe lasts 2 hours. Got: {user['answer']!r}. Check that every retrieved doc is wrapped in `<document id=\"...\">...</document>` and the question comes after them."
+      f = user["rag_answer"]
+      for q, fact in [("What time is dinner?", "19:00"), ("Where do we shelter during a radiation storm?", "Module D"), ("How often are scrubber beds swapped?", "90 days")]:
+          a = f(q)
+          assert fact in a, f"For {q!r} the answer should contain {fact!r}; got {a!r}."
+      calls = user["client"].calls
+      assert calls and all(c["model"] == user["MODEL"] for c in calls), "Call `client.messages.create` with `model=MODEL`."
+    success_msg: |
+      ORBIT now answers from the handbook. Every fact in the reply came from a retrieved document, so if the answer is
+      wrong you can look at what was retrieved and see why. That traceability is half the value of RAG.
+
+  - id: prompt-rag-or-tune
+    type: classify
+    title: Prompt, RAG or fine-tune?
+    prompt: |
+      For each Helios-7 need, pick the cheapest approach that will work well. Think about corpus size, how often it
+      changes, whether answers must be traceable, and whether you need knowledge or a behaviour.
+    hint: Facts that change or must be cited point to RAG. Small, stable text that every call needs fits in the prompt. A consistent behaviour or format that prompting couldn't fix points to fine-tuning.
+    zones: [Put it in the prompt, RAG, Fine-tune]
+    items:
+      - { text: "Six rules for how ORBIT addresses the crew, needed on every call", zone: Put it in the prompt }
+      - { text: "A 250-word glossary of station acronyms that rarely changes", zone: Put it in the prompt }
+      - { text: "40,000 maintenance logs, with new ones every day", zone: RAG }
+      - { text: "Answers must quote the current procedure and name the document it came from", zone: RAG }
+      - { text: "Incident reports that are added after every incident", zone: RAG }
+      - { text: "A small, cheap model must label 50,000 sensor alerts per day in a strict code format; few-shot prompting plateaued at 80%", zone: Fine-tune }
+      - { text: "Replies must always use the station's radio-call style, and examples in the prompt don't hold it over long chats", zone: Fine-tune }

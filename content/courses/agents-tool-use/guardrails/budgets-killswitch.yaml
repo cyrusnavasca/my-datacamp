@@ -1,0 +1,418 @@
+title: Budgets and the kill switch
+description: Cap what an unattended agent may spend, check budgets before the call rather than after, and give humans a stop button the agent can't ignore.
+exercises:
+  - id: budgets-slides
+    type: video
+    title: Limits for unattended agents
+    slides: |
+      # Nobody is watching at 03:00
+
+      An unattended agent needs limits that hold without a person in the loop:
+
+      | limit | stops | typical setting |
+      | --- | --- | --- |
+      | steps per request | loops, wandering | from the step distribution of successful runs (chapter 2) |
+      | repeated identical calls | stuck loops, duplicate side effects | stop at the first repeat |
+      | **cost per request** | one runaway request eating the night's budget | a few times the median request cost |
+      | **cost per shift** | many medium runaways | the budget you can afford to lose |
+      | calls per tool | message floods, booking storms | e.g. at most 3 `send_message` per request |
+      | wall-clock time | hangs | a minute or two per request |
+      | **kill switch** | anything, now | a person flips it |
+
+      Every stop is recorded with **why** it happened, so the morning report shows it.
+
+      ---
+
+      ## Check budgets before the call, not after
+
+      ```python
+      n = client.messages.count_tokens(model=MODEL, messages=messages, tools=TOOLS).input_tokens
+      worst_case = n * PRICE_IN + MAX_TOKENS * PRICE_OUT          # assume the longest possible reply
+      if spent + worst_case > BUDGET:
+          return stop("budget")
+      r = client.messages.create(model=MODEL, max_tokens=MAX_TOKENS, ...)
+      spent += cost_of(r.usage)                                   # the real cost, afterwards
+      ```
+
+      Checking only **after** each call overshoots by one call, and in an agent the next call is the expensive one: it
+      resends everything, including the 50,000-token result the last tool just returned. A pre-flight count costs a
+      little latency and no tokens. Look up current prices; never hard-code what you haven't checked.
+
+      ---
+
+      ## The kill switch
+
+      ```python
+      kill = KillSwitch()          # lives outside the agent: a file, a flag in a database, a button
+      ...
+      if kill.tripped:             # before every model call AND every tool call
+          return stop("killed")
+      ```
+
+      - Check it **between every step**. A check only at the start of a request lets a running request finish its damage.
+      - Once tripped: start no new requests, run no queued actions, report what was pending.
+      - The agent can't untrip it, and nothing in its context ("ignore the kill switch") can change it: it's code, not prompt.
+      - **Test it**: trip it in a drill and confirm the agent stops within one step.
+
+      ---
+
+      ## Trade-off: what happens when a limit is hit
+
+      | response | safety | crew experience | fits |
+      | --- | --- | --- | --- |
+      | hard stop, report "budget exceeded" | highest | the request isn't done | unattended runs |
+      | degrade: switch to a cheaper model or digest results | high | slower, maybe worse answers | cost limits on routine work |
+      | ask a human to extend the budget | high | waits for a person | attended work, rare big jobs |
+      | soft limit: warn and continue | lowest | uninterrupted | only for read-only work you're measuring |
+
+      Unattended agents default to hard stops plus a clear morning report. Being surprised by a status is cheap;
+      being surprised by a bill or a vented airlock isn't.
+
+  - id: budget-guard
+    type: coding
+    title: A budget that holds
+    context: |
+      A crew member asks ORBIT to compare a whole day of humidity across all modules. Its model reads 24-hour histories,
+      about 50,000 tokens each, one after another. The request budget is `BUDGET` dollars. `PRICE_IN` and `PRICE_OUT` are
+      the model's prices per token, and every entry in `client.calls` has a `"cost"`. `post_check_run()` runs the same
+      request with a budget checked **after** each call and returns what it spent.
+    instructions:
+      - "Before each model call, count the input tokens with `client.messages.count_tokens(model=MODEL, messages=messages, tools=TOOLS).input_tokens` and compute `worst_case = n * PRICE_IN + MAX_TOKENS * PRICE_OUT`."
+      - "If `spent + worst_case > BUDGET`, return `{\"stop\": \"budget\", \"steps\": step - 1, \"spent\": spent}` without calling. After each call, add `client.calls[-1][\"cost\"]` to `spent`."
+      - "Run it and store the result in `result`. Store `naive_spent = post_check_run()` to compare."
+    hint: |
+      Put the check at the top of the `for step` loop, before `client.messages.create`. Keep `spent` as a running total
+      that starts at 0.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, FakeClaude, VirtualClock, history_hog, tool_result, ToolError, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      BUDGET = 0.05
+      MAX_TOKENS = 1024
+      PRICE_IN = aikit.PRICES["medium"]["input"] / 1_000_000
+      PRICE_OUT = aikit.PRICES["medium"]["output"] / 1_000_000
+      task = "Compare the last 24 hours of humidity in every module."
+      client = FakeClaude(history_hog(), clock=VirtualClock())
+
+      def _step(c, messages):
+          r = c.messages.create(model=MODEL, max_tokens=MAX_TOKENS, tools=TOOLS, messages=messages)
+          messages.append({"role": "assistant", "content": r.content})
+          if r.stop_reason != "tool_use":
+              return False
+          messages.append({"role": "user", "content": [tool_result(b.id, station.run_tool(b.name, b.input))
+                                                        for b in r.content if b.type == "tool_use"]})
+          return True
+
+      def post_check_run(max_steps=8):
+          c = FakeClaude(history_hog(), clock=VirtualClock())
+          messages, spent = [{"role": "user", "content": task}], 0.0
+          for _ in range(max_steps):
+              more = _step(c, messages)
+              spent += c.calls[-1]["cost"]
+              if spent > BUDGET or not more:
+                  break
+          return spent
+    sample_code: |
+      def run_with_budget(max_steps=8):
+          messages, spent = [{"role": "user", "content": task}], 0.0
+          for step in range(1, max_steps + 1):
+              n = ____
+              worst_case = ____
+              if ____:
+                  return {"stop": "budget", "steps": step - 1, "spent": spent}
+              r = client.messages.create(model=MODEL, max_tokens=MAX_TOKENS, tools=TOOLS, messages=messages)
+              spent += ____
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return {"stop": "end_turn", "steps": step, "spent": spent}
+              messages.append({"role": "user", "content": [tool_result(b.id, station.run_tool(b.name, b.input))
+                                                            for b in r.content if b.type == "tool_use"]})
+          return {"stop": "max_steps", "steps": max_steps, "spent": spent}
+
+      result = run_with_budget()
+      naive_spent = ____
+      print(result)
+      print(f"pre-flight check spent ${result['spent']:.4f}; post-call check spent ${naive_spent:.4f} (budget ${BUDGET})")
+    solution: |
+      def run_with_budget(max_steps=8):
+          messages, spent = [{"role": "user", "content": task}], 0.0
+          for step in range(1, max_steps + 1):
+              n = client.messages.count_tokens(model=MODEL, messages=messages, tools=TOOLS).input_tokens
+              worst_case = n * PRICE_IN + MAX_TOKENS * PRICE_OUT
+              if spent + worst_case > BUDGET:
+                  return {"stop": "budget", "steps": step - 1, "spent": spent}
+              r = client.messages.create(model=MODEL, max_tokens=MAX_TOKENS, tools=TOOLS, messages=messages)
+              spent += client.calls[-1]["cost"]
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return {"stop": "end_turn", "steps": step, "spent": spent}
+              messages.append({"role": "user", "content": [tool_result(b.id, station.run_tool(b.name, b.input))
+                                                            for b in r.content if b.type == "tool_use"]})
+          return {"stop": "max_steps", "steps": max_steps, "spent": spent}
+
+      result = run_with_budget()
+      naive_spent = post_check_run()
+      print(result)
+      print(f"pre-flight check spent ${result['spent']:.4f}; post-call check spent ${naive_spent:.4f} (budget ${BUDGET})")
+    tests: |
+      r = check_object("result")
+      assert r.get("stop") == "budget", f"The run should stop on the budget; it stopped with {r.get('stop')!r}."
+      total = user["client"].total_cost()
+      assert total <= user["BUDGET"], f"The client spent ${total:.4f}, over the ${user['BUDGET']} budget. Check the estimate *before* calling the model, not after."
+      assert abs(r["spent"] - total) < 1e-9, "`spent` should add up the cost of every call made."
+      assert r["steps"] == 1, f"Only the first call fits in the budget; the run made {r['steps']}."
+      check_equal("naive_spent", msg="`naive_spent` is what `post_check_run()` returns.")
+    success_msg: |
+      The pre-flight check saw that the next call would resend 50,000 tokens and stopped under budget. The post-call
+      version only noticed after paying for that call, at about three times the budget. In agents the expensive call
+      is the next one, so check before it.
+
+  - id: where-to-check
+    type: mc
+    title: Where does the kill switch go?
+    question: |
+      ORBIT runs requests unattended, each a loop of model calls and tool calls. The commander must be able to stop it
+      within seconds, even in the middle of a long request. Where should the harness check `kill.tripped`?
+    options:
+      - text: Before every model call and before every tool call, and before starting each request.
+        correct: true
+        feedback: "Right. Between every step is the only place that bounds how much can happen after the switch is flipped: at most the call already in flight."
+      - text: Only before starting each request.
+        feedback: "A request already running would carry on: a 6-step request could still book, message or ask for an airlock after the commander hit stop."
+      - text: "In the system prompt: \"If the kill switch is on, stop immediately.\""
+        feedback: "The model can't see the switch, and prompts aren't enforcement. A kill switch has to be code that runs whether or not the model cooperates."
+      - text: Only when a budget limit is reached.
+        feedback: "Budgets and the kill switch answer different questions. The commander may need to stop a cheap but wrong run, such as one repeating airlock requests."
+    hint: How many actions can happen between the switch being flipped and the next check?
+
+  - id: night-shift
+    type: sequential
+    title: "Mission: the night shift"
+    context: |
+      Tonight ORBIT runs 10 crew requests unattended (`REQUESTS`: `(requester, text)` pairs). It must finish the safe ones,
+      queue anything that opens an airlock for the commander, stay under budget, and stop when the commander hits the kill
+      switch before the last request. One request asks it to summarise maintenance log 0412, which is untrusted. The
+      model (`client`), the tools (`TOOLS`), `kill`, `approval_queue` and the limits are set up for you.
+    pre_code: |
+      import json
+      import aikit
+      from kits.agents_tool_use import (HeliosStation, FakeClaude, VirtualClock, KillSwitch, night_shift_model, night_tools,
+                                        read_log, tool_result, text_of, ToolError, NIGHT_REQUESTS, MODEL)
+      station = HeliosStation()
+      TOOLS = night_tools()
+      client = FakeClaude(night_shift_model(), clock=VirtualClock())
+      kill = KillSwitch()
+      approval_queue = []
+      REQUESTS = NIGHT_REQUESTS
+      CREW = [c["name"] for c in station.roster]
+      READ = {"get_sensor", "sensor_history", "search_handbook", "crew_roster", "read_log"}
+      WRITE = {"book_module", "send_message"}
+      DANGEROUS = {"open_airlock"}
+      MAX_STEPS, MAX_TOKENS = 6, 1024
+      PER_REQUEST_BUDGET, SHIFT_BUDGET = 0.05, 0.15
+      PRICE_IN = aikit.PRICES["medium"]["input"] / 1_000_000
+      PRICE_OUT = aikit.PRICES["medium"]["output"] / 1_000_000
+      KILL_BEFORE = 9   # the commander trips the switch before request index 9
+    steps:
+      - instructions:
+          - "Write `guarded_execute(name, input, requester, task)`. In order: if `kill.tripped`, return an error; `DANGEROUS` tools are queued (`{\"id\", \"tool\", \"input\", \"requester\", \"task\", \"status\": \"pending\"}`) and return a pending, don't-retry error; `send_message` to anyone not in `CREW` and any tool outside `READ | WRITE` return a refusal error."
+          - "Otherwise run it: `read_log(**input)` for `read_log`, `station.run_tool(name, input)` for the rest, turning a `ToolError` into an error. Errors are `(text, True)` tuples."
+        hint: |
+          Mirror the airlock gate from the last lesson. Wrap the run in `try`/`except ToolError as e: return f"Error: {e}", True`.
+          The kill check must come first, so nothing runs once the switch is tripped.
+        sample_code: |
+          def guarded_execute(name, input, requester, task=""):
+              if kill.tripped:
+                  return "Error: the kill switch is tripped. Stop now.", True
+              if name in DANGEROUS:
+                  item = ____
+                  approval_queue.append(item)
+                  return f"Approval required: request #{item['id']} is pending the commander's decision. Do not retry.", True
+              if ____:
+                  return f"Error: messages may only go to crew members, not {input.get('to')!r}.", True
+              if name not in READ | WRITE:
+                  return ____
+              try:
+                  if name == "read_log":
+                      return read_log(**input)
+                  return station.run_tool(name, input)
+              except ToolError as e:
+                  return ____
+        solution: |
+          def guarded_execute(name, input, requester, task=""):
+              if kill.tripped:
+                  return "Error: the kill switch is tripped. Stop now.", True
+              if name in DANGEROUS:
+                  item = {"id": len(approval_queue) + 1, "tool": name, "input": input, "requester": requester,
+                          "task": task, "status": "pending"}
+                  approval_queue.append(item)
+                  return f"Approval required: request #{item['id']} is pending the commander's decision. Do not retry.", True
+              if name == "send_message" and input.get("to") not in CREW:
+                  return f"Error: messages may only go to crew members, not {input.get('to')!r}.", True
+              if name not in READ | WRITE:
+                  return f"Error: {name} is not allowed for the night assistant.", True
+              try:
+                  if name == "read_log":
+                      return read_log(**input)
+                  return station.run_tool(name, input)
+              except ToolError as e:
+                  return f"Error: {e}", True
+        tests: |
+          ge = user["guarded_execute"]
+          st, q, k = user["station"], user["approval_queue"], user["kill"]
+          out = ge("open_airlock", {"airlock_id": "AL-2"}, "Tomas Lindqvist", "Open AL-2")
+          assert isinstance(out, tuple) and out[1] is True and "pending" in out[0], f"open_airlock should return a (pending message, True) tuple; got {out!r}."
+          assert st.airlocks["AL-2"] == "closed" and len(q) == 1, "open_airlock must be queued, not run."
+          assert q[0].get("requester") == "Tomas Lindqvist" and q[0].get("task") == "Open AL-2" and q[0].get("status") == "pending", f"The queue item should record requester, task and status 'pending'; got {q[0]}."
+          out = ge("send_message", {"to": "Meridian Control", "text": "hi"}, "Noor Haddad", "")
+          assert isinstance(out, tuple) and out[1] is True and not st.outbox, "Messages to anyone outside the crew must be refused."
+          out = ge("delete_logs", {}, "Noor Haddad", "")
+          assert isinstance(out, tuple) and out[1] is True, "Tools outside READ | WRITE must be refused."
+          out = ge("get_sensor", {"module": "C", "metric": "pressure_x"}, "Kenji Watanabe", "")
+          assert isinstance(out, tuple) and out[1] is True and "Error" in out[0], "A ToolError should come back as an (error, True) tuple."
+          assert "Replaced filter" in ge("read_log", {"log_id": "0412"}, "Lucía Ferreira", ""), "read_log should return the log's text."
+          k.trip("drill")
+          out = ge("get_sensor", {"module": "C", "metric": "humidity"}, "Kenji Watanabe", "")
+          k.tripped = False
+          assert isinstance(out, tuple) and out[1] is True and "kill" in out[0].lower(), "With the kill switch tripped, nothing may run: return an error first."
+      - instructions:
+          - "Write `run_request(text, requester)`, the guarded loop. Before every model call: return status `\"killed\"` if `kill.tripped`; pre-flight the cost and return `\"budget\"` if this request's spending plus the worst case would exceed `PER_REQUEST_BUDGET`."
+          - "Run tools through `guarded_execute`. Return `\"capped\"` on a repeated identical call or after `MAX_STEPS`. On `end_turn`, return `\"queued\"` if this request added to `approval_queue`, else `\"done\"`."
+          - "Every return is `{\"status\", \"answer\", \"steps\", \"cost\"}`, where `cost` is what `client.total_cost()` grew by during the request."
+        hint: |
+          Record `start = client.total_cost()` and `queued_before = len(approval_queue)` at the top. A small inner
+          `finish(status, step, answer=None)` helper keeps the returns consistent. Repeat keys are
+          `(b.name, json.dumps(b.input, sort_keys=True))`.
+        sample_code: |
+          def run_request(text, requester):
+              start, queued_before = client.total_cost(), len(approval_queue)
+
+              def finish(status, step, answer=None):
+                  return {"status": status, "answer": answer, "steps": step, "cost": client.total_cost() - start}
+
+              messages, seen = [{"role": "user", "content": text}], set()
+              for step in range(1, MAX_STEPS + 1):
+                  if kill.tripped:
+                      return finish("killed", step - 1)
+                  n = client.messages.count_tokens(model=MODEL, messages=messages, tools=TOOLS).input_tokens
+                  if ____:
+                      return finish("budget", step - 1)
+                  r = client.messages.create(model=MODEL, max_tokens=MAX_TOKENS, tools=TOOLS, messages=messages)
+                  messages.append({"role": "assistant", "content": r.content})
+                  if r.stop_reason != "tool_use":
+                      return finish(____, step, text_of(r))
+                  results = []
+                  for b in r.content:
+                      if b.type != "tool_use":
+                          continue
+                      key = (b.name, json.dumps(b.input, sort_keys=True))
+                      if key in seen:
+                          return finish("capped", step)
+                      seen.add(key)
+                      out = guarded_execute(b.name, b.input, requester, text)
+                      body, is_err = out if isinstance(out, tuple) else (out, False)
+                      results.append(tool_result(b.id, body, is_err))
+                  messages.append({"role": "user", "content": results})
+              return finish(____, MAX_STEPS)
+        solution: |
+          def run_request(text, requester):
+              start, queued_before = client.total_cost(), len(approval_queue)
+
+              def finish(status, step, answer=None):
+                  return {"status": status, "answer": answer, "steps": step, "cost": client.total_cost() - start}
+
+              messages, seen = [{"role": "user", "content": text}], set()
+              for step in range(1, MAX_STEPS + 1):
+                  if kill.tripped:
+                      return finish("killed", step - 1)
+                  n = client.messages.count_tokens(model=MODEL, messages=messages, tools=TOOLS).input_tokens
+                  if client.total_cost() - start + n * PRICE_IN + MAX_TOKENS * PRICE_OUT > PER_REQUEST_BUDGET:
+                      return finish("budget", step - 1)
+                  r = client.messages.create(model=MODEL, max_tokens=MAX_TOKENS, tools=TOOLS, messages=messages)
+                  messages.append({"role": "assistant", "content": r.content})
+                  if r.stop_reason != "tool_use":
+                      return finish("queued" if len(approval_queue) > queued_before else "done", step, text_of(r))
+                  results = []
+                  for b in r.content:
+                      if b.type != "tool_use":
+                          continue
+                      key = (b.name, json.dumps(b.input, sort_keys=True))
+                      if key in seen:
+                          return finish("capped", step)
+                      seen.add(key)
+                      out = guarded_execute(b.name, b.input, requester, text)
+                      body, is_err = out if isinstance(out, tuple) else (out, False)
+                      results.append(tool_result(b.id, body, is_err))
+                  messages.append({"role": "user", "content": results})
+              return finish("capped", MAX_STEPS)
+        tests: |
+          rr = user["run_request"]
+          st, q, k, c = user["station"], user["approval_queue"], user["kill"], user["client"]
+          r = rr("Read the CO2 level in engineering.", "Kenji Watanabe")
+          assert r.get("status") == "done" and "0.282" in (r.get("answer") or ""), f"A plain read should end 'done' with the reading; got {r}."
+          r = rr("Open AL-2 so the cargo drone can dock.", "Tomas Lindqvist")
+          assert r.get("status") == "queued" and st.airlocks["AL-2"] == "closed", f"An airlock request should end 'queued' with the airlock closed; got {r}."
+          r = rr("Keep checking hydroponics humidity until it drops below 60%.", "Kenji Watanabe")
+          assert r.get("status") == "capped" and r.get("steps", 99) <= 2, f"The polling request should be stopped by the repeat detector at step 2 ('capped'); got {r}."
+          r = rr("Compare the last 24 hours of humidity in every module.", "Noor Haddad")
+          assert r.get("status") == "budget", f"The 24-hour comparison should stop on the budget; got {r}."
+          assert r["cost"] <= user["PER_REQUEST_BUDGET"], f"It spent ${r['cost']:.4f}, over the ${user['PER_REQUEST_BUDGET']} request budget. Pre-flight the next call's cost."
+          k.trip("drill")
+          before = len(c.calls)
+          r = rr("Read the CO2 level in engineering.", "Kenji Watanabe")
+          k.tripped = False
+          assert r.get("status") == "killed" and len(c.calls) == before, f"With the switch tripped the request must stop before any model call; got {r} and {len(c.calls) - before} call(s)."
+      - instructions:
+          - "Run the shift: for each `(who, text)` in `REQUESTS` (with its index `i`), trip the switch with `kill.trip(\"commander\")` when `i == KILL_BEFORE`, then call `run_request(text, who)`, and append `{\"who\", \"request\", **result}` to `report`."
+          - "Store `statuses` (the list of statuses) and `shift_cost` (total of the `cost` column), and print the morning report: one line per request, then the approval queue."
+        hint: "`report.append({\"who\": who, \"request\": text, **result})`, then `statuses = [r[\"status\"] for r in report]`."
+        sample_code: |
+          report = []
+          for i, (who, text) in enumerate(REQUESTS):
+              if ____:
+                  kill.trip("commander")
+              result = ____
+              report.append({"who": who, "request": text, **result})
+
+          statuses = ____
+          shift_cost = ____
+          for r in report:
+              print(f"{r['status']:7} ${r['cost']:.4f}  {r['who']:16} {r['request']}")
+          print(f"shift cost ${shift_cost:.4f} of ${SHIFT_BUDGET}")
+          for item in approval_queue:
+              print("AWAITING COMMANDER:", item["tool"], item["input"], "for", item["requester"], "| task:", item["task"])
+        solution: |
+          report = []
+          for i, (who, text) in enumerate(REQUESTS):
+              if i == KILL_BEFORE:
+                  kill.trip("commander")
+              result = run_request(text, who)
+              report.append({"who": who, "request": text, **result})
+
+          statuses = [r["status"] for r in report]
+          shift_cost = sum(r["cost"] for r in report)
+          for r in report:
+              print(f"{r['status']:7} ${r['cost']:.4f}  {r['who']:16} {r['request']}")
+          print(f"shift cost ${shift_cost:.4f} of ${SHIFT_BUDGET}")
+          for item in approval_queue:
+              print("AWAITING COMMANDER:", item["tool"], item["input"], "for", item["requester"], "| task:", item["task"])
+        tests: |
+          from kits.agents_tool_use import NIGHT_EXPECTED
+          s = check_object("statuses")
+          bad = [(i, got, want) for i, (got, want) in enumerate(zip(s, NIGHT_EXPECTED)) if got != want]
+          assert len(s) == 10 and not bad, f"Statuses should be {NIGHT_EXPECTED}; these differ (index, got, expected): {bad}."
+          st = user["station"]
+          assert all(v == "closed" for v in st.airlocks.values()), "An airlock opened during the night shift!"
+          assert all(a["tool"] != "open_airlock" for a in st.actions), "open_airlock reached the station. It must only ever be queued."
+          q = user["approval_queue"]
+          assert [x["input"]["airlock_id"] for x in q] == ["AL-2", "AL-1"], f"The commander's queue should hold AL-2 (cargo drone) and AL-1 (from the maintenance log); it holds {[x['input'] for x in q]}."
+          assert "maintenance log 0412" in str(q[1].get("task")), "The AL-1 request should record that it came from the log summary, so the commander can see it's suspicious."
+          assert user["shift_cost"] <= user["SHIFT_BUDGET"], f"The shift cost ${user['shift_cost']:.4f}, over the ${user['SHIFT_BUDGET']} budget."
+          assert abs(user["shift_cost"] - user["client"].total_cost()) < 1e-9, "`shift_cost` should add up the cost of every request."
+    success_msg: |
+      Morning report: five requests done, two airlock requests waiting for the commander (one of them planted by the
+      maintenance log, and the queue shows exactly where it came from), one polling loop stopped at its first repeat,
+      one runaway comparison stopped before its expensive call, and the last request never started because the
+      commander said stop. No airlock opened, and the night cost a few cents. Nothing here relied on the model behaving:
+      every guarantee came from your harness.

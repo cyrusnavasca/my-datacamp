@@ -1,0 +1,219 @@
+title: A server from scratch
+description: An MCP server is a dispatch table from method names to handlers. Build one for the Helios sensors, then see what FastMCP generates for you, and how to size your tools.
+exercises:
+  - id: server-slides
+    type: video
+    title: A server is a loop and a dispatch table
+    slides: |
+      # The whole server in one function
+
+      Whatever the transport, a server does the same four things for every incoming message:
+
+      1. **Parse** it (the transport hands you a line or an HTTP body).
+      2. **Classify** it: a request, a notification or a response.
+      3. **Route** requests by `method` to a handler.
+      4. **Wrap** the handler's return value in a response with the same `id`.
+
+      ```python
+      HANDLERS = {"initialize": on_initialize, "ping": lambda p: {},
+                  "tools/list": on_tools_list, "tools/call": on_tools_call}
+
+      def handle(msg):
+          if "id" not in msg:                      # notification: act on it, never answer
+              return None
+          handler = HANDLERS.get(msg["method"])
+          if handler is None:
+              return error(msg["id"], -32601, "Method not found")
+          return result(msg["id"], handler(msg.get("params", {})))
+      ```
+
+      ---
+
+      ## The handlers
+
+      ```python
+      def on_initialize(params):
+          asked = params["protocolVersion"]
+          return {"protocolVersion": asked if asked in SUPPORTED else SUPPORTED[0],
+                  "capabilities": {"tools": {}},              # declare only what you implement
+                  "serverInfo": {"name": "helios-sensors", "version": "0.1.0"}}
+
+      def on_tools_list(params):
+          return {"tools": [GET_SENSOR]}                    # name, description, inputSchema
+
+      def on_tools_call(params):
+          text = station.run_tool(params["name"], params["arguments"])
+          return {"content": [{"type": "text", "text": text}], "isError": False}
+      ```
+
+      A tool result is a list of **content blocks**: `text`, `image` (base64 plus `mimeType`), or a
+      resource. Newer spec revisions also allow `structuredContent` that matches a declared `outputSchema`.
+
+      ---
+
+      ## What FastMCP does for you
+
+      ```python
+      from typing import Literal
+      from mcp.server.fastmcp import FastMCP
+
+      mcp = FastMCP("helios-sensors")
+
+      @mcp.tool()
+      def get_sensor(module: Literal["A", "B", "C", "D", "E", "F"],
+                     metric: Literal["temperature", "humidity", "co2", "o2", "pressure"]) -> str:
+          """Read one environment sensor in a Helios-7 module."""
+          return station.run_tool("get_sensor", {"module": module, "metric": metric})
+      ```
+
+      | you write | FastMCP generates |
+      | --- | --- |
+      | `@mcp.tool()` | an entry in the tools registry, and `tools/list` |
+      | type hints (`Literal[...]`) | `inputSchema` with types and `enum` |
+      | the docstring | the tool's `description`: the model reads it |
+      | the return value | a `content` list |
+      | an exception | an `isError: true` result |
+      | `mcp.run()` | the transport, the lifecycle and version negotiation |
+
+      When a tool misbehaves, look at what it generated: print the `tools/list` result.
+
+      ---
+
+      ## How big should a tool be?
+
+      | design | example | model picks the right tool | round trips for "is Module C healthy?" | tokens | per-action permissions |
+      | --- | --- | --- | --- | --- | --- |
+      | one mega-tool | `station(action, params)` | poor: one vague description | 1 | small list, but large free-form params | none: approve all or nothing |
+      | fine-grained | `get_sensor(module, metric)` | good | 5 | small results, but 5 of them | yes |
+      | task-level | `module_health(module)` returns all 5 readings with normal ranges | good | 1 | one larger result | yes |
+
+      **Design tools around the tasks the model has to do, not around your API endpoints.** Add a
+      task-level tool for the common question, keep fine-grained tools for the rest, and give risky
+      actions (`book_module`, `open_airlock`) **their own tools**, so the host can gate them one by one.
+
+  - id: dispatch-parsons
+    type: parsons
+    title: Arrange the dispatcher
+    prompt: Arrange the lines of `handle(msg)` so notifications get no answer, unknown methods get -32601, and everything else goes to its handler.
+    hint: Notifications are checked first; the lookup comes before the "not found" test.
+    lines:
+      - "def handle(msg):"
+      - "    if \"id\" not in msg:"
+      - "        return None"
+      - "    handler = HANDLERS.get(msg[\"method\"])"
+      - "    if handler is None:"
+      - "        return error(msg[\"id\"], -32601, \"Method not found\")"
+      - "    return result(msg[\"id\"], handler(msg.get(\"params\", {})))"
+
+  - id: sensor-server
+    type: coding
+    title: The Helios sensor server
+    context: |
+      `handle(msg)` is the dispatcher you just arranged; it routes through `HANDLERS`, which you'll fill.
+      `GET_SENSOR` is the tool definition, `station.run_tool(name, arguments)` returns a JSON string, and
+      `SUPPORTED` lists the protocol versions this server speaks (newest first). A scripted test client
+      will connect to your server.
+    instructions:
+      - "Write `on_initialize(params)`: echo `params[\"protocolVersion\"]` if it's in `SUPPORTED`, else answer `SUPPORTED[0]`. Declare `{\"tools\": {}}` and a `serverInfo` with name `helios-sensors` and a version."
+      - "Write `on_tools_list(params)` returning `{\"tools\": [GET_SENSOR]}`."
+      - "Write `on_tools_call(params)`: run the tool through `station` and return a result with one text content block and `isError` False."
+      - "Fill `HANDLERS` with `initialize`, `ping` (returns `{}`), `tools/list` and `tools/call`."
+    hint: |
+      `text = station.run_tool(params["name"], params.get("arguments", {}))`, then
+      `return {"content": [{"type": "text", "text": text}], "isError": False}`.
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import SUPPORTED, result, error, sensor_server, MCPClient, request, NEW, OLD
+      station = aikit.helios.Station()
+      GET_SENSOR = sensor_server().tool_definitions()[0]
+
+      def handle(msg):
+          if "id" not in msg:
+              return None
+          handler = HANDLERS.get(msg["method"])
+          if handler is None:
+              return error(msg["id"], -32601, "Method not found")
+          return result(msg["id"], handler(msg.get("params", {})))
+    sample_code: |
+      def on_initialize(params):
+          asked = params["protocolVersion"]
+          return {"protocolVersion": ____,
+                  "capabilities": ____,
+                  "serverInfo": {"name": "helios-sensors", "version": "0.1.0"}}
+
+      def on_tools_list(params):
+          return ____
+
+      def on_tools_call(params):
+          text = ____
+          return {"content": [{"type": "text", "text": text}], "isError": False}
+
+      HANDLERS = {"initialize": on_initialize, ____}
+
+      client = MCPClient(handle)
+      print(client.initialize())
+      print([t["name"] for t in client.list_tools()])
+      print(client.call_tool("get_sensor", {"module": "C", "metric": "humidity"}))
+    solution: |
+      def on_initialize(params):
+          asked = params["protocolVersion"]
+          return {"protocolVersion": asked if asked in SUPPORTED else SUPPORTED[0],
+                  "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "helios-sensors", "version": "0.1.0"}}
+
+      def on_tools_list(params):
+          return {"tools": [GET_SENSOR]}
+
+      def on_tools_call(params):
+          text = station.run_tool(params["name"], params.get("arguments", {}))
+          return {"content": [{"type": "text", "text": text}], "isError": False}
+
+      HANDLERS = {"initialize": on_initialize, "ping": lambda params: {},
+                  "tools/list": on_tools_list, "tools/call": on_tools_call}
+
+      client = MCPClient(handle)
+      print(client.initialize())
+      print([t["name"] for t in client.list_tools()])
+      print(client.call_tool("get_sensor", {"module": "C", "metric": "humidity"}))
+    tests: |
+      MCPClient, request, NEW, OLD = user["MCPClient"], user["request"], user["NEW"], user["OLD"]
+      h = user["handle"]
+      check_object("HANDLERS")
+      missing = [m for m in ("initialize", "ping", "tools/list", "tools/call") if m not in user["HANDLERS"]]
+      assert not missing, f"`HANDLERS` is missing {missing}."
+      c = MCPClient(h)
+      info = c.initialize()
+      assert info["protocolVersion"] == NEW, "A client asking for the newest version should get it echoed back."
+      assert "tools" in info.get("capabilities", {}), "Declare `{'tools': {}}` in capabilities so clients know to call tools/list."
+      assert MCPClient(h, versions=[OLD]).initialize()["protocolVersion"] == OLD, "A client that asks for the older supported version should get that version back."
+      r = h(request(50, "initialize", {"protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}))
+      assert r["result"]["protocolVersion"] == NEW, "For a version you don't support, answer with your newest: `SUPPORTED[0]`."
+      assert h(request(51, "ping")) == {"jsonrpc": "2.0", "id": 51, "result": {}}, "`ping` should return an empty result `{}`."
+      assert [t["name"] for t in c.list_tools()] == ["get_sensor"], "`tools/list` should return `{'tools': [GET_SENSOR]}`."
+      out = c.call_tool("get_sensor", {"module": "C", "metric": "humidity"})
+      assert out.get("isError") is False and "68" in out["content"][0]["text"], "`tools/call` should run the tool and wrap its text in `content`."
+      out = c.call_tool("get_sensor", {"module": "B", "metric": "co2"})
+      assert '"co2"' in out["content"][0]["text"], "`tools/call` should pass `params['arguments']` to the station."
+    success_msg: |
+      About twenty lines, and a real MCP client can talk to it. Everything FastMCP adds (schema
+      generation, transports, validation) sits around this same dispatch table.
+
+  - id: tool-granularity
+    type: mc
+    title: Redesign the sensor tools
+    question: |
+      Crew logs show ORBIT's most common request is "is Module X healthy?". Today that takes five
+      `get_sensor` calls, about 4 seconds, and ORBIT sometimes forgets a metric. Crew also ask for
+      single readings, and the ops team wants to approve each `book_module` call separately. Which
+      redesign of the server's tools is best?
+    options:
+      - text: Add a task-level module_health(module) tool that returns all five readings with their normal ranges; keep get_sensor and book_module as they are
+        correct: true
+        feedback: Right. One call answers the common question with nothing forgotten, single readings stay cheap, and bookings keep their own tool, so the host can still gate them.
+      - text: Replace every tool with one station(action, params) tool to keep the tool list short
+        feedback: The list gets shorter, but the model now has to guess free-form params from one vague description, and the host can't approve book_module separately from harmless reads.
+      - text: Keep only get_sensor and tell the model in the system prompt to call it five times in parallel
+        feedback: Parallel calls cut the latency, so it's a fair partial fix, but you still pay for five results, and the model still has to know the normal ranges and remember all five metrics.
+      - text: Fold book_module into module_health so a single call can check a module and book it
+        feedback: Mixing a read and a write in one tool means the host can't approve the booking without also gating every health check. Keep risky actions in their own tools.
+    hint: Look at the granularity table. Which option fixes the common case without losing per-action approval?

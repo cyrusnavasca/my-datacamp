@@ -1,0 +1,232 @@
+title: When the loss will not go down
+description: Read the loss curve, measure before guessing, sweep the learning rate, and repair a broken training loop.
+exercises:
+  - id: intro
+    type: video
+    title: A playbook for training that does not work
+    slides: |
+      # Read the symptom first
+
+      | what the loss does | first suspect | also check |
+      | --- | --- | --- |
+      | `nan` or `inf` within a few steps | learning rate too high | unscaled inputs, `log(0)`, exploding gradients |
+      | bounces, never settles | learning rate too high | batch too small, data not shuffled |
+      | falls in a slow straight line | learning rate too low | |
+      | flat from step 1 | the loop: no `step()`, broken graph, frozen params | dead ReLUs, vanishing gradients |
+      | falls, then gets erratic and grows | forgot `zero_grad()`: gradients pile up | |
+      | stuck at $\ln C$ for a classifier | labels and inputs not matched up | wrong label column, shuffled one but not the other |
+      | train falls, validation rises | overfitting | lesson 4 of this chapter |
+
+      ---
+
+      ## Measure before you change anything
+
+      Four cheap checks, in order:
+
+      1. **Initial loss.** About $\ln C$ for classification (chapter 2). Far off means a bug before training even starts.
+      2. **Overfit one small batch.** Train on 8-32 examples for a few hundred steps. Any reasonable model should drive the loss near zero. If it cannot, you have a **bug**, not a tuning problem.
+      3. **Gradient norms** per layer after `backward()`. All zero: a broken graph or frozen parameters. Tiny at the input: vanishing. Huge: exploding.
+      4. **Update size.** $\lVert \text{lr} \cdot g \rVert / \lVert w \rVert$ per layer. Around $10^{-3}$ is healthy; $10^{-1}$ means the lr is too high, $10^{-6}$ too low.
+
+      ---
+
+      ## The learning-rate sweep
+
+      ```python
+      def final_loss(lr, steps=150):
+          torch.manual_seed(0)                 # same init for every lr: a fair comparison
+          model = make_model()
+          opt = torch.optim.SGD(model.parameters(), lr=lr)
+          for _ in range(steps):
+              ...                              # the five steps
+          return loss.item()
+
+      results = {lr: final_loss(lr) for lr in [1.0, 0.1, 0.01, 0.001]}
+      ```
+
+      - Space the values **logarithmically**; the right lr is found by order of magnitude.
+      - Fix the seed inside, or you are comparing initialisations, not learning rates.
+      - Treat `nan` as the worst result. Python's `min` does not: comparisons with `nan` are always `False`.
+      - Cost: one short run per value. Pick the best (or the largest stable one, backed off a bit) and only then train long.
+
+      ---
+
+      ## Fix in this order (cheapest first)
+
+      | step | what | cost |
+      | --- | --- | --- |
+      | 1 | read the loop: `zero_grad`, `backward`, `step`, `model.train()`, shapes of `pred` and `y` | minutes, free |
+      | 2 | overfit one batch | seconds of compute |
+      | 3 | learning-rate sweep | one short run per value |
+      | 4 | standardise inputs, check labels | a few lines |
+      | 5 | init, activations, normalisation layers (chapter 2) | changes the model |
+      | 6 | clip gradients for spikes: `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)` between `backward()` and `step()` | one line; hides the cause if overused |
+
+      **Verify** each fix with the same metric you measured, on the same data and seed. Change one
+      thing at a time, or you will not know which change worked.
+
+  - id: symptom-to-cause
+    type: classify
+    title: Diagnose from the symptom
+    prompt: Sort each observation under its most likely cause.
+    hint: "nan and bouncing: too high. Slow and steady: too low. Gets worse as if steps keep growing: gradients piling up. Nothing helps even on a tiny batch: the data."
+    zones: [Learning rate too high, Learning rate too low, Forgot optimizer.zero_grad(), Bug in the data or labels]
+    items:
+      - { text: "The loss becomes nan within the first 20 steps", zone: Learning rate too high }
+      - { text: "The loss jumps up and down by large amounts and never settles", zone: Learning rate too high }
+      - { text: "The loss falls in a slow, almost straight line and is still falling when training ends", zone: Learning rate too low }
+      - { text: "The update size is about 1e-7 of the weight size in every layer", zone: Learning rate too low }
+      - { text: "The loss drops at first, then swings harder and harder as if the step size kept growing", zone: Forgot optimizer.zero_grad() }
+      - { text: "Gradient norms grow steadily every step, even at a learning rate that worked yesterday", zone: Forgot optimizer.zero_grad() }
+      - { text: "Even on a single batch of 8 examples, the loss stays at ln(C) for every learning rate you try", zone: Bug in the data or labels }
+      - { text: "Shuffling the labels randomly makes no difference to the training loss", zone: Bug in the data or labels }
+
+  - id: lr-sweep
+    type: coding
+    title: Sweep the learning rate
+    context: |
+      `make_model()` builds a small regression network (`2 → 32 → 1`), and `X`, `y` are 256
+      training examples (`y` has shape `(256,)`). Find a good SGD learning rate with a short,
+      fair sweep.
+    instructions:
+      - "Complete `final_loss(lr)`: seed with `torch.manual_seed(0)`, build a model, train 150 full-batch SGD steps on `F.mse_loss(model(X).squeeze(1), y)`, and return the last loss as a float."
+      - "Store `{lr: final_loss(lr) for lr in lrs}` in `results`."
+      - "Store the learning rate with the lowest final loss in `best_lr`, treating `nan` as the worst possible result."
+      - Print `results` and `best_lr`.
+    hint: |
+      `best_lr = min(results, key=lambda lr: float("inf") if math.isnan(results[lr]) else results[lr])`.
+      A plain `min(results, key=results.get)` gets stuck on the `nan` because every comparison with `nan` is `False`.
+    pre_code: |
+      import math
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.rand(256, 2) * 4 - 2
+      y = torch.sin(X[:, 0]) * 2 + X[:, 1] ** 2 * 0.5 + 0.1 * torch.randn(256)
+
+      def make_model():
+          return nn.Sequential(nn.Linear(2, 32), nn.ReLU(), nn.Linear(32, 1))
+
+      lrs = [1.0, 0.1, 0.01, 0.001, 0.0001]
+    sample_code: |
+      def final_loss(lr, steps=150):
+          torch.manual_seed(0)
+          model = make_model()
+          optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+          for _ in range(steps):
+              ____
+          return loss.item()
+
+      results = ____
+      best_lr = min(results, key=results.get)
+      print(results)
+      print(best_lr)
+    solution: |
+      def final_loss(lr, steps=150):
+          torch.manual_seed(0)
+          model = make_model()
+          optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+          for _ in range(steps):
+              optimizer.zero_grad()
+              loss = F.mse_loss(model(X).squeeze(1), y)
+              loss.backward()
+              optimizer.step()
+          return loss.item()
+
+      results = {lr: final_loss(lr) for lr in lrs}
+      best_lr = min(results, key=lambda lr: float("inf") if math.isnan(results[lr]) else results[lr])
+      print(results)
+      print(best_lr)
+    tests: |
+      import math
+      check_object("results")
+      assert set(user["results"]) == set(sol["lrs"]), "`results` should have one entry for each learning rate in `lrs`."
+      for lr, want in sol["results"].items():
+          got = user["results"][lr]
+          if math.isnan(want):
+              assert math.isnan(got), f"lr={lr} should diverge to nan with 150 SGD steps. Did you seed with `torch.manual_seed(0)` inside `final_loss`?"
+          else:
+              assert not math.isnan(got) and abs(got - want) < 1e-3 * max(1, want), f"The final loss for lr={lr} should be about {want:.3f}, got {got}. Seed inside `final_loss`, use full-batch SGD for 150 steps, and squeeze the output to shape `(256,)`."
+      check_equal("best_lr", 0.1, msg="`best_lr` should be the lr with the lowest loss, ignoring nan. With `nan` first in the dict, a plain `min` returns it by mistake.")
+    success_msg: |
+      0.1 wins, 1.0 diverges, and 0.0001 has barely started. Four orders of magnitude, five short runs.
+      Now train long at the winner.
+
+  - id: fix-broken-loop
+    type: coding
+    title: "Fix it: a loop that produces nan"
+    context: |
+      Same data and `make_model()` as before. A colleague's loop ends with a `nan` loss, and it
+      has **three** separate problems. Use the playbook: run it, read the symptom, measure
+      (print shapes, try a smaller lr, check the five steps), fix one thing at a time.
+    instructions:
+      - Find and fix all three bugs in the loop. Keep `make_model()` and the 300 steps.
+      - "Verify: after training, the mean squared error of `model` on `X`, `y` must be below `0.15`. Store it as a float in `final_mse` and print it."
+    hint: |
+      Check, in order: is `optimizer.zero_grad()` called every step? Do `pred` and `y` have the same
+      shape (print them)? Is `lr` in the range your sweep found? A loss of about 3 (the variance of `y`)
+      after fixing the lr means the shapes are still wrong.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.rand(256, 2) * 4 - 2
+      y = torch.sin(X[:, 0]) * 2 + X[:, 1] ** 2 * 0.5 + 0.1 * torch.randn(256)
+
+      def make_model():
+          return nn.Sequential(nn.Linear(2, 32), nn.ReLU(), nn.Linear(32, 1))
+    sample_code: |
+      import warnings
+      warnings.filterwarnings("ignore")
+
+      model = make_model()
+      optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+
+      losses = []
+      for step in range(300):
+          pred = model(X)
+          loss = F.mse_loss(pred, y)
+          loss.backward()
+          optimizer.step()
+          losses.append(loss.item())
+
+      print(losses[0], losses[-1])
+      with torch.no_grad():
+          final_mse = ____
+      print(final_mse)
+    solution: |
+      import warnings
+      warnings.filterwarnings("ignore")
+
+      model = make_model()
+      optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+      losses = []
+      for step in range(300):
+          optimizer.zero_grad()
+          pred = model(X).squeeze(1)
+          loss = F.mse_loss(pred, y)
+          loss.backward()
+          optimizer.step()
+          losses.append(loss.item())
+
+      print(losses[0], losses[-1])
+      with torch.no_grad():
+          final_mse = F.mse_loss(model(X).squeeze(1), y).item()
+      print(final_mse)
+    tests: |
+      import math, torch, torch.nn.functional as F
+      check_object("model")
+      with torch.no_grad():
+          pred = user["model"](sol["X"]).reshape(-1)
+          mse = F.mse_loss(pred, sol["y"]).item()
+      assert not math.isnan(mse), "The model's predictions are nan: the training diverged. Lower the learning rate (your sweep found a good one) and make sure gradients are zeroed every step."
+      assert mse < 0.15, f"The model's MSE on the training data is {mse:.3f}; it must be below 0.15. If it is around 3, `pred` and `y` still have different shapes; if it is around 0.3-0.6, check `zero_grad()`."
+      check_object("final_mse")
+      assert abs(float(user["final_mse"]) - mse) < 1e-3, "`final_mse` should be the mean squared error of `model` on `X`, `y` after training, with predictions shaped like `y`."
+    success_msg: |
+      Three bugs, three different fingerprints: nan (lr too high), a loss stuck at the variance of `y`
+      (shape broadcasting), and erratic, growing steps (no `zero_grad`). Fixing only one or two
+      leaves the MSE far above 0.15.

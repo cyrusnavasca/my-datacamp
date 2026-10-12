@@ -1,0 +1,256 @@
+title: Few-shot examples
+description: How examples in the prompt steer a model, how to choose them from your failures, and the biases they bring.
+exercises:
+  - id: few-shot-slides
+    type: video
+    title: Teaching by example, inside the prompt
+    slides: |
+      # In-context learning
+
+      Put a few solved examples in the prompt and the model continues the pattern. No weights change; the examples
+      only shape **this** request. That's **in-context learning**, and it's the cheapest way to show a model a decision
+      that's hard to describe in words.
+
+      ```python
+      SYSTEM = """You triage crew tickets. Classify each ticket into exactly one category:
+      maintenance, it, supplies, scheduling or medical. Reply with <category></category> tags.
+      <examples>
+      <example><ticket>The pump display in Module F froze again.</ticket><category>it</category></example>
+      <example><ticket>Where are the spare filters stored?</ticket><category>supplies</category></example>
+      </examples>"""
+
+      r = client.messages.create(model="claude-sonnet-5-5", max_tokens=20, system=SYSTEM,
+                                 messages=[{"role": "user", "content": "<ticket>Printer in Module C says offline.</ticket>"}])
+      ```
+
+      Examples teach **format** (the model copies their shape) and the **decision boundary**: a frozen *display* is IT,
+      even though the ticket mentions a pump.
+
+      ---
+
+      ## Which examples?
+
+      A good example teaches something the model gets wrong without it.
+
+      1. Run the model **zero-shot** on a labelled pool of tickets.
+      2. Collect the **misses** and look for patterns ("display froze" is labelled maintenance, "where are the spare..." is labelled maintenance).
+      3. Add **one example per pattern**. Duplicates of the same pattern use up prompt space and teach nothing new.
+      4. Score on a **held-out** set, never on the tickets you took examples from. Otherwise you're just checking that the model can copy.
+
+      Also cover every label, include realistic phrasing, and include the hard cases near the boundary.
+
+      ---
+
+      ## Biases examples bring
+
+      | bias | what happens | mitigation |
+      | --- | --- | --- |
+      | majority label | unsure cases drift to the most common label among the examples | balance labels across the examples |
+      | recency | ties go to the label of the last example | vary or shuffle the order, and re-check the score |
+      | surface copying | the model copies wording, length or quirks of the examples | make the examples look like real inputs |
+      | leakage | test items among the examples inflate the score | keep the example pool and test set separate |
+
+      ---
+
+      ## Zero-shot, few-shot, many-shot or fine-tune?
+
+      | approach | quality on fuzzy boundaries | input tokens per call | setup | changing the labels |
+      | --- | --- | --- | --- | --- |
+      | zero-shot | relies on the prior | lowest | minutes | edit the prompt |
+      | few-shot (3-10) | good, if examples target the misses | +20-40 per example | an afternoon | edit the examples |
+      | many-shot (50-500) | better still, then plateaus | thousands: cache them (chapter 4) | a labelled set | edit the examples |
+      | fine-tune | best on stable, narrow tasks | lowest at run time | data, training, evaluation | retrain |
+
+      Start zero-shot, add examples to fix measured misses, and consider fine-tuning only when examples stop helping
+      and the task is stable and high-volume (covered in the fine-tuning course).
+
+      ---
+
+      ## Playbook: "the classifier's accuracy is low"
+
+      1. **Measure** accuracy on a held-out set, and accuracy **per category**. One bad category is a different problem from all of them being mediocre.
+      2. **Diagnose:** list the misses. Do they share a pattern (one phrasing, one label)? Are the examples skewed to one label?
+      3. **Fix**, in order: name every label and its meaning in the instructions, add one example per failing pattern, balance labels.
+      4. **Verify** on the same held-out set, then check you didn't break a category that used to work.
+
+  - id: zero-vs-few
+    type: coding
+    title: Zero-shot versus ten examples
+    context: |
+      `pool` (100 tickets) is where you may take examples from, and `test` (60 tickets) is the held-out set you score on.
+      Both are DataFrames with `text` and `category` columns. `client` is the triage model, `TRIAGE_SYSTEM` the instructions,
+      and `parse_label(reply)` pulls the label out of a reply.
+    instructions:
+      - "Write `build_system(examples)`: return `TRIAGE_SYSTEM`, followed by one `<example><ticket>...</ticket><category>...</category></example>` line per `(text, category)` pair in `examples`."
+      - "Write `accuracy(examples)`: classify every ticket in `test` (user message `<ticket>{text}</ticket>`, `system=build_system(examples)`) and return the share labelled correctly."
+      - "Store `accuracy([])` in `zero_shot`, and the accuracy with the **first 10** tickets of `pool` as examples in `first_ten`."
+    hint: |
+      `"\n".join(f"<example><ticket>{t}</ticket><category>{c}</category></example>" for t, c in examples)`.
+      The first 10 pool pairs are `list(zip(pool.text[:10], pool.category[:10]))`.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import ticket_triager, split_tickets, parse_label, TRIAGE_SYSTEM, MODEL
+      client = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+      pool, test = split_tickets()
+    sample_code: |
+      def build_system(examples):
+          lines = [TRIAGE_SYSTEM]
+          for text, category in examples:
+              lines.append(____)
+          return "\n".join(lines)
+
+      def accuracy(examples):
+          system = build_system(examples)
+          correct = 0
+          for row in test.itertuples():
+              r = client.messages.create(model=MODEL, max_tokens=50, system=system,
+                                         messages=[{"role": "user", "content": ____}])
+              correct += parse_label(r.content[0].text) == row.category
+          return ____
+
+      zero_shot = ____
+      first_ten = ____
+      print(zero_shot, first_ten)
+    solution: |
+      def build_system(examples):
+          lines = [TRIAGE_SYSTEM]
+          for text, category in examples:
+              lines.append(f"<example><ticket>{text}</ticket><category>{category}</category></example>")
+          return "\n".join(lines)
+
+      def accuracy(examples):
+          system = build_system(examples)
+          correct = 0
+          for row in test.itertuples():
+              r = client.messages.create(model=MODEL, max_tokens=50, system=system,
+                                         messages=[{"role": "user", "content": f"<ticket>{row.text}</ticket>"}])
+              correct += parse_label(r.content[0].text) == row.category
+          return correct / len(test)
+
+      zero_shot = accuracy([])
+      first_ten = accuracy(list(zip(pool.text[:10], pool.category[:10])))
+      print(zero_shot, first_ten)
+    tests: |
+      check_object("build_system")
+      s = user["build_system"]([("Out of gloves in the galley.", "supplies")])
+      assert "<ticket>Out of gloves in the galley.</ticket>" in s and "<category>supplies</category>" in s, "`build_system` should add each example as `<example><ticket>TEXT</ticket><category>LABEL</category></example>`."
+      check_equal("zero_shot", msg="`zero_shot` is `accuracy([])`, the share of the 60 test tickets labelled correctly.")
+      check_equal("first_ten", msg="`first_ten` uses the first 10 pool tickets as `(text, category)` examples.")
+    success_msg: |
+      Ten examples moved accuracy from 65% to 73%. That's better, but not much, for 10 examples. Look at the first ten pool tickets:
+      mostly maintenance and IT, the categories the model already handled. Examples help most where the model fails.
+
+  - id: error-driven-examples
+    type: coding
+    title: "Troubleshoot: pick examples from the failures"
+    context: |
+      Triage must reach **90%** on the held-out `test` set, with at most **10 examples** (each example costs tokens on
+      every call). `accuracy(examples)` from the last exercise is ready, and `zero_shot_label(text)` returns the model's zero-shot label for one ticket.
+    instructions:
+      - "**Diagnose:** store the `pool` rows that the zero-shot model gets wrong in `misses` (a DataFrame)."
+      - "**Fix:** choose at most 10 `(text, category)` pairs **from `pool`** as `examples`. Target the patterns behind the misses."
+      - "**Verify:** store `accuracy(examples)` in `score`. It must be at least 0.9."
+    hint: |
+      `misses = pool[[zero_shot_label(t) != c for t, c in zip(pool.text, pool.category)]]`. Many misses repeat the same
+      pattern, so drop duplicate texts first (`misses.drop_duplicates("text")`) and take varied ones.
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import ticket_triager, split_tickets, parse_label, examples_block, TRIAGE_SYSTEM, MODEL
+      client = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+      pool, test = split_tickets()
+
+      def zero_shot_label(text):
+          r = client.messages.create(model=MODEL, max_tokens=50, system=TRIAGE_SYSTEM,
+                                     messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}])
+          return parse_label(r.content[0].text)
+
+      def accuracy(examples):
+          system = TRIAGE_SYSTEM + "\n" + examples_block(examples)
+          correct = 0
+          for row in test.itertuples():
+              r = client.messages.create(model=MODEL, max_tokens=50, system=system,
+                                         messages=[{"role": "user", "content": f"<ticket>{row.text}</ticket>"}])
+              correct += parse_label(r.content[0].text) == row.category
+          return correct / len(test)
+    sample_code: |
+      misses = pool[[____ for t, c in zip(pool.text, pool.category)]]
+      print(len(misses), "misses")
+      print(misses.category.value_counts())
+
+      picked = ____
+      examples = list(zip(picked.text, picked.category))
+      score = ____
+      print(len(examples), "examples ->", score)
+    solution: |
+      misses = pool[[zero_shot_label(t) != c for t, c in zip(pool.text, pool.category)]]
+      print(len(misses), "misses")
+      print(misses.category.value_counts())
+
+      picked = misses.drop_duplicates("text").head(10)
+      examples = list(zip(picked.text, picked.category))
+      score = accuracy(examples)
+      print(len(examples), "examples ->", score)
+    tests: |
+      check_object("misses")
+      assert len(user["misses"]) == 33, f"`misses` should hold the 33 pool rows where the zero-shot label differs from `category`; it has {len(user['misses'])}."
+      check_object("examples")
+      ex = list(user["examples"])
+      assert 1 <= len(ex) <= 10, f"Use between 1 and 10 examples; you have {len(ex)}."
+      pool_texts = set(user["pool"].text)
+      assert all(len(e) == 2 and e[0] in pool_texts for e in ex), "Every example must be a `(text, category)` pair taken from `pool`, never from `test`."
+      from kits.llm_apis_prompting import triage_accuracy
+      real = triage_accuracy(ex)
+      assert real >= 0.9, f"With these examples the held-out accuracy is {real:.0%}. Avoid near-duplicate examples, and cover the different patterns among the misses (drop duplicate texts first)."
+      assert abs(user.get("score", -1) - real) < 1e-9, "`score` should be `accuracy(examples)`."
+    success_msg: |
+      Targeted examples beat the first-ten approach with the same budget. The misses told you exactly what the model
+      didn't know: IT display faults, "where are the spare...", galley swaps. This error-driven loop works for any classifier.
+
+  - id: majority-bias
+    type: mc
+    title: Predict the majority-label bias
+    question: |
+      A teammate's prompt has five few-shot examples, and **all five are maintenance tickets**. What will the model
+      answer for `Swap my galley duty on Friday with Tomas?`, which looks like none of them?
+    context: "The console has `ask(ticket)` loaded with that prompt. Predict first, then run `ask(\"Swap my galley duty on Friday with Tomas?\")`."
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import ticket_triager, split_tickets, examples_block, TRIAGE_SYSTEM, MODEL
+      client = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+      pool, test = split_tickets()
+      maint = pool[pool.category == "maintenance"].head(5)
+      SYSTEM = TRIAGE_SYSTEM + "\n" + examples_block(zip(maint.text, maint.category))
+
+      def ask(ticket):
+          r = client.messages.create(model=MODEL, max_tokens=50, system=SYSTEM,
+                                     messages=[{"role": "user", "content": f"<ticket>{ticket}</ticket>"}])
+          return r.content[0].text
+    options:
+      - text: "`<category>scheduling</category>`, because the instructions list scheduling."
+        feedback: Listing a label tells the model it exists, but this phrasing isn't covered by the model's prior or by any example. Run it in the console.
+      - text: "`<category>maintenance</category>`"
+        correct: true
+        feedback: Right. With nothing close to go on, the model leans on the label it saw most often in the examples. Balance labels across your examples so unsure cases don't all drift one way.
+      - text: An error, because no example matches.
+        feedback: Examples guide the model; they don't restrict it. It always answers something, which is why biased examples are dangerous.
+      - text: A random label each time.
+        feedback: The bias is systematic, not random. That makes it worse, because it skews every unsure ticket the same way.
+    hint: Which label did the model see five times in a row?
+
+  - id: shots-tradeoff
+    type: mc
+    title: Few-shot, many-shot or fine-tune?
+    question: |
+      ORBIT's triage now gets 93% with 8 targeted examples. Volume is 20,000 tickets a day, the commander adds or renames
+      a category about once a month, and you have 100 labelled tickets. What's the best next step?
+    options:
+      - text: Keep the few-shot prompt, cache its static prefix, and keep adding examples as new misses appear.
+        correct: true
+        feedback: Right. It's accurate, cheap to change when categories move, and caching makes the stable examples cheaper on every call. Monitor the misses and fix them with examples.
+      - text: Fine-tune a model on the 100 labelled tickets.
+        feedback: 100 tickets is thin training data, and every monthly label change means relabelling and retraining. Fine-tuning wins on stable, high-volume tasks after examples stop helping, and that isn't the case here.
+      - text: Switch to 300 examples (many-shot) for maximum accuracy.
+        feedback: You'd pay for about 11,000 extra input tokens on each of 20,000 calls a day, for at most 7 points of headroom, and you only have 100 labelled tickets anyway. Try more examples only if measured misses remain.
+      - text: Drop the examples and go back to zero-shot to save tokens.
+        feedback: Zero-shot scored 65%. Eight examples cost a couple of hundred tokens per call, which is small next to 28 points of accuracy.
+    hint: Weigh accuracy, cost per call and how often the task changes.

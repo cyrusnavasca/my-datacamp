@@ -1,0 +1,12 @@
+title: Demo
+description: Fixture course.
+chapters:
+  - id: ch1
+    title: Chapter one
+    lessons: [l1]
+  - id: ch2
+    title: Chapter two
+    lessons: [missing-lesson]
+  - id: ch3
+    title: Chapter three
+    lessons: [bad]

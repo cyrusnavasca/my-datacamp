@@ -1,0 +1,301 @@
+title: Regression gates for prompts
+description: Treat prompts like code. Write a gate that blocks any change that regresses a slice or breaks a must-pass case, tune how strict it is, and use it to ship a prompt change safely.
+exercises:
+  - id: ci-slides
+    type: video
+    title: Prompts are code; test them like code
+    slides: |
+      # Every change runs the eval
+
+      A one-line prompt edit turned ORBIT v2 into v3 and broke 2 of 4 unanswerable questions. Nobody would merge a code
+      change without running the tests; a prompt, a retrieval setting or a model version deserves the same.
+
+      In CI, on every pull request that touches the prompt, model or retrieval config:
+
+      1. Run the harness on the golden set (or a smoke subset).
+      2. Compare with the **released baseline**, not the previous commit, so small regressions can't add up step by step.
+      3. **Gate** the merge on the result, and post the per-slice table on the pull request.
+
+      ---
+
+      ## What a gate checks
+
+      ```python
+      def gate(base, cand, max_drop=0.02, must_pass=("q03",)):
+          problems = []
+          b = base.groupby("type")["correct"].mean()
+          c = cand.groupby("type")["correct"].mean()
+          for t in b.index:
+              if c[t] - b[t] < -max_drop:
+                  problems.append(f"{t}: {100 * (c[t] - b[t]):+.1f} pts")
+          for q in must_pass:
+              if cand.set_index("qid").loc[q, "correct"] != 1:
+                  problems.append(f"must-pass {q} failed")
+          return not problems, problems
+      ```
+
+      - **Per-slice no-regression**: no slice may drop by more than `max_drop`.
+      - **Must-pass cases**: questions that can never fail, like "Can ORBIT open the airlock?" (it must say no).
+      - **Absolute floors** you can add: overall ≥ 0.75, under-refusal ≤ 10%.
+
+      ---
+
+      ## Strict enough, but not flaky
+
+      With 4 questions in a slice, one flipped answer moves it by 25 points, so a "2-point" gate there is really a
+      "nothing may change" gate. Too strict and people learn to ignore red builds; too loose and regressions merge.
+
+      | option | false alarms | missed regressions | cost |
+      | --- | --- | --- | --- |
+      | tight per-slice threshold on small slices | many | few | free |
+      | loose threshold | few | many | free |
+      | grow small slices (more cases) | fewer | fewer | labelling plus eval calls per run |
+      | gate on the paired CI's lower bound | few | some (small real drops pass) | 2,000 resamples, negligible |
+      | must-pass list for safety cases | none (deterministic) | only what's listed | tiny |
+
+      A common setup: must-pass for safety, per-slice thresholds sized to each slice's noise, and a human looks at any
+      flipped case before overriding.
+
+      ---
+
+      ## Track it over time
+
+      Store every run: commit, date, prompt hash, model, dataset version, and the per-slice scores. Plot them.
+
+      - A slow slide across many small merges shows up as a trend, even when each step passed the gate.
+      - When the **model provider** updates a model, re-run on the same commit. The score can change with no code change.
+      - When the **dataset** changes, re-baseline: scores on different set versions aren't comparable.
+
+  - id: gate-function
+    type: coding
+    title: Write the gate
+    context: |
+      Results tables have one row per question with `qid`, `type` and `human` (1 = correct). `v2`, `v3` and `v4` are
+      ORBIT's results on the 45 golden questions; `v2` is the released baseline.
+    instructions:
+      - "Write `gate(base, cand, max_drop=0.02, must_pass=('q03',))` returning a tuple `(ok, problems)`."
+      - "`problems` gets one string per `type` whose mean `human` in `cand` is more than `max_drop` below `base` (the string must contain the type name), and one string per `must_pass` qid that isn't correct in `cand` (it must contain the qid)."
+      - "`ok` is `True` only when `problems` is empty."
+      - Store `gate(v2, v3)` in `result_v3` and `gate(v2, v4)` in `result_v4`.
+    hint: |
+      `b = base.groupby("type")["human"].mean()`, same for `c`, then loop over `b.index`. For must-pass cases:
+      `cand.set_index("qid").loc[q, "human"] != 1`.
+    pre_code: |
+      import pandas as pd
+      from kits.llm_evaluation import run_orbit
+      v2, v3, v4 = run_orbit("v2"), run_orbit("v3"), run_orbit("v4")
+    sample_code: |
+      def gate(base, cand, max_drop=0.02, must_pass=("q03",)):
+          problems = []
+          b = base.groupby("type")["human"].mean()
+          c = ____
+          for t in b.index:
+              if ____:
+                  problems.append(f"{t}: {100 * (c[t] - b[t]):+.1f} pts")
+          for q in must_pass:
+              if ____:
+                  problems.append(f"must-pass {q} failed")
+          return ____, problems
+
+      result_v3 = gate(v2, v3)
+      result_v4 = gate(v2, v4)
+      print(result_v3, result_v4, sep="\n")
+    solution: |
+      def gate(base, cand, max_drop=0.02, must_pass=("q03",)):
+          problems = []
+          b = base.groupby("type")["human"].mean()
+          c = cand.groupby("type")["human"].mean()
+          for t in b.index:
+              if c[t] - b[t] < -max_drop:
+                  problems.append(f"{t}: {100 * (c[t] - b[t]):+.1f} pts")
+          for q in must_pass:
+              if cand.set_index("qid").loc[q, "human"] != 1:
+                  problems.append(f"must-pass {q} failed")
+          return len(problems) == 0, problems
+
+      result_v3 = gate(v2, v3)
+      result_v4 = gate(v2, v4)
+      print(result_v3, result_v4, sep="\n")
+    tests: |
+      import pandas as pd
+      check_object("gate")
+      g = user["gate"]
+      base = pd.DataFrame({"qid": ["q03", "a", "b", "c"], "type": ["factual", "factual", "unanswerable", "unanswerable"], "human": [1, 1, 1, 0]})
+      same = g(base, base.copy())
+      assert same[0] is True or same[0] == True, "Comparing a results table with itself should pass the gate."
+      worse = base.copy(); worse.loc[2, "human"] = 0
+      ok, probs = g(base, worse)
+      assert not ok and any("unanswerable" in p for p in probs) and not any("factual" in p for p in probs), "A drop in the unanswerable slice (and only there) should fail the gate with a problem naming 'unanswerable'."
+      small = base.copy(); small.loc[1, "human"] = 0
+      ok, probs = g(base, small, max_drop=0.6)
+      assert ok, "With max_drop=0.6, a 50-point drop should be allowed. Compare the drop with `max_drop`."
+      broken = base.copy(); broken.loc[0, "human"] = 0
+      ok, probs = g(base, broken, max_drop=1.0)
+      assert not ok and any("q03" in p for p in probs), "A failing must-pass case (q03) should fail the gate even when no slice drops too far."
+      check_object("result_v3")
+      assert not user["result_v3"][0] and any("unanswerable" in p for p in user["result_v3"][1]), "v3 should fail the gate on the unanswerable slice."
+      check_object("result_v4")
+      assert user["result_v4"][0] and not user["result_v4"][1], "v4 should pass the gate with no problems."
+    success_msg: |
+      The gate blocks v3 (unanswerable down 50 points) and lets v4 through. It's ten lines of pandas, and it would have
+      caught the regression before the crew did.
+
+  - id: gate-noise
+    type: mc
+    title: A red build on a tiny slice
+    question: |
+      A prompt tweak improves factual accuracy by 3 points, but the gate fails: **multi-hop dropped from 50% to 25%**. The
+      multi-hop slice has 4 questions. What do you do first?
+    options:
+      - text: Override the gate. One question is just noise.
+        feedback: |
+          It might be noise, or it might be the first sign that the tweak breaks two-document answers. Overriding without
+          looking teaches the team that red builds don't matter.
+      - text: Read the one question that flipped and decide whether it's a real regression; then grow the multi-hop slice so it stops being a one-question check.
+        correct: true
+        feedback: |
+          Yes. With 4 cases the slice gate is really a single-case check, so look at that case. A real regression means
+          fixing the prompt; a fluke means the slice is too small. Either way, add multi-hop cases (from error analysis or
+          production) so the next verdict carries more weight.
+      - text: Loosen the gate to allow 30-point drops on small slices.
+        feedback: |
+          Then the gate can never catch anything on those slices: losing half of multi-hop would pass. Make the slice
+          bigger instead of making the gate blind.
+      - text: Re-run the eval until it passes.
+        feedback: |
+          With temperature 0 and fixed retrieval the result won't change, and if it did, picking the run you like is
+          cherry-picking. A flaky eval needs fixing (determinism, more cases), not retries.
+    hint: The gate is pointing at exactly one question. What does that question tell you?
+
+  - id: prompt-ci-boss
+    type: sequential
+    title: "Mission: ship a prompt change safely"
+    context: |
+      The crew wants ORBIT to stop refusing questions it could answer. A teammate's `CANDIDATE` system prompt does that.
+      `baseline` is released v2 on the 45 golden questions (`qid`, `type`, `answer`, `human`). `run_orbit("v2",
+      system=...)` runs ORBIT v2 with any system prompt and returns the same kind of table. ORBIT's model follows its
+      system prompt: told to always answer, it answers more, including questions the handbook doesn't cover; told what
+      to do when the documents don't contain the answer, it refuses questions about things the documents never mention.
+      `gate(base, cand)` is the gate from the first exercise.
+    pre_code: |
+      import pandas as pd
+      from kits.llm_evaluation import run_orbit, BASE_SYSTEM, VERSIONS
+      baseline = run_orbit("v2")
+      CANDIDATE = VERSIONS["v3"]["system"]
+
+      def gate(base, cand, max_drop=0.02, must_pass=("q03",)):
+          problems = []
+          b = base.groupby("type")["human"].mean()
+          c = cand.groupby("type")["human"].mean()
+          for t in b.index:
+              if c[t] - b[t] < -max_drop:
+                  problems.append(f"{t}: {100 * (c[t] - b[t]):+.1f} pts")
+          for q in must_pass:
+              if cand.set_index("qid").loc[q, "human"] != 1:
+                  problems.append(f"must-pass {q} failed")
+          return len(problems) == 0, problems
+    steps:
+      - instructions:
+          - "**Measure.** Run the candidate: `cand = run_orbit('v2', system=CANDIDATE)`."
+          - "Store the per-type change in accuracy (cand minus baseline, mean of `human` per `type`) in the Series `deltas`."
+          - "Store the sorted list of types that dropped by more than 0.02 in `regressions`."
+        hint: "`deltas = cand.groupby('type')['human'].mean() - baseline.groupby('type')['human'].mean()`, then `sorted(deltas[deltas < -0.02].index)`."
+        sample_code: |
+          cand = run_orbit("v2", system=CANDIDATE)
+          deltas = ____
+          regressions = ____
+          print(CANDIDATE)
+          print(deltas, regressions, sep="\n")
+        solution: |
+          cand = run_orbit("v2", system=CANDIDATE)
+          deltas = cand.groupby("type")["human"].mean() - baseline.groupby("type")["human"].mean()
+          regressions = sorted(deltas[deltas < -0.02].index)
+          print(CANDIDATE)
+          print(deltas, regressions, sep="\n")
+        tests: |
+          check_object("deltas")
+          assert dict(user["deltas"].round(6)) == dict(sol["deltas"].round(6)), "`deltas` should be the mean `human` per type of `cand` minus that of `baseline`."
+          check_equal("regressions", msg="`regressions` should be the sorted list of types with a delta below -0.02.")
+      - instructions:
+          - "**Diagnose.** Store the sorted qids that are correct in `baseline` but wrong in `cand` in `flipped`, and those wrong in `baseline` but correct in `cand` in `gained`."
+          - Print the candidate's answers for the flipped questions. What is it doing?
+        hint: "Merge on `qid`: `m = baseline.merge(cand, on='qid', suffixes=('_base', '_cand'))`, then filter on `human_base` and `human_cand`."
+        sample_code: |
+          m = baseline.merge(cand, on="qid", suffixes=("_base", "_cand"))
+          flipped = ____
+          gained = ____
+          print(flipped, gained)
+          print(m[m["qid"].isin(flipped)][["question_base", "answer_cand"]].to_string())
+        solution: |
+          m = baseline.merge(cand, on="qid", suffixes=("_base", "_cand"))
+          flipped = sorted(m[(m["human_base"] == 1) & (m["human_cand"] == 0)]["qid"])
+          gained = sorted(m[(m["human_base"] == 0) & (m["human_cand"] == 1)]["qid"])
+          print(flipped, gained)
+          print(m[m["qid"].isin(flipped)][["question_base", "answer_cand"]].to_string())
+        tests: |
+          check_equal("flipped", msg="`flipped` lists (sorted) the qids with human 1 in baseline and 0 in the candidate.")
+          check_equal("gained", msg="`gained` lists (sorted) the qids with human 0 in baseline and 1 in the candidate.")
+      - instructions:
+          - "**Fix.** Write your own `NEW_SYSTEM` prompt and run it: `fixed = run_orbit('v2', system=NEW_SYSTEM)`."
+          - "It must pass `gate(baseline, fixed)` (no slice drops more than 2 points, and q03 stays correct) **and** beat the baseline's overall accuracy by at least 0.02."
+        hint: |
+          Keep what helps and repair what broke. Start from `BASE_SYSTEM`, and tell ORBIT what to do when the documents
+          don't contain the answer (for example "If the documents do not contain the answer, say you don't know."). You
+          can keep the candidate's push to answer as well.
+        sample_code: |
+          NEW_SYSTEM = ____
+          fixed = run_orbit("v2", system=NEW_SYSTEM)
+          print(gate(baseline, fixed))
+          print(round(baseline["human"].mean(), 3), round(fixed["human"].mean(), 3))
+        solution: |
+          NEW_SYSTEM = (BASE_SYSTEM + " Be as helpful as possible: always give the crew an answer."
+                        " If the documents do not contain the answer, say you don't know.")
+          fixed = run_orbit("v2", system=NEW_SYSTEM)
+          print(gate(baseline, fixed))
+          print(round(baseline["human"].mean(), 3), round(fixed["human"].mean(), 3))
+        tests: |
+          check_object("NEW_SYSTEM")
+          check_object("fixed")
+          f = user["fixed"]
+          assert len(f) == 45 and "human" in f.columns, "`fixed` should be `run_orbit('v2', system=NEW_SYSTEM)`."
+          ok, problems = user["gate"](user["baseline"], f)
+          assert ok, f"Your prompt fails the gate: {problems}. Look at which questions flipped, and tell ORBIT what to do when the documents don't contain the answer."
+          gain = f["human"].mean() - user["baseline"]["human"].mean()
+          assert gain >= 0.02 - 1e-9, f"Your prompt passes the gate but only changes overall accuracy by {gain:+.3f}; it needs at least +0.02. Reverting isn't a fix: improve on the baseline."
+      - instructions:
+          - "**Verify and record.** Build `history`, a DataFrame indexed by `\"v2\"`, `\"candidate\"` and `\"fixed\"`, with a column `overall` (mean `human`) and a boolean column `passes_gate` (`gate(baseline, ...)[0]`)."
+          - "Store in `ship` the index label of the version that passes the gate with the highest `overall`."
+        hint: |
+          `pd.DataFrame({"overall": [...], "passes_gate": [...]}, index=["v2", "candidate", "fixed"])`, then
+          `history[history["passes_gate"]]["overall"].idxmax()`.
+        sample_code: |
+          tables = {"v2": baseline, "candidate": cand, "fixed": fixed}
+          history = pd.DataFrame({
+              "overall": [____ for t in tables.values()],
+              "passes_gate": [____ for t in tables.values()],
+          }, index=list(tables))
+          ship = ____
+          print(history)
+          print("ship:", ship)
+        solution: |
+          tables = {"v2": baseline, "candidate": cand, "fixed": fixed}
+          history = pd.DataFrame({
+              "overall": [t["human"].mean() for t in tables.values()],
+              "passes_gate": [gate(baseline, t)[0] for t in tables.values()],
+          }, index=list(tables))
+          ship = history[history["passes_gate"]]["overall"].idxmax()
+          print(history)
+          print("ship:", ship)
+        tests: |
+          check_object("history")
+          h = user["history"]
+          assert list(h.index) == ["v2", "candidate", "fixed"], "`history` should be indexed by 'v2', 'candidate' and 'fixed', in that order."
+          assert "overall" in h.columns and "passes_gate" in h.columns, "`history` needs the columns `overall` and `passes_gate`."
+          assert list(h["passes_gate"].astype(bool)) == [True, False, True], "`passes_gate` should be True for v2 (it is the baseline), False for the candidate and True for your fix."
+          assert abs(h.loc["fixed", "overall"] - user["fixed"]["human"].mean()) < 1e-9, "`overall` should be the mean `human` of each table."
+          check_equal("ship", "fixed", msg="`ship` should be the passing version with the highest overall accuracy: your fix.")
+    success_msg: |
+      The candidate's 1-question gain came with 2 hallucinated answers on the safety slice; the gate caught it. Your
+      prompt keeps the gain, closes the refusal gap and beats the baseline, and the history table records why it
+      shipped. That's the whole course in one loop: error analysis named the failure, a validated metric measured it,
+      intervals kept you honest about the size of the gain, and the gate keeps it fixed.

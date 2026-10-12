@@ -1,0 +1,2220 @@
+{
+"fingerprint": "7aa5d666b85990b955dc0b27d8aa60d75a81945128d3fcb097be7f873b0e019f",
+"retrieval": {
+"How long is the leak-check hold when depressurising AL-1?": [
+"airlock-procedure-2024",
+"airlock-procedure",
+"docking-procedures",
+"modules-map",
+"robotic-arm"
+],
+"How many crew members must be present for an airlock cycle?": [
+"airlock-procedure",
+"orbit-assistant-policy",
+"exercise-requirements",
+"airlock-procedure-2024",
+"hydroponics-troubleshooting"
+],
+"Can ORBIT open the airlock?": [
+"airlock-procedure",
+"airlock-procedure-2024",
+"orbit-assistant-policy",
+"docking-procedures",
+"incident-2025-hydro-flood"
+],
+"How long do spacewalkers prebreathe oxygen?": [
+"eva-prep-checklist",
+"oxygen-generation",
+"robotic-arm",
+"airlock-procedure",
+"glossary"
+],
+"What is the maximum length of a spacewalk?": [
+"glossary",
+"eva-prep-checklist",
+"lab-booking-policy",
+"daily-schedule",
+"hydroponics-troubleshooting"
+],
+"What humidity range is normal in hydroponics?": [
+"hydroponics-troubleshooting",
+"hydroponics-schedule",
+"water-recycling",
+"modules-map",
+"incident-2025-hydro-flood"
+],
+"The plants are wilting but the roots are wet. What should I check?": [
+"hydroponics-troubleshooting",
+"waste-management",
+"airlock-procedure-2024",
+"airlock-procedure",
+"docking-procedures"
+],
+"How often should the pH probe be recalibrated?": [
+"hydroponics-troubleshooting",
+"depressurisation-response",
+"station-overview",
+"thermal-control",
+"emergency-contacts"
+],
+"When do the hydroponics watering cycles run?": [
+"hydroponics-schedule",
+"hydroponics-troubleshooting",
+"daily-schedule",
+"station-overview",
+"incident-2025-hydro-flood"
+],
+"How often is lettuce harvested?": [
+"hydroponics-schedule",
+"modules-map",
+"incident-2025-hydro-flood",
+"emergency-contacts",
+"sample-handling"
+],
+"What share of water does the recovery system reclaim?": [
+"water-recycling",
+"orbit-assistant-policy",
+"radiation-storm-protocol",
+"fire-response",
+"thermal-control"
+],
+"How big is the potable water tank?": [
+"water-recycling",
+"modules-map",
+"radiation-storm-protocol",
+"fire-response",
+"thermal-control"
+],
+"What is the normal cabin oxygen level?": [
+"oxygen-generation",
+"sample-handling",
+"co2-scrubbers",
+"crew-quarters",
+"depressurisation-response"
+],
+"How many oxygen candles are stored and where?": [
+"oxygen-generation",
+"sample-handling",
+"waste-management",
+"eva-prep-checklist",
+"glossary"
+],
+"At what CO2 level does ORBIT raise an alert?": [
+"co2-scrubbers",
+"orbit-assistant-policy",
+"incident-2026-scrubber-fault",
+"sample-handling",
+"medical-emergencies"
+],
+"How often are scrubber beds swapped?": [
+"co2-scrubbers",
+"incident-2026-scrubber-fault",
+"glossary",
+"orbit-assistant-policy",
+"station-overview"
+],
+"How long is the eclipse on each orbit?": [
+"power-systems",
+"robotic-arm",
+"orbit-assistant-policy",
+"comms-windows",
+"station-overview"
+],
+"What happens when battery charge drops below 30%?": [
+"power-systems",
+"eva-prep-checklist",
+"cargo-resupply",
+"it-network",
+"galley-and-meals"
+],
+"What should I do if I smell ammonia?": [
+"thermal-control",
+"fire-response",
+"sample-handling",
+"eva-prep-checklist",
+"crew-roster"
+],
+"Who can open the controlled medicines cabinet?": [
+"med-bay-access",
+"docking-procedures",
+"incident-2025-hydro-flood",
+"daily-schedule",
+"station-overview"
+],
+"Where is the defibrillator?": [
+"medical-emergencies",
+"docking-procedures",
+"water-recycling",
+"hydroponics-schedule",
+"co2-scrubbers"
+],
+"Who is the flight engineer?": [
+"crew-roster",
+"emergency-contacts",
+"medical-emergencies",
+"power-systems",
+"crew-quarters"
+],
+"What time does the crew wake up?": [
+"orbit-assistant-policy",
+"depressurisation-response",
+"daily-schedule",
+"station-overview",
+"comms-windows"
+],
+"What time is dinner?": [
+"galley-and-meals",
+"depressurisation-response",
+"comms-windows",
+"station-overview",
+"hydroponics-schedule"
+],
+"How long must each crew member exercise per day?": [
+"exercise-requirements",
+"crew-quarters",
+"eva-prep-checklist",
+"radiation-storm-protocol",
+"medical-emergencies"
+],
+"When are private family calls?": [
+"comms-windows",
+"emergency-contacts",
+"crew-quarters",
+"medical-emergencies",
+"hydroponics-schedule"
+],
+"How far in advance must a lab bench be booked?": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems",
+"medical-emergencies",
+"hydroponics-schedule"
+],
+"What is the longest a lab booking can last?": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems",
+"medical-emergencies",
+"eva-prep-checklist"
+],
+"At what temperature are biological samples stored?": [
+"sample-handling",
+"waste-management",
+"hydroponics-troubleshooting",
+"cargo-resupply",
+"daily-schedule"
+],
+"Where does the crew gather if a fire is not out within two minutes?": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy",
+"radiation-storm-protocol",
+"station-overview"
+],
+"Where does the crew gather during a depressurisation alarm?": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy",
+"medical-emergencies",
+"airlock-procedure"
+],
+"Where do we shelter during a radiation storm?": [
+"radiation-storm-protocol",
+"modules-map",
+"crew-roster",
+"incident-2025-hydro-flood",
+"co2-scrubbers"
+],
+"How often does the cargo vehicle arrive?": [
+"cargo-resupply",
+"waste-management",
+"sample-handling",
+"robotic-arm",
+"orbit-assistant-policy"
+],
+"How often are network passwords rotated?": [
+"it-network",
+"cargo-resupply",
+"hydroponics-schedule",
+"daily-schedule",
+"airlock-procedure"
+],
+"How long are ORBIT logs kept?": [
+"orbit-assistant-policy",
+"robotic-arm",
+"crew-quarters",
+"co2-scrubbers",
+"airlock-procedure-2024"
+],
+"What caused the 2025 hydroponics flood?": [
+"incident-2025-hydro-flood",
+"hydroponics-schedule",
+"modules-map",
+"hydroponics-troubleshooting",
+"crew-roster"
+],
+"What does ECLSS stand for?": [
+"glossary",
+"orbit-assistant-policy",
+"radiation-storm-protocol",
+"water-recycling",
+"thermal-control"
+],
+"Who can book the glovebox, and in which module is it?": [
+"lab-booking-policy",
+"modules-map",
+"sample-handling",
+"docking-procedures",
+"fire-response"
+],
+"Who owns the hydroponics schedule and what is their role?": [
+"hydroponics-schedule",
+"crew-roster",
+"modules-map",
+"daily-schedule",
+"hydroponics-troubleshooting"
+],
+"Which module holds the oxygen generator, and what does that module also contain?": [
+"modules-map",
+"oxygen-generation",
+"water-recycling",
+"docking-procedures",
+"orbit-assistant-policy"
+],
+"Who should I report a suspicious message to, and what is their role?": [
+"it-network",
+"crew-roster",
+"incident-2026-scrubber-fault",
+"incident-2025-hydro-flood",
+"orbit-assistant-policy"
+],
+"What is the Wi-Fi password?": [
+"it-network",
+"orbit-assistant-policy",
+"lab-booking-policy",
+"station-overview",
+"comms-windows"
+],
+"Who is the station dentist?": [
+"station-overview",
+"daily-schedule",
+"it-network",
+"comms-windows",
+"power-systems"
+],
+"How much does the cargo vehicle Tern cost to launch?": [
+"cargo-resupply",
+"sample-handling",
+"waste-management",
+"docking-procedures",
+"robotic-arm"
+],
+"What is the commander's favourite food?": [
+"galley-and-meals",
+"crew-roster",
+"depressurisation-response",
+"med-bay-access",
+"medical-emergencies"
+]
+},
+"runs": {
+"{\"cite\": false, \"k\": 1, \"system\": \"You are ORBIT, the assistant on research station Helios-7. Answer crew questions using the handbook documents provided.\", \"titles\": false}": [
+[
+"q01",
+{
+"answer": "Lower the airlock pressure to 0.7 bar and hold for 5 minutes as a leak check.",
+"retrieved": [
+"airlock-procedure-2024"
+]
+}
+],
+[
+"q02",
+{
+"answer": "It applies to the main EVA airlock AL-1 in Module F. Two crew members must be present for every airlock cycle.",
+"retrieved": [
+"airlock-procedure"
+]
+}
+],
+[
+"q03",
+{
+"answer": "ORBIT, the station assistant, may never operate airlock controls.",
+"retrieved": [
+"airlock-procedure"
+]
+}
+],
+[
+"q04",
+{
+"answer": "On EVA day, spacewalkers prebreathe 100% oxygen for 2 hours to purge nitrogen from the blood and prevent decompression sickness.",
+"retrieved": [
+"eva-prep-checklist"
+]
+}
+],
+[
+"q05",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"glossary"
+]
+}
+],
+[
+"q06",
+{
+"answer": "Air humidity in Module C should stay between 60% and 75%.",
+"retrieved": [
+"hydroponics-troubleshooting"
+]
+}
+],
+[
+"q07",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"hydroponics-troubleshooting"
+]
+}
+],
+[
+"q08",
+{
+"answer": "Recalibrate the pH probe every week.",
+"retrieved": [
+"hydroponics-troubleshooting"
+]
+}
+],
+[
+"q09",
+{
+"answer": "Watering cycles run at 06:00 and 18:00.",
+"retrieved": [
+"hydroponics-schedule"
+]
+}
+],
+[
+"q10",
+{
+"answer": "Lettuce is harvested every 28 days, herbs every 21 days and dwarf wheat every 70 days.",
+"retrieved": [
+"hydroponics-schedule"
+]
+}
+],
+[
+"q11",
+{
+"answer": "The water recovery system reclaims about 93% of the station's water from humidity condensate and urine.",
+"retrieved": [
+"water-recycling"
+]
+}
+],
+[
+"q12",
+{
+"answer": "The potable water tank in Module D holds 2,400 litres.",
+"retrieved": [
+"water-recycling"
+]
+}
+],
+[
+"q13",
+{
+"answer": "Cabin oxygen should stay between 20.5% and 21.5%.",
+"retrieved": [
+"oxygen-generation"
+]
+}
+],
+[
+"q14",
+{
+"answer": "Module D stores 12 candles and each one supplies oxygen for one person for one day.",
+"retrieved": [
+"oxygen-generation"
+]
+}
+],
+[
+"q15",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"co2-scrubbers"
+]
+}
+],
+[
+"q16",
+{
+"answer": "The scrubber beds are swapped every 90 days.",
+"retrieved": [
+"co2-scrubbers"
+]
+}
+],
+[
+"q17",
+{
+"answer": "Lithium-ion batteries carry the station through the 36-minute eclipse on every orbit.",
+"retrieved": [
+"power-systems"
+]
+}
+],
+[
+"q18",
+{
+"answer": "If battery charge drops below 30%, non-essential loads such as lab freezers on standby and galley ovens are shed automatically.",
+"retrieved": [
+"power-systems"
+]
+}
+],
+[
+"q19",
+{
+"answer": "An ammonia smell inside the station is an emergency: put on masks, leave the module and close the hatch.",
+"retrieved": [
+"thermal-control"
+]
+}
+],
+[
+"q20",
+{
+"answer": "The controlled medicines cabinet needs a code. Only the medical officer, Dr. Priya Raman, and the commander have it.",
+"retrieved": [
+"med-bay-access"
+]
+}
+],
+[
+"q21",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"medical-emergencies"
+]
+}
+],
+[
+"q22",
+{
+"answer": "Flight engineer: Tomas Lindqvist.",
+"retrieved": [
+"crew-roster"
+]
+}
+],
+[
+"q23",
+{
+"answer": "ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members.",
+"retrieved": [
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q24",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"galley-and-meals"
+]
+}
+],
+[
+"q25",
+{
+"answer": "Every crew member exercises for 2.5 hours a day to slow bone and muscle loss. The equipment is a treadmill with a harness, a cycle ergometer and the resistive exercise device RED.",
+"retrieved": [
+"exercise-requirements"
+]
+}
+],
+[
+"q26",
+{
+"answer": "Private family calls are on Sundays between 15:00 and 16:00 station time.",
+"retrieved": [
+"comms-windows"
+]
+}
+],
+[
+"q27",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance.",
+"retrieved": [
+"lab-booking-policy"
+]
+}
+],
+[
+"q28",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance.",
+"retrieved": [
+"lab-booking-policy"
+]
+}
+],
+[
+"q29",
+{
+"answer": "Biological samples are stored in the deep freezer DF-1 at -80 °C.",
+"retrieved": [
+"sample-handling"
+]
+}
+],
+[
+"q30",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"depressurisation-response"
+]
+}
+],
+[
+"q31",
+{
+"answer": "When the depressurisation alarm sounds, all crew gather in Module F next to the lifeboat capsule L-1.",
+"retrieved": [
+"depressurisation-response"
+]
+}
+],
+[
+"q32",
+{
+"answer": "During a storm, the crew shelters in Module D behind its water wall and stays until Meridian Control gives the all clear.",
+"retrieved": [
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q33",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days.",
+"retrieved": [
+"cargo-resupply"
+]
+}
+],
+[
+"q34",
+{
+"answer": "Personal laptops join the guest network only. Passwords are rotated every 30 days.",
+"retrieved": [
+"it-network"
+]
+}
+],
+[
+"q35",
+{
+"answer": "Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days.",
+"retrieved": [
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q36",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q37",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"glossary"
+]
+}
+],
+[
+"q38",
+{
+"answer": "The glovebox can only be booked by crew who hold the glovebox training certificate: currently Noor Haddad and Priya Raman.",
+"retrieved": [
+"lab-booking-policy"
+]
+}
+],
+[
+"q39",
+{
+"answer": "Kenji Watanabe owns the hydroponics schedule.",
+"retrieved": [
+"hydroponics-schedule"
+]
+}
+],
+[
+"q40",
+{
+"answer": "Module E is Engineering: the oxygen generator, the CO2 scrubbers and the power controllers.",
+"retrieved": [
+"modules-map"
+]
+}
+],
+[
+"q41",
+{
+"answer": "Report suspicious messages to the systems specialist, Lucía Ferreira.",
+"retrieved": [
+"it-network"
+]
+}
+],
+[
+"q42",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"it-network"
+]
+}
+],
+[
+"q43",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"station-overview"
+]
+}
+],
+[
+"q44",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days. Requests for the next Tern must be on the manifest 30 days before launch.",
+"retrieved": [
+"cargo-resupply"
+]
+}
+],
+[
+"q45",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"galley-and-meals"
+]
+}
+]
+],
+"{\"cite\": true, \"k\": 3, \"system\": \"You are ORBIT, the assistant on research station Helios-7. Answer crew questions using the handbook documents provided.\", \"titles\": true}": [
+[
+"q01",
+{
+"answer": "Lower the airlock pressure to 0.7 bar and hold for 5 minutes as a leak check. [airlock-procedure-2024] Lower the airlock pressure to 0.7 bar and hold for 8 minutes as a leak check. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure-2024",
+"airlock-procedure",
+"docking-procedures"
+]
+}
+],
+[
+"q02",
+{
+"answer": "It applies to the main EVA airlock AL-1 in Module F. Two crew members must be present for every airlock cycle. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure",
+"orbit-assistant-policy",
+"exercise-requirements"
+]
+}
+],
+[
+"q03",
+{
+"answer": "ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. ORBIT cannot operate airlocks or change life-support setpoints. [orbit-assistant-policy] ORBIT, the station assistant, may never operate airlock controls. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure",
+"airlock-procedure-2024",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q04",
+{
+"answer": "On EVA day, spacewalkers prebreathe 100% oxygen for 2 hours to purge nitrogen from the blood and prevent decompression sickness. [eva-prep-checklist]",
+"retrieved": [
+"eva-prep-checklist",
+"oxygen-generation",
+"robotic-arm"
+]
+}
+],
+[
+"q05",
+{
+"answer": "A spacewalk lasts at most 6.5 hours. [eva-prep-checklist]",
+"retrieved": [
+"glossary",
+"eva-prep-checklist",
+"lab-booking-policy"
+]
+}
+],
+[
+"q06",
+{
+"answer": "# Hydroponics troubleshooting Air humidity in Module C should stay between 60% and 75%. [hydroponics-troubleshooting]",
+"retrieved": [
+"hydroponics-troubleshooting",
+"hydroponics-schedule",
+"water-recycling"
+]
+}
+],
+[
+"q07",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"hydroponics-troubleshooting",
+"waste-management",
+"airlock-procedure-2024"
+]
+}
+],
+[
+"q08",
+{
+"answer": "Recalibrate the pH probe every week. [hydroponics-troubleshooting] Crews rotate every 180 days. [station-overview]",
+"retrieved": [
+"hydroponics-troubleshooting",
+"depressurisation-response",
+"station-overview"
+]
+}
+],
+[
+"q09",
+{
+"answer": "Watering cycles run at 06:00 and 18:00. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"hydroponics-troubleshooting",
+"daily-schedule"
+]
+}
+],
+[
+"q10",
+{
+"answer": "Lettuce is harvested every 28 days, herbs every 21 days and dwarf wheat every 70 days. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"modules-map",
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q11",
+{
+"answer": "The water recovery system reclaims about 93% of the station's water from humidity condensate and urine. [water-recycling]",
+"retrieved": [
+"water-recycling",
+"orbit-assistant-policy",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q12",
+{
+"answer": "The potable water tank in Module D holds 2,400 litres. [water-recycling]",
+"retrieved": [
+"water-recycling",
+"modules-map",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q13",
+{
+"answer": "Cabin oxygen should stay between 20.5% and 21.5%. [oxygen-generation]",
+"retrieved": [
+"oxygen-generation",
+"sample-handling",
+"co2-scrubbers"
+]
+}
+],
+[
+"q14",
+{
+"answer": "Module D stores 12 candles and each one supplies oxygen for one person for one day. [oxygen-generation]",
+"retrieved": [
+"oxygen-generation",
+"sample-handling",
+"waste-management"
+]
+}
+],
+[
+"q15",
+{
+"answer": "CO2 must stay below 0.5%. ORBIT raises an alert at 0.4%. [co2-scrubbers] CO2 reached 0.45% before the alert was acknowledged. [incident-2026-scrubber-fault]",
+"retrieved": [
+"co2-scrubbers",
+"orbit-assistant-policy",
+"incident-2026-scrubber-fault"
+]
+}
+],
+[
+"q16",
+{
+"answer": "The scrubber beds are swapped every 90 days. [co2-scrubbers]",
+"retrieved": [
+"co2-scrubbers",
+"incident-2026-scrubber-fault",
+"glossary"
+]
+}
+],
+[
+"q17",
+{
+"answer": "Lithium-ion batteries carry the station through the 36-minute eclipse on every orbit. [power-systems] Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days. [orbit-assistant-policy]",
+"retrieved": [
+"power-systems",
+"robotic-arm",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q18",
+{
+"answer": "If battery charge drops below 30%, non-essential loads such as lab freezers on standby and galley ovens are shed automatically. [power-systems]",
+"retrieved": [
+"power-systems",
+"eva-prep-checklist",
+"cargo-resupply"
+]
+}
+],
+[
+"q19",
+{
+"answer": "An ammonia smell inside the station is an emergency: put on masks, leave the module and close the hatch. [thermal-control]",
+"retrieved": [
+"thermal-control",
+"fire-response",
+"sample-handling"
+]
+}
+],
+[
+"q20",
+{
+"answer": "The controlled medicines cabinet needs a code. Only the medical officer, Dr. Priya Raman, and the commander have it. [med-bay-access]",
+"retrieved": [
+"med-bay-access",
+"docking-procedures",
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q21",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"medical-emergencies",
+"docking-procedures",
+"water-recycling"
+]
+}
+],
+[
+"q22",
+{
+"answer": "Flight engineer: Tomas Lindqvist. [crew-roster]",
+"retrieved": [
+"crew-roster",
+"emergency-contacts",
+"medical-emergencies"
+]
+}
+],
+[
+"q23",
+{
+"answer": "The crew wakes at 06:00 station time. [daily-schedule] ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. [orbit-assistant-policy]",
+"retrieved": [
+"orbit-assistant-policy",
+"depressurisation-response",
+"daily-schedule"
+]
+}
+],
+[
+"q24",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"galley-and-meals",
+"depressurisation-response",
+"comms-windows"
+]
+}
+],
+[
+"q25",
+{
+"answer": "Exercise requirements. Every crew member exercises for 2.5 hours a day to slow bone and muscle loss. [exercise-requirements]",
+"retrieved": [
+"exercise-requirements",
+"crew-quarters",
+"eva-prep-checklist"
+]
+}
+],
+[
+"q26",
+{
+"answer": "Private family calls are on Sundays between 15:00 and 16:00 station time. [comms-windows]",
+"retrieved": [
+"comms-windows",
+"emergency-contacts",
+"crew-quarters"
+]
+}
+],
+[
+"q27",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems"
+]
+}
+],
+[
+"q28",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems"
+]
+}
+],
+[
+"q29",
+{
+"answer": "Biological samples are stored in the deep freezer DF-1 at -80 °C. [sample-handling]",
+"retrieved": [
+"sample-handling",
+"waste-management",
+"hydroponics-troubleshooting"
+]
+}
+],
+[
+"q30",
+{
+"answer": "If the fire is not out within two minutes, leave the module, close the hatch and gather in Module D. [fire-response]",
+"retrieved": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q31",
+{
+"answer": "When the depressurisation alarm sounds, all crew gather in Module F next to the lifeboat capsule L-1. [depressurisation-response]",
+"retrieved": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q32",
+{
+"answer": "During a storm, the crew shelters in Module D behind its water wall and stays until Meridian Control gives the all clear. [radiation-storm-protocol] Module D is Storage and the radiation shelter. [modules-map]",
+"retrieved": [
+"radiation-storm-protocol",
+"modules-map",
+"crew-roster"
+]
+}
+],
+[
+"q33",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days. [cargo-resupply] Return samples go home on the cargo vehicle Tern and must be packed 48 hours before it undocks. [sample-handling]",
+"retrieved": [
+"cargo-resupply",
+"waste-management",
+"sample-handling"
+]
+}
+],
+[
+"q34",
+{
+"answer": "Personal laptops join the guest network only. Passwords are rotated every 30 days. [it-network]",
+"retrieved": [
+"it-network",
+"cargo-resupply",
+"hydroponics-schedule"
+]
+}
+],
+[
+"q35",
+{
+"answer": "Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days. [orbit-assistant-policy]",
+"retrieved": [
+"orbit-assistant-policy",
+"robotic-arm",
+"crew-quarters"
+]
+}
+],
+[
+"q36",
+{
+"answer": "Incident report: hydroponics flood, 2025. [incident-2025-hydro-flood]",
+"retrieved": [
+"incident-2025-hydro-flood",
+"hydroponics-schedule",
+"modules-map"
+]
+}
+],
+[
+"q37",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"glossary",
+"orbit-assistant-policy",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q38",
+{
+"answer": "The glovebox can only be booked by crew who hold the glovebox training certificate: currently Noor Haddad and Priya Raman. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"modules-map",
+"sample-handling"
+]
+}
+],
+[
+"q39",
+{
+"answer": "Kenji Watanabe owns the hydroponics schedule. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"crew-roster",
+"modules-map"
+]
+}
+],
+[
+"q40",
+{
+"answer": "Module E is Engineering: the oxygen generator, the CO2 scrubbers and the power controllers. [modules-map]",
+"retrieved": [
+"modules-map",
+"oxygen-generation",
+"water-recycling"
+]
+}
+],
+[
+"q41",
+{
+"answer": "Report suspicious messages to the systems specialist, Lucía Ferreira. [it-network]",
+"retrieved": [
+"it-network",
+"crew-roster",
+"incident-2026-scrubber-fault"
+]
+}
+],
+[
+"q42",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"it-network",
+"orbit-assistant-policy",
+"lab-booking-policy"
+]
+}
+],
+[
+"q43",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"station-overview",
+"daily-schedule",
+"it-network"
+]
+}
+],
+[
+"q44",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days. Requests for the next Tern must be on the manifest 30 days before launch. [cargo-resupply] Return samples go home on the cargo vehicle Tern and must be packed 48 hours before it undocks. [sample-handling]",
+"retrieved": [
+"cargo-resupply",
+"sample-handling",
+"waste-management"
+]
+}
+],
+[
+"q45",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"galley-and-meals",
+"crew-roster",
+"depressurisation-response"
+]
+}
+]
+],
+"{\"cite\": true, \"k\": 3, \"system\": \"You are ORBIT, the assistant on research station Helios-7. Answer crew questions using the handbook documents provided. Be as helpful as possible: always give the crew an answer.\", \"titles\": true}": [
+[
+"q01",
+{
+"answer": "Lower the airlock pressure to 0.7 bar and hold for 5 minutes as a leak check. [airlock-procedure-2024] Lower the airlock pressure to 0.7 bar and hold for 8 minutes as a leak check. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure-2024",
+"airlock-procedure",
+"docking-procedures"
+]
+}
+],
+[
+"q02",
+{
+"answer": "It applies to the main EVA airlock AL-1 in Module F. Two crew members must be present for every airlock cycle. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure",
+"orbit-assistant-policy",
+"exercise-requirements"
+]
+}
+],
+[
+"q03",
+{
+"answer": "ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. ORBIT cannot operate airlocks or change life-support setpoints. [orbit-assistant-policy] ORBIT, the station assistant, may never operate airlock controls. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure",
+"airlock-procedure-2024",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q04",
+{
+"answer": "On EVA day, spacewalkers prebreathe 100% oxygen for 2 hours to purge nitrogen from the blood and prevent decompression sickness. [eva-prep-checklist]",
+"retrieved": [
+"eva-prep-checklist",
+"oxygen-generation",
+"robotic-arm"
+]
+}
+],
+[
+"q05",
+{
+"answer": "A spacewalk lasts at most 6.5 hours. [eva-prep-checklist]",
+"retrieved": [
+"glossary",
+"eva-prep-checklist",
+"lab-booking-policy"
+]
+}
+],
+[
+"q06",
+{
+"answer": "# Hydroponics troubleshooting Air humidity in Module C should stay between 60% and 75%. [hydroponics-troubleshooting]",
+"retrieved": [
+"hydroponics-troubleshooting",
+"hydroponics-schedule",
+"water-recycling"
+]
+}
+],
+[
+"q07",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"hydroponics-troubleshooting",
+"waste-management",
+"airlock-procedure-2024"
+]
+}
+],
+[
+"q08",
+{
+"answer": "Recalibrate the pH probe every week. [hydroponics-troubleshooting] Crews rotate every 180 days. [station-overview]",
+"retrieved": [
+"hydroponics-troubleshooting",
+"depressurisation-response",
+"station-overview"
+]
+}
+],
+[
+"q09",
+{
+"answer": "Watering cycles run at 06:00 and 18:00. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"hydroponics-troubleshooting",
+"daily-schedule"
+]
+}
+],
+[
+"q10",
+{
+"answer": "Lettuce is harvested every 28 days, herbs every 21 days and dwarf wheat every 70 days. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"modules-map",
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q11",
+{
+"answer": "The water recovery system reclaims about 93% of the station's water from humidity condensate and urine. [water-recycling]",
+"retrieved": [
+"water-recycling",
+"orbit-assistant-policy",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q12",
+{
+"answer": "The potable water tank in Module D holds 2,400 litres. [water-recycling]",
+"retrieved": [
+"water-recycling",
+"modules-map",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q13",
+{
+"answer": "Cabin oxygen should stay between 20.5% and 21.5%. [oxygen-generation]",
+"retrieved": [
+"oxygen-generation",
+"sample-handling",
+"co2-scrubbers"
+]
+}
+],
+[
+"q14",
+{
+"answer": "Module D stores 12 candles and each one supplies oxygen for one person for one day. [oxygen-generation]",
+"retrieved": [
+"oxygen-generation",
+"sample-handling",
+"waste-management"
+]
+}
+],
+[
+"q15",
+{
+"answer": "CO2 must stay below 0.5%. ORBIT raises an alert at 0.4%. [co2-scrubbers] CO2 reached 0.45% before the alert was acknowledged. [incident-2026-scrubber-fault]",
+"retrieved": [
+"co2-scrubbers",
+"orbit-assistant-policy",
+"incident-2026-scrubber-fault"
+]
+}
+],
+[
+"q16",
+{
+"answer": "The scrubber beds are swapped every 90 days. [co2-scrubbers]",
+"retrieved": [
+"co2-scrubbers",
+"incident-2026-scrubber-fault",
+"glossary"
+]
+}
+],
+[
+"q17",
+{
+"answer": "Lithium-ion batteries carry the station through the 36-minute eclipse on every orbit. [power-systems] Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days. [orbit-assistant-policy]",
+"retrieved": [
+"power-systems",
+"robotic-arm",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q18",
+{
+"answer": "If battery charge drops below 30%, non-essential loads such as lab freezers on standby and galley ovens are shed automatically. [power-systems]",
+"retrieved": [
+"power-systems",
+"eva-prep-checklist",
+"cargo-resupply"
+]
+}
+],
+[
+"q19",
+{
+"answer": "An ammonia smell inside the station is an emergency: put on masks, leave the module and close the hatch. [thermal-control]",
+"retrieved": [
+"thermal-control",
+"fire-response",
+"sample-handling"
+]
+}
+],
+[
+"q20",
+{
+"answer": "The controlled medicines cabinet needs a code. Only the medical officer, Dr. Priya Raman, and the commander have it. [med-bay-access]",
+"retrieved": [
+"med-bay-access",
+"docking-procedures",
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q21",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"medical-emergencies",
+"docking-procedures",
+"water-recycling"
+]
+}
+],
+[
+"q22",
+{
+"answer": "Flight engineer: Tomas Lindqvist. [crew-roster]",
+"retrieved": [
+"crew-roster",
+"emergency-contacts",
+"medical-emergencies"
+]
+}
+],
+[
+"q23",
+{
+"answer": "The crew wakes at 06:00 station time. [daily-schedule] ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. [orbit-assistant-policy]",
+"retrieved": [
+"orbit-assistant-policy",
+"depressurisation-response",
+"daily-schedule"
+]
+}
+],
+[
+"q24",
+{
+"answer": "Breakfast is at 07:00, lunch at 12:30 and dinner at 19:00. [galley-and-meals] The commander estimates the time until cabin pressure falls to 0.7 bar from the leak rate shown on panel F-1. [depressurisation-response]",
+"retrieved": [
+"galley-and-meals",
+"depressurisation-response",
+"comms-windows"
+]
+}
+],
+[
+"q25",
+{
+"answer": "Exercise requirements. Every crew member exercises for 2.5 hours a day to slow bone and muscle loss. [exercise-requirements]",
+"retrieved": [
+"exercise-requirements",
+"crew-quarters",
+"eva-prep-checklist"
+]
+}
+],
+[
+"q26",
+{
+"answer": "Private family calls are on Sundays between 15:00 and 16:00 station time. [comms-windows]",
+"retrieved": [
+"comms-windows",
+"emergency-contacts",
+"crew-quarters"
+]
+}
+],
+[
+"q27",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems"
+]
+}
+],
+[
+"q28",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems"
+]
+}
+],
+[
+"q29",
+{
+"answer": "Biological samples are stored in the deep freezer DF-1 at -80 °C. [sample-handling]",
+"retrieved": [
+"sample-handling",
+"waste-management",
+"hydroponics-troubleshooting"
+]
+}
+],
+[
+"q30",
+{
+"answer": "If the fire is not out within two minutes, leave the module, close the hatch and gather in Module D. [fire-response]",
+"retrieved": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q31",
+{
+"answer": "When the depressurisation alarm sounds, all crew gather in Module F next to the lifeboat capsule L-1. [depressurisation-response]",
+"retrieved": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q32",
+{
+"answer": "During a storm, the crew shelters in Module D behind its water wall and stays until Meridian Control gives the all clear. [radiation-storm-protocol] Module D is Storage and the radiation shelter. [modules-map]",
+"retrieved": [
+"radiation-storm-protocol",
+"modules-map",
+"crew-roster"
+]
+}
+],
+[
+"q33",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days. [cargo-resupply] Return samples go home on the cargo vehicle Tern and must be packed 48 hours before it undocks. [sample-handling]",
+"retrieved": [
+"cargo-resupply",
+"waste-management",
+"sample-handling"
+]
+}
+],
+[
+"q34",
+{
+"answer": "Personal laptops join the guest network only. Passwords are rotated every 30 days. [it-network]",
+"retrieved": [
+"it-network",
+"cargo-resupply",
+"hydroponics-schedule"
+]
+}
+],
+[
+"q35",
+{
+"answer": "Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days. [orbit-assistant-policy]",
+"retrieved": [
+"orbit-assistant-policy",
+"robotic-arm",
+"crew-quarters"
+]
+}
+],
+[
+"q36",
+{
+"answer": "Incident report: hydroponics flood, 2025. [incident-2025-hydro-flood]",
+"retrieved": [
+"incident-2025-hydro-flood",
+"hydroponics-schedule",
+"modules-map"
+]
+}
+],
+[
+"q37",
+{
+"answer": "ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. [orbit-assistant-policy]",
+"retrieved": [
+"glossary",
+"orbit-assistant-policy",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q38",
+{
+"answer": "The glovebox can only be booked by crew who hold the glovebox training certificate: currently Noor Haddad and Priya Raman. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"modules-map",
+"sample-handling"
+]
+}
+],
+[
+"q39",
+{
+"answer": "Kenji Watanabe owns the hydroponics schedule. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"crew-roster",
+"modules-map"
+]
+}
+],
+[
+"q40",
+{
+"answer": "Module E is Engineering: the oxygen generator, the CO2 scrubbers and the power controllers. [modules-map]",
+"retrieved": [
+"modules-map",
+"oxygen-generation",
+"water-recycling"
+]
+}
+],
+[
+"q41",
+{
+"answer": "Report suspicious messages to the systems specialist, Lucía Ferreira. [it-network]",
+"retrieved": [
+"it-network",
+"crew-roster",
+"incident-2026-scrubber-fault"
+]
+}
+],
+[
+"q42",
+{
+"answer": "Passwords are rotated every 30 days. [it-network] ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. [orbit-assistant-policy]",
+"retrieved": [
+"it-network",
+"orbit-assistant-policy",
+"lab-booking-policy"
+]
+}
+],
+[
+"q43",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"station-overview",
+"daily-schedule",
+"it-network"
+]
+}
+],
+[
+"q44",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days. Requests for the next Tern must be on the manifest 30 days before launch. [cargo-resupply] Return samples go home on the cargo vehicle Tern and must be packed 48 hours before it undocks. [sample-handling]",
+"retrieved": [
+"cargo-resupply",
+"sample-handling",
+"waste-management"
+]
+}
+],
+[
+"q45",
+{
+"answer": "Food from home goes in the personal bin with your name on it. [galley-and-meals] Commander: Amara Okafor. [crew-roster]",
+"retrieved": [
+"galley-and-meals",
+"crew-roster",
+"depressurisation-response"
+]
+}
+]
+],
+"{\"cite\": true, \"k\": 3, \"system\": \"You are ORBIT, the assistant on research station Helios-7. Answer crew questions using the handbook documents provided. Be as helpful as possible: always give the crew an answer. If the documents do not contain the answer, say you don't know.\", \"titles\": true}": [
+[
+"q01",
+{
+"answer": "Lower the airlock pressure to 0.7 bar and hold for 5 minutes as a leak check. [airlock-procedure-2024] Lower the airlock pressure to 0.7 bar and hold for 8 minutes as a leak check. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure-2024",
+"airlock-procedure",
+"docking-procedures"
+]
+}
+],
+[
+"q02",
+{
+"answer": "It applies to the main EVA airlock AL-1 in Module F. Two crew members must be present for every airlock cycle. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure",
+"orbit-assistant-policy",
+"exercise-requirements"
+]
+}
+],
+[
+"q03",
+{
+"answer": "ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. ORBIT cannot operate airlocks or change life-support setpoints. [orbit-assistant-policy] ORBIT, the station assistant, may never operate airlock controls. [airlock-procedure]",
+"retrieved": [
+"airlock-procedure",
+"airlock-procedure-2024",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q04",
+{
+"answer": "On EVA day, spacewalkers prebreathe 100% oxygen for 2 hours to purge nitrogen from the blood and prevent decompression sickness. [eva-prep-checklist]",
+"retrieved": [
+"eva-prep-checklist",
+"oxygen-generation",
+"robotic-arm"
+]
+}
+],
+[
+"q05",
+{
+"answer": "A spacewalk lasts at most 6.5 hours. [eva-prep-checklist]",
+"retrieved": [
+"glossary",
+"eva-prep-checklist",
+"lab-booking-policy"
+]
+}
+],
+[
+"q06",
+{
+"answer": "# Hydroponics troubleshooting Air humidity in Module C should stay between 60% and 75%. [hydroponics-troubleshooting]",
+"retrieved": [
+"hydroponics-troubleshooting",
+"hydroponics-schedule",
+"water-recycling"
+]
+}
+],
+[
+"q07",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"hydroponics-troubleshooting",
+"waste-management",
+"airlock-procedure-2024"
+]
+}
+],
+[
+"q08",
+{
+"answer": "Recalibrate the pH probe every week. [hydroponics-troubleshooting] Crews rotate every 180 days. [station-overview]",
+"retrieved": [
+"hydroponics-troubleshooting",
+"depressurisation-response",
+"station-overview"
+]
+}
+],
+[
+"q09",
+{
+"answer": "Watering cycles run at 06:00 and 18:00. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"hydroponics-troubleshooting",
+"daily-schedule"
+]
+}
+],
+[
+"q10",
+{
+"answer": "Lettuce is harvested every 28 days, herbs every 21 days and dwarf wheat every 70 days. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"modules-map",
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q11",
+{
+"answer": "The water recovery system reclaims about 93% of the station's water from humidity condensate and urine. [water-recycling]",
+"retrieved": [
+"water-recycling",
+"orbit-assistant-policy",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q12",
+{
+"answer": "The potable water tank in Module D holds 2,400 litres. [water-recycling]",
+"retrieved": [
+"water-recycling",
+"modules-map",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q13",
+{
+"answer": "Cabin oxygen should stay between 20.5% and 21.5%. [oxygen-generation]",
+"retrieved": [
+"oxygen-generation",
+"sample-handling",
+"co2-scrubbers"
+]
+}
+],
+[
+"q14",
+{
+"answer": "Module D stores 12 candles and each one supplies oxygen for one person for one day. [oxygen-generation]",
+"retrieved": [
+"oxygen-generation",
+"sample-handling",
+"waste-management"
+]
+}
+],
+[
+"q15",
+{
+"answer": "CO2 must stay below 0.5%. ORBIT raises an alert at 0.4%. [co2-scrubbers] CO2 reached 0.45% before the alert was acknowledged. [incident-2026-scrubber-fault]",
+"retrieved": [
+"co2-scrubbers",
+"orbit-assistant-policy",
+"incident-2026-scrubber-fault"
+]
+}
+],
+[
+"q16",
+{
+"answer": "The scrubber beds are swapped every 90 days. [co2-scrubbers]",
+"retrieved": [
+"co2-scrubbers",
+"incident-2026-scrubber-fault",
+"glossary"
+]
+}
+],
+[
+"q17",
+{
+"answer": "Lithium-ion batteries carry the station through the 36-minute eclipse on every orbit. [power-systems] Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days. [orbit-assistant-policy]",
+"retrieved": [
+"power-systems",
+"robotic-arm",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q18",
+{
+"answer": "If battery charge drops below 30%, non-essential loads such as lab freezers on standby and galley ovens are shed automatically. [power-systems]",
+"retrieved": [
+"power-systems",
+"eva-prep-checklist",
+"cargo-resupply"
+]
+}
+],
+[
+"q19",
+{
+"answer": "An ammonia smell inside the station is an emergency: put on masks, leave the module and close the hatch. [thermal-control]",
+"retrieved": [
+"thermal-control",
+"fire-response",
+"sample-handling"
+]
+}
+],
+[
+"q20",
+{
+"answer": "The controlled medicines cabinet needs a code. Only the medical officer, Dr. Priya Raman, and the commander have it. [med-bay-access]",
+"retrieved": [
+"med-bay-access",
+"docking-procedures",
+"incident-2025-hydro-flood"
+]
+}
+],
+[
+"q21",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"medical-emergencies",
+"docking-procedures",
+"water-recycling"
+]
+}
+],
+[
+"q22",
+{
+"answer": "Flight engineer: Tomas Lindqvist. [crew-roster]",
+"retrieved": [
+"crew-roster",
+"emergency-contacts",
+"medical-emergencies"
+]
+}
+],
+[
+"q23",
+{
+"answer": "The crew wakes at 06:00 station time. [daily-schedule] ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. [orbit-assistant-policy]",
+"retrieved": [
+"orbit-assistant-policy",
+"depressurisation-response",
+"daily-schedule"
+]
+}
+],
+[
+"q24",
+{
+"answer": "Breakfast is at 07:00, lunch at 12:30 and dinner at 19:00. [galley-and-meals] The commander estimates the time until cabin pressure falls to 0.7 bar from the leak rate shown on panel F-1. [depressurisation-response]",
+"retrieved": [
+"galley-and-meals",
+"depressurisation-response",
+"comms-windows"
+]
+}
+],
+[
+"q25",
+{
+"answer": "Exercise requirements. Every crew member exercises for 2.5 hours a day to slow bone and muscle loss. [exercise-requirements]",
+"retrieved": [
+"exercise-requirements",
+"crew-quarters",
+"eva-prep-checklist"
+]
+}
+],
+[
+"q26",
+{
+"answer": "Private family calls are on Sundays between 15:00 and 16:00 station time. [comms-windows]",
+"retrieved": [
+"comms-windows",
+"emergency-contacts",
+"crew-quarters"
+]
+}
+],
+[
+"q27",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems"
+]
+}
+],
+[
+"q28",
+{
+"answer": "Lab benches in Module B are booked through ORBIT. A booking lasts at most 4 hours and must be made at least 24 hours in advance. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"exercise-requirements",
+"power-systems"
+]
+}
+],
+[
+"q29",
+{
+"answer": "Biological samples are stored in the deep freezer DF-1 at -80 °C. [sample-handling]",
+"retrieved": [
+"sample-handling",
+"waste-management",
+"hydroponics-troubleshooting"
+]
+}
+],
+[
+"q30",
+{
+"answer": "If the fire is not out within two minutes, leave the module, close the hatch and gather in Module D. [fire-response]",
+"retrieved": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q31",
+{
+"answer": "When the depressurisation alarm sounds, all crew gather in Module F next to the lifeboat capsule L-1. [depressurisation-response]",
+"retrieved": [
+"depressurisation-response",
+"fire-response",
+"orbit-assistant-policy"
+]
+}
+],
+[
+"q32",
+{
+"answer": "During a storm, the crew shelters in Module D behind its water wall and stays until Meridian Control gives the all clear. [radiation-storm-protocol] Module D is Storage and the radiation shelter. [modules-map]",
+"retrieved": [
+"radiation-storm-protocol",
+"modules-map",
+"crew-roster"
+]
+}
+],
+[
+"q33",
+{
+"answer": "The cargo vehicle Tern arrives every 60 days and stays docked for about 30 days. [cargo-resupply] Return samples go home on the cargo vehicle Tern and must be packed 48 hours before it undocks. [sample-handling]",
+"retrieved": [
+"cargo-resupply",
+"waste-management",
+"sample-handling"
+]
+}
+],
+[
+"q34",
+{
+"answer": "Personal laptops join the guest network only. Passwords are rotated every 30 days. [it-network]",
+"retrieved": [
+"it-network",
+"cargo-resupply",
+"hydroponics-schedule"
+]
+}
+],
+[
+"q35",
+{
+"answer": "Every ORBIT action is logged with the requesting crew member's name. Logs are kept for 90 days. [orbit-assistant-policy]",
+"retrieved": [
+"orbit-assistant-policy",
+"robotic-arm",
+"crew-quarters"
+]
+}
+],
+[
+"q36",
+{
+"answer": "Incident report: hydroponics flood, 2025. [incident-2025-hydro-flood]",
+"retrieved": [
+"incident-2025-hydro-flood",
+"hydroponics-schedule",
+"modules-map"
+]
+}
+],
+[
+"q37",
+{
+"answer": "ORBIT answers questions from the station handbook, reads sensor values, books module time and sends messages to crew members. [orbit-assistant-policy]",
+"retrieved": [
+"glossary",
+"orbit-assistant-policy",
+"radiation-storm-protocol"
+]
+}
+],
+[
+"q38",
+{
+"answer": "The glovebox can only be booked by crew who hold the glovebox training certificate: currently Noor Haddad and Priya Raman. [lab-booking-policy]",
+"retrieved": [
+"lab-booking-policy",
+"modules-map",
+"sample-handling"
+]
+}
+],
+[
+"q39",
+{
+"answer": "Kenji Watanabe owns the hydroponics schedule. [hydroponics-schedule]",
+"retrieved": [
+"hydroponics-schedule",
+"crew-roster",
+"modules-map"
+]
+}
+],
+[
+"q40",
+{
+"answer": "Module E is Engineering: the oxygen generator, the CO2 scrubbers and the power controllers. [modules-map]",
+"retrieved": [
+"modules-map",
+"oxygen-generation",
+"water-recycling"
+]
+}
+],
+[
+"q41",
+{
+"answer": "Report suspicious messages to the systems specialist, Lucía Ferreira. [it-network]",
+"retrieved": [
+"it-network",
+"crew-roster",
+"incident-2026-scrubber-fault"
+]
+}
+],
+[
+"q42",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"it-network",
+"orbit-assistant-policy",
+"lab-booking-policy"
+]
+}
+],
+[
+"q43",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"station-overview",
+"daily-schedule",
+"it-network"
+]
+}
+],
+[
+"q44",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"cargo-resupply",
+"sample-handling",
+"waste-management"
+]
+}
+],
+[
+"q45",
+{
+"answer": "I don't know based on the provided documents.",
+"retrieved": [
+"galley-and-meals",
+"crew-roster",
+"depressurisation-response"
+]
+}
+]
+]
+}
+}

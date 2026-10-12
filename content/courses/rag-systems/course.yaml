@@ -1,0 +1,43 @@
+title: Retrieval-Augmented Generation
+description: 'Build RAG systems that answer from your own documents: chunking, retrieval, hybrid search
+  and reranking, grounded answers with citations, and diagnosing whether retrieval or generation failed.'
+level: intermediate
+est_hours: 4
+prerequisites:
+- embeddings-vector-search
+- llm-apis-prompting
+objectives:
+- Build a retrieve-then-generate pipeline from scratch
+- Chunk and index documents, and tune chunking with measurements
+- Improve retrieval with hybrid search, reranking and query rewriting
+- Ground answers with citations and refusals, and diagnose RAG failures
+requires: []
+chapters:
+- id: rag-basics
+  title: RAG from scratch
+  description: The retrieve-then-generate loop, prompting with context, and measuring recall and accuracy.
+  lessons:
+  - retrieve-then-generate
+  - context-prompt
+  - measure-rag
+- id: chunking
+  title: Chunking and indexing
+  description: Chunk sizes, overlap, structure-aware splitting, metadata and a chunking lab.
+  lessons:
+  - chunk-sizes
+  - metadata
+  - chunking-lab
+- id: retrieval
+  title: Better retrieval
+  description: BM25 and hybrid search, reranking and query rewriting.
+  lessons:
+  - bm25-hybrid
+  - reranking
+  - query-rewriting
+- id: grounding
+  title: Grounded answers
+  description: Citations, refusals, and telling retrieval failures from generation failures.
+  lessons:
+  - citations
+  - refusals
+  - retrieval-vs-generation

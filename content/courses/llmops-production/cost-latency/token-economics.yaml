@@ -1,0 +1,208 @@
+title: Token economics
+description: What an LLM request costs, per task and per month, where ORBIT's money actually goes, and which lever moves it.
+exercises:
+  - id: token-economics-slides
+    type: video
+    title: Where the money goes
+    slides: |
+      # What you pay for
+
+      Every call is billed by tokens, with separate prices (per million tokens) for each kind:
+
+      $$\text{cost} = \frac{n_\text{in}\,p_\text{in} + n_\text{out}\,p_\text{out} + n_\text{write}\,1.25\,p_\text{in} + n_\text{read}\,0.1\,p_\text{in}}{10^6}$$
+
+      | tier (course prices) | input $/M | output $/M | used for |
+      | --- | --- | --- | --- |
+      | small (`claude-haiku-4-5`) | 1 | 5 | fast, cheap, simpler tasks |
+      | medium (`claude-sonnet-5-5`) | 3 | 15 | ORBIT's default |
+      | large (`claude-opus-5-5`) | 5 | 25 | hardest tasks |
+
+      These are `aikit.PRICES`, made up for the course. Real prices change: always read the provider's pricing
+      page. The **ratios** are what matter: output costs about 5× input, and cache reads cost a tenth of input.
+
+      ---
+
+      ## Cost per task, not per call
+
+      A crew question is a **task**. One task can mean several calls:
+
+      - an agent loop (tool call, then the answer): 2-5 calls, each resending the growing history
+      - retries after errors (a request that times out on your side may still have been processed and billed)
+      - an LLM judge or guardrail check on the answer
+      - embedding calls for retrieval
+
+      $$\text{monthly cost} = \text{cost per call} \times \text{calls per task} \times \text{tasks per day} \times 30$$
+
+      Measure calls per task from your traces; do not guess it.
+
+      ---
+
+      ## ORBIT's bill, measured
+
+      ORBIT sends its rules plus the **whole handbook** with every question:
+
+      | part of the request | tokens | share of cost |
+      | --- | --- | --- |
+      | rules | 52 | 1% |
+      | handbook | 3,848 | 80% |
+      | question (+ message overhead) | ~16 | 0.3% |
+      | output (answer) | ~180 | 19% |
+
+      Output tokens are 5× pricier, but there are 20× fewer of them. In retrieval and chat apps, **input usually
+      dominates cost**, while **output usually dominates latency** (next lesson). Different symptoms, different fixes.
+
+      ---
+
+      ## The levers and what they cost you
+
+      | lever | cuts | what it costs you | wins when |
+      | --- | --- | --- | --- |
+      | **prompt caching** | repeated input, ~90% of its price | 25% extra on the first write; prefix must be identical | a big stable prefix (handbook, tools, few-shot) |
+      | **trim context** (retrieve top-k instead of everything) | input | answers fail when retrieval misses | the corpus is too big to send, or most of it is irrelevant |
+      | **brief answers** | output | may drop detail people needed | outputs are long and padded |
+      | **smaller model / routing** | both prices, ~3× | accuracy on hard questions | many easy requests |
+      | **response cache** | the whole call | stale or wrong answers | many repeated questions |
+      | **batch API** | ~50% of everything | results take minutes to hours | offline jobs |
+
+      **Playbook:** measure the breakdown first, then pull the lever on the **biggest** bucket, then re-run the eval
+      to check accuracy did not drop.
+
+  - id: cost-by-hand
+    type: coding
+    title: Price one request, then a month
+    context: |
+      `r` is ORBIT's reply to *"How long is the eclipse on each orbit?"* from `claude-sonnet-5-5` (medium tier).
+      `PRICES` holds the course prices per million tokens. The traces show **1.3 LLM calls per crew question** on
+      average, and the five sister stations will send **900 questions a day**.
+    instructions:
+      - "Compute the cost of `r` by hand from `r.usage` and `PRICES[\"medium\"]`; store it in `cost`."
+      - "Store `input_share`: the fraction of `cost` that comes from input tokens."
+      - "Store `monthly`: the projected cost of 30 days, using `CALLS_PER_TASK` and `TASKS_PER_DAY`."
+    hint: |
+      `(r.usage.input_tokens * p["input"] + r.usage.output_tokens * p["output"]) / 1_000_000`. The month is
+      `cost * CALLS_PER_TASK * TASKS_PER_DAY * 30`.
+    pre_code: |
+      from kits.llmops_production import make_client, MODEL, SYSTEM, PRICES
+      client = make_client()
+      r = client.messages.create(model=MODEL, max_tokens=600, system=SYSTEM,
+                                 messages=[{"role": "user", "content": "How long is the eclipse on each orbit?"}])
+      CALLS_PER_TASK = 1.3
+      TASKS_PER_DAY = 900
+    sample_code: |
+      p = PRICES["medium"]
+      cost = ____
+      input_share = ____
+      monthly = ____
+
+      print(r.usage)
+      print(f"${cost:.5f} per call (the client recorded ${client.calls[-1]['cost']:.5f})")
+      print(f"{input_share:.0%} of it is input; ${monthly:,.0f} per month")
+    solution: |
+      p = PRICES["medium"]
+      cost = (r.usage.input_tokens * p["input"] + r.usage.output_tokens * p["output"]) / 1_000_000
+      input_share = (r.usage.input_tokens * p["input"] / 1_000_000) / cost
+      monthly = cost * CALLS_PER_TASK * TASKS_PER_DAY * 30
+
+      print(r.usage)
+      print(f"${cost:.5f} per call (the client recorded ${client.calls[-1]['cost']:.5f})")
+      print(f"{input_share:.0%} of it is input; ${monthly:,.0f} per month")
+    tests: |
+      check_equal("cost", tol=1e-9, msg="`cost` is (input_tokens x input price + output_tokens x output price) / 1,000,000, with the medium prices.")
+      assert abs(user["cost"] - user["client"].calls[-1]["cost"]) < 1e-9, "Your `cost` should match what the client recorded in `client.calls[-1]['cost']`."
+      check_equal("input_share", tol=1e-6, msg="`input_share` is the input part of the cost divided by `cost`.")
+      check_equal("monthly", tol=1e-6, msg="`monthly` is cost x CALLS_PER_TASK x TASKS_PER_DAY x 30.")
+    success_msg: |
+      About 1.4 cents a call sounds like nothing, until it is about $500 a month for one modest assistant, and 83%
+      of that pays for the same handbook sent again and again.
+
+  - id: cost-breakdown
+    type: coding
+    title: Where do the tokens go?
+    context: |
+      ORBIT's system prompt is `RULES + "\n\n" + HANDBOOK_BLOCK`. `r` is its reply to `Q`. `count_tokens` is the
+      tokenizer the fake client uses, and `p` holds the medium-tier prices.
+    instructions:
+      - "Store `tokens`: a dict with the token counts of `rules`, `handbook` and `question`, using `count_tokens`."
+      - "Store `overhead`: `r.usage.input_tokens` minus the sum of `tokens` (the per-message formatting tokens)."
+      - "Store `costs`: a dict with the dollar cost of each of the three input parts, plus `output` for the reply's output tokens."
+      - "Store `biggest`: the key of `costs` with the largest value."
+    hint: |
+      `{"rules": count_tokens(RULES), "handbook": count_tokens(HANDBOOK_BLOCK), "question": count_tokens(Q)}`.
+      Each input part costs `n * p["input"] / 1_000_000`; the output uses `p["output"]`. `max(costs, key=costs.get)`.
+    pre_code: |
+      from kits.llmops_production import make_client, MODEL, RULES, HANDBOOK_BLOCK, PRICES, count_tokens
+      client = make_client()
+      Q = "Who owns the hydroponics schedule and what is their role?"
+      r = client.messages.create(model=MODEL, max_tokens=600, system=RULES + "\n\n" + HANDBOOK_BLOCK,
+                                 messages=[{"role": "user", "content": Q}])
+      p = PRICES["medium"]
+    sample_code: |
+      tokens = {
+          "rules": count_tokens(RULES),
+          "handbook": ____,
+          "question": ____,
+      }
+      overhead = ____
+
+      costs = {k: n * p["input"] / 1_000_000 for k, n in tokens.items()}
+      costs["output"] = ____
+      biggest = ____
+
+      total = sum(costs.values())
+      for k, v in costs.items():
+          print(f"{k:9s} ${v:.5f}  {v / total:.0%}")
+    solution: |
+      tokens = {
+          "rules": count_tokens(RULES),
+          "handbook": count_tokens(HANDBOOK_BLOCK),
+          "question": count_tokens(Q),
+      }
+      overhead = r.usage.input_tokens - sum(tokens.values())
+
+      costs = {k: n * p["input"] / 1_000_000 for k, n in tokens.items()}
+      costs["output"] = r.usage.output_tokens * p["output"] / 1_000_000
+      biggest = max(costs, key=costs.get)
+
+      total = sum(costs.values())
+      for k, v in costs.items():
+          print(f"{k:9s} ${v:.5f}  {v / total:.0%}")
+    tests: |
+      check_equal("tokens", msg="`tokens` should hold `count_tokens` of RULES, HANDBOOK_BLOCK and Q under the keys rules, handbook and question.")
+      check_equal("overhead", msg="`overhead` is `r.usage.input_tokens` minus the sum of the three counts.")
+      check_object("costs")
+      got, exp = user["costs"], sol["costs"]
+      assert set(got) == set(exp), f"`costs` needs the keys {sorted(exp)}."
+      for k in exp:
+          assert abs(got[k] - exp[k]) < 1e-12, f"`costs['{k}']` should be {exp[k]:.6f}."
+      check_equal("biggest")
+    success_msg: |
+      For this question the handbook is three quarters of the bill and the (long) answer a quarter; averaged over the
+      eval set it is about 80/20. The question itself is a rounding error. A cost fix that does not touch the
+      handbook can save at most a quarter.
+
+  - id: cheapest-lever
+    type: mc
+    title: Which change saves the most?
+    question: |
+      On the 41-question eval set, ORBIT costs **$0.594** at **100%** accuracy. You may make **one** change. Which one
+      cuts the cost the most **without lowering accuracy**? The console has `run_eval`, `summarize`, `make_client`,
+      `SYSTEM`, `RULES`, `CONCISE`, `SMALL` and `base` (the baseline summary), so you can try each one.
+    pre_code: |
+      from kits.llmops_production import run_eval, summarize, make_client, SYSTEM, RULES, CONCISE, SMALL
+      base = summarize(run_eval(make_client()))
+      print(base)
+      # try e.g.: summarize(run_eval(make_client(), system=SYSTEM + "\n" + CONCISE))
+      #           summarize(run_eval(make_client(), model=SMALL))
+      #           summarize(run_eval(make_client(), cache=True))
+      #           summarize(run_eval(make_client(), system=RULES))
+    options:
+      - text: Ask for brief answers (`CONCISE` in the system prompt).
+        feedback: Accuracy stays at 100% and answers get about 5× faster, but the cost drops only about 18%, because output was only a fifth of the bill. A great latency fix, a weak cost fix.
+      - text: Switch every question to the small model (`SMALL`).
+        feedback: The cost drops about 67%, but accuracy falls to about 73%. The small model gets the hard, multi-part questions wrong. Routing (next lessons) keeps most of the saving without that loss.
+      - text: Cache the system prompt (`cache=True`).
+        correct: true
+        feedback: Right. About 70% cheaper at the same 100% accuracy. The handbook is identical on every call, so after the first write each call reads it from the cache at a tenth of the input price. The answers are exactly the same.
+      - text: Drop the handbook and send only the rules (`system=RULES`).
+        feedback: Almost free, and almost always wrong. With no documents ORBIT makes answers up and accuracy collapses to zero. Trimming context needs retrieval that finds the right documents, and then you must measure recall.
+    hint: Look at which bucket of the bill each change shrinks, and run the eval in the console to see what happens to accuracy.

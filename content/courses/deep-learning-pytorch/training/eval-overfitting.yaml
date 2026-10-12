@@ -1,0 +1,347 @@
+title: Evaluation and overfitting
+description: Evaluate correctly with eval mode and no_grad, recognise overfitting, and choose between dropout, weight decay and early stopping.
+exercises:
+  - id: intro
+    type: video
+    title: Measuring generalisation, and fighting overfitting
+    slides: |
+      # Three splits, three jobs
+
+      | split | used for | touched |
+      | --- | --- | --- |
+      | train | computing gradients | every step |
+      | validation | choosing: hyperparameters, architecture, when to stop | every epoch |
+      | test | reporting the final number | **once**, at the end |
+
+      Anything you make decisions with leaks into your choices. If you pick the epoch with the best
+      validation accuracy, that accuracy is optimistic, so the number you report comes from a set
+      you never looked at.
+
+      ---
+
+      ## Evaluation mode: two switches, both needed
+
+      ```python
+      def evaluate(model, X, y):
+          model.eval()                        # layers behave for inference
+          with torch.no_grad():               # no graph: less memory, faster
+              logits = model(X)
+              loss = F.cross_entropy(logits, y).item()
+              acc = (logits.argmax(dim=1) == y).float().mean().item()
+          model.train()                       # back to training behaviour
+          return loss, acc
+      ```
+
+      | switch | changes | forget it and |
+      | --- | --- | --- |
+      | `model.eval()` | Dropout off; BatchNorm uses its running statistics | metrics are noisy and too pessimistic, predictions change between calls |
+      | `torch.no_grad()` | autograd stops recording | memory grows with every evaluation batch; slower |
+
+      They are independent: `eval()` does not turn off gradients, and `no_grad()` does not turn off dropout.
+
+      ---
+
+      ## Underneath: three regularisers
+
+      **Dropout(p)** zeroes each activation with probability $p$ during training and multiplies the
+      survivors by $\frac{1}{1-p}$, so the expected value is unchanged ("inverted dropout"). At eval
+      time it does nothing. No unit can rely on any single other unit.
+
+      **Weight decay** $\lambda$ shrinks every weight a little each step: $w \leftarrow w - \text{lr}\,(g + \lambda w)$.
+      Large weights (sharp, memorising functions) cost something. In AdamW the shrink is applied
+      separately from the adaptive step.
+
+      **Early stopping** evaluates every epoch, keeps a copy of the best weights
+      (`copy.deepcopy(model.state_dict())`), and restores them at the end.
+
+      ---
+
+      ## Playbook: overfitting
+
+      **Symptom:** training loss keeps falling while validation loss bottoms out and rises;
+      train accuracy far above validation accuracy.
+
+      **Measure:** log train and validation loss and accuracy every epoch; the **gap** is the metric.
+
+      | fix | cost | risk | try it when |
+      | --- | --- | --- | --- |
+      | more data | collecting and labelling | none | you can get it: the best fix there is |
+      | data augmentation | some compute per batch | unrealistic augmentations | images, audio, text with safe transforms |
+      | early stopping | free, needs a validation set | stopping on a noisy blip | always; it is the cheapest |
+      | weight decay | one hyperparameter | too much underfits | almost always, 1e-4 to 1e-1 |
+      | dropout | slower convergence | too much underfits | wide layers, small data |
+      | smaller model | less capacity | underfitting | the model is far bigger than the data needs |
+
+      **Verify:** the validation metric improves, then report the test metric once.
+
+      ---
+
+      ## Overfitting or underfitting?
+
+      | train | validation | diagnosis | move |
+      | --- | --- | --- | --- |
+      | high error | high error, similar | underfitting | bigger model, train longer, **less** regularisation |
+      | low error | much higher error | overfitting | regularise, more data |
+      | low error | low error | good | stop tuning; check the test set |
+
+      Regularisation pushes you from the second row towards the first. Too much and you land in
+      underfitting: always watch both numbers.
+
+  - id: eval-mode
+    type: coding
+    title: What eval() and no_grad() change
+    context: |
+      `model` is a small classifier with a `Dropout(0.5)` layer, and `X`, `y` are 64 examples with
+      3 classes. See how dropout behaves in each mode, then write a correct `evaluate` function.
+    instructions:
+      - "In training mode (`model.train()`), store whether two calls `model(X)` give different outputs in `train_differs` (use `not torch.equal(a, b)`)."
+      - "After `model.eval()`, store whether two calls give identical outputs in `eval_same`."
+      - "Store the largest value of `nn.Dropout(0.5)` applied (in training mode) to `torch.ones(1000)` in `survivor_value`."
+      - "Write `evaluate(model, X, y)` that returns `(loss, accuracy)` as floats, in eval mode and without building a graph, and switches the model back to training mode before returning."
+    hint: |
+      Survivors are scaled by `1 / (1 - p)`. In `evaluate`: `model.eval()`, then `with torch.no_grad():` for the forward pass, then `model.train()` before `return`.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.randn(64, 10)
+      y = torch.randint(0, 3, (64,))
+      model = nn.Sequential(nn.Linear(10, 32), nn.ReLU(), nn.Dropout(0.5), nn.Linear(32, 3))
+    sample_code: |
+      model.train()
+      train_differs = ____
+
+      model.eval()
+      eval_same = ____
+
+      survivor_value = nn.Dropout(0.5)(torch.ones(1000)).max().item()
+
+      def evaluate(model, X, y):
+          ____
+          return loss, acc
+
+      model.train()
+      print(train_differs, eval_same, survivor_value)
+      print(evaluate(model, X, y))
+    solution: |
+      model.train()
+      train_differs = not torch.equal(model(X), model(X))
+
+      model.eval()
+      eval_same = torch.equal(model(X), model(X))
+
+      survivor_value = nn.Dropout(0.5)(torch.ones(1000)).max().item()
+
+      def evaluate(model, X, y):
+          model.eval()
+          with torch.no_grad():
+              logits = model(X)
+              loss = F.cross_entropy(logits, y).item()
+              acc = (logits.argmax(dim=1) == y).float().mean().item()
+          model.train()
+          return loss, acc
+
+      model.train()
+      print(train_differs, eval_same, survivor_value)
+      print(evaluate(model, X, y))
+    tests: |
+      import torch, torch.nn as nn, torch.nn.functional as F
+      assert user.get("train_differs") is True, "`train_differs` should be True: in training mode dropout zeroes different units on every call."
+      assert user.get("eval_same") is True, "`eval_same` should be True: in eval mode dropout is switched off."
+      check_equal("survivor_value", 2.0, msg="`survivor_value` should be 2.0: surviving activations are scaled by 1 / (1 - 0.5).")
+      check_object("evaluate")
+      m = user["model"]
+      m.train()
+      loss, acc = user["evaluate"](m, sol["X"], sol["y"])
+      m.eval()
+      with torch.no_grad():
+          logits = m(sol["X"])
+      want_loss = F.cross_entropy(logits, sol["y"]).item()
+      want_acc = (logits.argmax(1) == sol["y"]).float().mean().item()
+      assert isinstance(loss, float) and isinstance(acc, float), "`evaluate` should return two Python floats (use `.item()`)."
+      assert abs(loss - want_loss) < 1e-5, "The loss from `evaluate` changes from call to call or is wrong. Call `model.eval()` before the forward pass."
+      assert abs(acc - want_acc) < 1e-6, "The accuracy from `evaluate` is wrong. Compare `logits.argmax(dim=1)` with `y`."
+      m.train()
+      user["evaluate"](m, sol["X"], sol["y"])
+      assert m.training, "`evaluate` should put the model back in training mode (`model.train()`) before it returns, or the next training epoch runs without dropout."
+    success_msg: Dropout is random in training and off in eval; survivors are doubled so the average is unchanged. Your `evaluate` is ready for the boss.
+
+  - id: why-val-rising
+    type: mc
+    title: Why is validation loss rising?
+    question: |
+      Over 200 epochs, training loss falls steadily from 0.69 to 0.01. Validation loss falls to
+      0.45 by epoch 20, then climbs to 1.30 by epoch 200. Validation accuracy peaks at epoch 20
+      and slowly declines. What is going on, and what do you do first?
+    options:
+      - text: The learning rate is too high; lower it
+        feedback: "A too-high lr would make the **training** loss noisy or diverge. Here training loss falls smoothly to almost zero."
+      - text: The model is overfitting; keep the epoch-20 weights (early stopping) and add regularisation
+        correct: true
+        feedback: "Right. Training loss near zero with validation loss rising is the textbook overfitting curve. Early stopping is free and recovers the epoch-20 model; weight decay or dropout can then lower the curve's minimum."
+      - text: The model is underfitting; make it bigger
+        feedback: "An underfitting model has a **high** training loss. A training loss of 0.01 means the model has more than enough capacity; a bigger one would overfit faster."
+      - text: There is a bug in the evaluation code
+        feedback: "Possible in general (forgetting `model.eval()` adds noise), but the validation loss improving and then steadily worsening is the classic shape of overfitting, not of a bug."
+    hint: Compare where the training loss ends with where the validation loss ends.
+
+  - id: rescue-overfit
+    type: sequential
+    title: "Chapter boss: rescue an overfitting classifier"
+    timeout: 60
+    context: |
+      Only 80 labelled training examples, 10 features (2 informative, 8 pure noise), 2 classes.
+      `make_model(p)` builds a 128-unit, two-hidden-layer MLP with dropout probability `p`
+      (default 0). You get `X_train`, `y_train` (80), `X_val`, `y_val` (500) and
+      `X_test`, `y_test` (500). Measure the overfitting, fix it using only the validation set,
+      then report the test accuracy once.
+    pre_code: |
+      import copy
+      import numpy as np
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      from sklearn.datasets import make_moons
+      Xnp, ynp = make_moons(n_samples=1080, noise=0.3, random_state=1)
+      rng = np.random.default_rng(1)
+      Xnp = np.hstack([Xnp, rng.normal(size=(1080, 8))]).astype(np.float32)
+      X, y = torch.tensor(Xnp), torch.tensor(ynp)
+      X_train, y_train = X[:80], y[:80]
+      X_val, y_val = X[80:580], y[80:580]
+      X_test, y_test = X[580:], y[580:]
+
+      def make_model(p=0.0):
+          return nn.Sequential(
+              nn.Linear(10, 128), nn.ReLU(), nn.Dropout(p),
+              nn.Linear(128, 128), nn.ReLU(), nn.Dropout(p),
+              nn.Linear(128, 2),
+          )
+    steps:
+      - instructions:
+          - "Write `evaluate(model, X, y)` returning `(loss, accuracy)` as floats, using `model.eval()` and `torch.no_grad()`, and switching back to `model.train()` before returning."
+        hint: You wrote this in the first exercise of this lesson.
+        sample_code: |
+          def evaluate(model, X, y):
+              ____
+              return loss, acc
+        solution: |
+          def evaluate(model, X, y):
+              model.eval()
+              with torch.no_grad():
+                  logits = model(X)
+                  loss = F.cross_entropy(logits, y).item()
+                  acc = (logits.argmax(dim=1) == y).float().mean().item()
+              model.train()
+              return loss, acc
+        tests: |
+          import torch
+          check_object("evaluate")
+          torch.manual_seed(0)
+          m = sol["make_model"](0.5)
+          a = user["evaluate"](m, sol["X_val"], sol["y_val"])
+          b = sol["evaluate"](m, sol["X_val"], sol["y_val"])
+          assert abs(a[0] - b[0]) < 1e-5 and abs(a[1] - b[1]) < 1e-6, "`evaluate` should return `(loss, accuracy)` computed in eval mode, so dropout does not change the result."
+          assert m.training, "`evaluate` should call `model.train()` before returning."
+      - instructions:
+          - "Measure the baseline: run `torch.manual_seed(42)`, build `base = make_model()`, and train it full-batch for 500 epochs with `torch.optim.Adam(base.parameters(), lr=0.01)`."
+          - "Store `evaluate`'s accuracy on the training set in `train_acc` and on the validation set in `val_acc`, and their difference in `gap`. Print all three."
+        hint: "The loop body is the five steps with `F.cross_entropy(base(X_train), y_train)`. Then `train_acc = evaluate(base, X_train, y_train)[1]`."
+        sample_code: |
+          torch.manual_seed(42)
+          base = make_model()
+          opt = torch.optim.Adam(base.parameters(), lr=0.01)
+          for epoch in range(500):
+              ____
+
+          train_acc = ____
+          val_acc = ____
+          gap = train_acc - val_acc
+          print(train_acc, val_acc, gap)
+        solution: |
+          torch.manual_seed(42)
+          base = make_model()
+          opt = torch.optim.Adam(base.parameters(), lr=0.01)
+          for epoch in range(500):
+              opt.zero_grad()
+              F.cross_entropy(base(X_train), y_train).backward()
+              opt.step()
+
+          train_acc = evaluate(base, X_train, y_train)[1]
+          val_acc = evaluate(base, X_val, y_val)[1]
+          gap = train_acc - val_acc
+          print(train_acc, val_acc, gap)
+        tests: |
+          check_object("gap")
+          assert user["train_acc"] > 0.98, f"`train_acc` is {user['train_acc']:.3f}; the unregularised model should memorise the 80 training points (close to 1.0). Train for all 500 epochs."
+          assert user["gap"] > 0.15, f"`gap` is {user['gap']:.3f}; the baseline should overfit badly (a gap above 0.15). Use `make_model()` with no dropout and plain Adam."
+          check_equal("val_acc", tol=0.02, msg="`val_acc` should be the baseline's accuracy on `X_val`, `y_val` (around 0.73).")
+      - instructions:
+          - "Fix: train a new model `reg` with any mix of dropout (`make_model(p)`), weight decay (`weight_decay=` in the optimiser) and early stopping (keep the weights with the best validation accuracy)."
+          - "Choose using the **validation** set only. `reg` must reach at least `0.78` validation accuracy. Store it in `reg_val_acc` and print it."
+        hint: |
+          A combination that works: `make_model(0.5)`, `Adam(..., lr=0.01, weight_decay=0.1)`, and inside
+          the loop `acc = evaluate(reg, X_val, y_val)[1]`; when it beats the best so far, save
+          `best_state = copy.deepcopy(reg.state_dict())`. After the loop, `reg.load_state_dict(best_state)`.
+          Too much weight decay (0.3 or more here) underfits.
+        sample_code: |
+          torch.manual_seed(42)
+          reg = make_model(____)
+          opt = torch.optim.Adam(reg.parameters(), lr=0.01, weight_decay=____)
+          best_acc, best_state = -1.0, None
+          for epoch in range(500):
+              opt.zero_grad()
+              F.cross_entropy(reg(X_train), y_train).backward()
+              opt.step()
+              acc = evaluate(reg, X_val, y_val)[1]
+              if acc > best_acc:
+                  best_acc, best_state = ____, ____
+          reg.load_state_dict(best_state)
+
+          reg_val_acc = evaluate(reg, X_val, y_val)[1]
+          print(reg_val_acc)
+        solution: |
+          torch.manual_seed(42)
+          reg = make_model(0.5)
+          opt = torch.optim.Adam(reg.parameters(), lr=0.01, weight_decay=0.1)
+          best_acc, best_state = -1.0, None
+          for epoch in range(500):
+              opt.zero_grad()
+              F.cross_entropy(reg(X_train), y_train).backward()
+              opt.step()
+              acc = evaluate(reg, X_val, y_val)[1]
+              if acc > best_acc:
+                  best_acc, best_state = acc, copy.deepcopy(reg.state_dict())
+          reg.load_state_dict(best_state)
+
+          reg_val_acc = evaluate(reg, X_val, y_val)[1]
+          print(reg_val_acc)
+        tests: |
+          import torch, torch.nn.functional as F
+          check_object("reg")
+          m = user["reg"]
+          m.eval()
+          with torch.no_grad():
+              acc = (m(sol["X_val"]).argmax(1) == sol["y_val"]).float().mean().item()
+          m.train()
+          assert acc >= 0.78, f"`reg` reaches {acc:.3f} validation accuracy; it needs 0.78. Combine early stopping with dropout or weight decay (around 0.1). Very large weight decay underfits."
+          check_equal("reg_val_acc", acc, tol=1e-4, msg="`reg_val_acc` should be `evaluate(reg, X_val, y_val)[1]`.")
+      - instructions:
+          - "Verify, once: store the test accuracy of `base` in `base_test_acc` and of `reg` in `reg_test_acc`. Print both."
+        hint: "`evaluate(base, X_test, y_test)[1]`."
+        sample_code: |
+          base_test_acc = ____
+          reg_test_acc = ____
+          print(base_test_acc, reg_test_acc)
+        solution: |
+          base_test_acc = evaluate(base, X_test, y_test)[1]
+          reg_test_acc = evaluate(reg, X_test, y_test)[1]
+          print(base_test_acc, reg_test_acc)
+        tests: |
+          check_equal("base_test_acc", tol=1e-4, msg="`base_test_acc` should be `evaluate(base, X_test, y_test)[1]`.")
+          check_equal("reg_test_acc", tol=1e-4, msg="`reg_test_acc` should be `evaluate(reg, X_test, y_test)[1]`.")
+          assert user["reg_test_acc"] > user["base_test_acc"] + 0.03, "The regularised model should beat the baseline on the test set by a clear margin."
+    success_msg: |
+      The gap shrank and the gain held up on data you never tuned on. Notice that `reg_test_acc` is a
+      little lower than `reg_val_acc`: picking the best epoch on validation makes validation
+      optimistic, which is exactly why the test set exists.

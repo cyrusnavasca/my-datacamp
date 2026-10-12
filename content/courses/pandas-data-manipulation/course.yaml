@@ -1,0 +1,29 @@
+title: Data Manipulation with pandas
+description: Load, inspect, filter, transform, aggregate and join tabular data with pandas DataFrames.
+level: beginner
+est_hours: 4
+prerequisites:
+- python-for-data-science
+objectives:
+- Inspect and clean a DataFrame
+- Filter rows and select columns
+- Group, aggregate and pivot
+- Join tables and reshape data
+requires: []
+chapters:
+- id: dataframes
+  title: DataFrames
+  description: Create and inspect DataFrames, sort and subset them.
+  lessons: []
+- id: aggregating
+  title: Aggregating data
+  description: Summary statistics, groupby and pivot tables.
+  lessons: []
+- id: cleaning
+  title: Cleaning data
+  description: Missing values, types, duplicates and string columns.
+  lessons: []
+- id: joining-reshaping
+  title: Joining and reshaping
+  description: Merges, concatenation, melt and pivot.
+  lessons: []

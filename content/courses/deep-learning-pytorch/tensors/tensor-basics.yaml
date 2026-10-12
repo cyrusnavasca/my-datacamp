@@ -1,0 +1,219 @@
+title: Tensors, shapes and dtypes
+description: Create tensors, reshape batches, and choose a dtype by its memory, precision and range.
+exercises:
+  - id: intro
+    type: video
+    title: What a tensor really is
+    slides: |
+      # A tensor is an array with three extra facts
+
+      A PyTorch tensor is an n-dimensional array, like a NumPy array, that also knows:
+
+      | attribute | example | why it matters |
+      | --- | --- | --- |
+      | `shape` | `torch.Size([32, 1, 8, 8])` | every layer expects a particular shape |
+      | `dtype` | `torch.float32` | memory, speed, precision and range |
+      | `device` | `cpu`, `cuda:0`, `mps` | where the numbers live and where the maths runs |
+
+      ```python
+      import torch
+      x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+      z = torch.zeros(32, 64)          # 32 rows, 64 columns
+      r = torch.randn(32, 1, 8, 8)     # 32 one-channel 8x8 images
+      print(r.shape, r.dtype, r.device)
+      ```
+
+      Deep learning code is mostly **keeping track of shapes**. The convention is batch first:
+      `(batch, features)` for tables, `(batch, channels, height, width)` for images.
+
+      ---
+
+      ## Changing shape without changing data
+
+      | method | what it does | copies data? |
+      | --- | --- | --- |
+      | `x.reshape(32, 1, 8, 8)` | same numbers, new shape (use `-1` for "work it out") | only if it has to |
+      | `x.view(32, 1, 8, 8)` | same, but **never** copies; errors if it cannot | never |
+      | `x.permute(0, 2, 3, 1)` | reorder dimensions, e.g. channels-first to channels-last | never |
+      | `x.unsqueeze(1)` / `x.squeeze(1)` | add / remove a size-1 dimension | never |
+      | `x.mean(dim=1)` | reduce **away** dimension 1 | new tensor |
+
+      The number of elements must stay the same: a `(32, 64)` tensor has 2,048 numbers, and
+      `(32, 1, 8, 8)` also has 2,048. Reducing over `dim=1` removes that dimension from the shape.
+
+      ---
+
+      ## Underneath: storage and strides
+
+      A tensor is a flat block of memory (the **storage**) plus **strides**: how many elements to
+      skip to move one step along each dimension.
+
+      ```python
+      x = torch.arange(6).reshape(2, 3)
+      x.stride()                 # (3, 1): next row = skip 3, next column = skip 1
+      t = x.permute(1, 0)        # shape (3, 2), strides (1, 3): same memory, read differently
+      t.is_contiguous()          # False
+      t.view(6)                  # RuntimeError: view size is not compatible ...
+      t.reshape(6)               # works: reshape copies when the strides do not allow a view
+      ```
+
+      That is why `permute` and `view` are free (they only rewrite the strides) and why
+      `view` sometimes refuses. `reshape` (or `.contiguous().view(...)`) pays for a copy.
+
+      ---
+
+      ## Trade-off: which dtype?
+
+      | dtype | bytes | precision | largest value | use it for |
+      | --- | --- | --- | --- | --- |
+      | `float64` | 8 | ~16 digits | ~1.8e308 | gradient checks, scientific code; slow on GPUs |
+      | `float32` | 4 | ~7 digits | ~3.4e38 | the default; safe for training |
+      | `float16` | 2 | ~3 digits | **65,504** | inference, or training with loss scaling; overflows easily |
+      | `bfloat16` | 2 | ~2-3 digits | ~3.4e38 | training big models on modern GPUs: float32's range at half the memory |
+      | `int64` | 8 | exact | ~9.2e18 | class labels and indices (`F.cross_entropy` wants these) |
+
+      Halving the bytes halves memory and roughly doubles throughput on hardware that supports it.
+      The cost is precision (`float16` and `bfloat16` cannot store 2049 exactly) or range
+      (`float16` turns 100,000 into `inf`). Measure before you trust a half-precision run.
+
+      ---
+
+      ## Devices, and the playbook for tensor errors
+
+      ```python
+      device = "cuda" if torch.cuda.is_available() else "cpu"
+      x = x.to(device)     # copies to the GPU; every operand of an op must be on the same device
+      ```
+
+      Moving data to a GPU costs time; for tiny tensors (like in this course) the CPU is faster.
+
+      **When a tensor op fails, print `x.shape, x.dtype, x.device` for every input first.** Then:
+
+      | error says | usual cause | fix |
+      | --- | --- | --- |
+      | `expected scalar type Float but found Double` | data came from NumPy as float64 | `.float()` or `torch.tensor(a, dtype=torch.float32)` |
+      | `Expected all tensors to be on the same device` | model on GPU, data on CPU | `.to(device)` both |
+      | `shape '[...]' is invalid for input of size N` | element counts differ | recount; use `-1` for one dimension |
+      | `view size is not compatible ...` | non-contiguous after `permute`/`transpose` | `reshape` or `.contiguous()` |
+
+  - id: reshape-batch
+    type: coding
+    title: Reshape a batch of images
+    context: |
+      `flat` holds 32 greyscale images of 8x8 pixels, each flattened into one row of 64 values, so
+      its shape is `(32, 64)`. Convolution layers want `(batch, channels, height, width)`, while
+      plotting libraries want channels last.
+    instructions:
+      - Reshape `flat` into `images` with shape `(32, 1, 8, 8)`.
+      - Store each image's mean pixel value in `brightness`, a tensor of shape `(32,)`.
+      - Make `channels_last` with shape `(32, 8, 8, 1)` by reordering the dimensions of `images`.
+      - Print the shapes of all three.
+    hint: |
+      `flat.reshape(32, 1, 8, 8)` (or `-1` for the batch size). For the means, reduce over every
+      dimension except the batch: `images.mean(dim=(1, 2, 3))`. `images.permute(0, 2, 3, 1)` moves
+      channels to the end.
+    pre_code: |
+      import torch
+      torch.manual_seed(0)
+      flat = torch.rand(32, 64)
+    sample_code: |
+      images = ____
+      brightness = ____
+      channels_last = ____
+
+      print(images.shape, brightness.shape, channels_last.shape)
+    solution: |
+      images = flat.reshape(-1, 1, 8, 8)
+      brightness = images.mean(dim=(1, 2, 3))
+      channels_last = images.permute(0, 2, 3, 1)
+
+      print(images.shape, brightness.shape, channels_last.shape)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "images")
+      check_tensor(user, sol, "brightness", msg="`brightness` should hold one mean per image: average over dimensions 1, 2 and 3 (shape `(32,)`).")
+      check_tensor(user, sol, "channels_last", msg="`channels_last` should be `images` with the channel dimension moved to the end, shape `(32, 8, 8, 1)`. Use `permute`.")
+    success_msg: Right. `permute` cost nothing; it only rewrote the strides.
+
+  - id: predict-shape
+    type: mc
+    title: Predict the shape
+    question: |
+      `x = torch.zeros(4, 3, 5)`. What is the shape of `x.sum(dim=1).unsqueeze(-1)`?
+    context: Work it out first, then check it in the console.
+    pre_code: |
+      import torch
+      x = torch.zeros(4, 3, 5)
+    options:
+      - text: "`(4, 5, 1)`"
+        correct: true
+        feedback: "Yes. Summing over `dim=1` removes the 3, giving `(4, 5)`; `unsqueeze(-1)` adds a size-1 dimension at the end."
+      - text: "`(4, 1, 5)`"
+        feedback: "That is what `x.sum(dim=1, keepdim=True)` gives. Here the summed dimension is dropped, and `unsqueeze(-1)` adds the new one at the **end**."
+      - text: "`(4, 3, 5, 1)`"
+        feedback: "A reduction removes the dimension it reduces over. `sum(dim=1)` gets rid of the 3."
+      - text: "`(3, 5, 1)`"
+        feedback: "`dim=1` is the second dimension (size 3), not the first. Dimensions count from 0."
+    hint: A reduction over a dimension removes it from the shape; `unsqueeze(-1)` appends a 1.
+
+  - id: dtype-tradeoffs
+    type: coding
+    title: Measure what a dtype costs
+    context: |
+      Before switching a model to half precision, measure what you gain and what you lose.
+      `dtypes` maps a name to a torch dtype: `float64`, `float32`, `float16` and `bfloat16`.
+    instructions:
+      - "Build a dict `report` that maps each name in `dtypes` to a tuple of three values:"
+      - "1) bytes per value (`t.element_size()`), 2) what `2049.0` becomes when stored in that dtype, 3) what `100000.0` becomes. Use `.item()` to turn the stored values back into Python floats."
+      - Print `report`.
+    hint: |
+      Inside a loop over `dtypes.items()`: `a = torch.tensor(2049.0, dtype=dt)`, then
+      `report[name] = (a.element_size(), a.item(), torch.tensor(100000.0, dtype=dt).item())`.
+    pre_code: |
+      import torch
+      dtypes = {"float64": torch.float64, "float32": torch.float32,
+                "float16": torch.float16, "bfloat16": torch.bfloat16}
+    sample_code: |
+      report = {}
+      for name, dt in dtypes.items():
+          a = torch.tensor(2049.0, dtype=dt)
+          b = ____
+          report[name] = (____, ____, ____)
+
+      print(report)
+    solution: |
+      report = {}
+      for name, dt in dtypes.items():
+          a = torch.tensor(2049.0, dtype=dt)
+          b = torch.tensor(100000.0, dtype=dt)
+          report[name] = (a.element_size(), a.item(), b.item())
+
+      print(report)
+    tests: |
+      check_object("report")
+      assert set(user["report"]) == set(sol["dtypes"]), "`report` needs one entry per name in `dtypes`."
+      for name in sol["dtypes"]:
+          assert user["report"][name][0] == sol["report"][name][0], f"Bytes per value for {name} is wrong. Use `element_size()`."
+      check_equal("report", msg="Store the values *after* converting to each dtype: `torch.tensor(2049.0, dtype=dt).item()`.")
+    success_msg: |
+      float16 rounds 2049 to 2048 and overflows 100,000 to inf. bfloat16 also rounds, but keeps the
+      range. That is why bfloat16 is the usual choice for training and float16 needs loss scaling.
+
+  - id: choose-dtype
+    type: mc
+    title: Pick a dtype under constraints
+    question: |
+      You are training a 300M-parameter model on a GPU that supports bfloat16. GPU memory is the
+      bottleneck. A teammate switched to `float16` to save memory and the loss became `inf`
+      after a few hundred steps. Which dtype should the model compute in?
+    options:
+      - text: "`float64`"
+        feedback: "Four times the memory of a 2-byte type and much slower on GPUs. More precision does not help here; memory is the constraint."
+      - text: "`float32`"
+        feedback: "Safe and a reasonable fallback, but it doubles memory compared with a 2-byte type, and memory is the bottleneck."
+      - text: "`float16`, it just needs more steps"
+        feedback: "The `inf` is the symptom of float16's tiny range (max 65,504). Training longer will not fix an overflow. It would need loss scaling."
+      - text: "`bfloat16`"
+        correct: true
+        feedback: "Right. It is 2 bytes like float16 but has float32's range, so values that overflowed in float16 fit. The lower precision is usually acceptable for training; keeping a float32 copy of the weights (mixed precision) covers the rest."
+    hint: You measured the range of each dtype in the previous exercise.

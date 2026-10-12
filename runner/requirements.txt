@@ -1,0 +1,6 @@
+# Core libraries for the Data Science / ML track. Installed by `npm run setup:python`.
+numpy
+pandas
+matplotlib
+scikit-learn
+scipy

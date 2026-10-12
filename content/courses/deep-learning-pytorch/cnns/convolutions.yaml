@@ -1,0 +1,199 @@
+title: Convolutions by hand
+description: What a convolution computes, how kernel size, stride and padding set the output shape, and why weight sharing beats dense layers on images.
+exercises:
+  - id: intro
+    type: video
+    title: Sliding a kernel over an image
+    slides: |
+      # Why not flatten the image into an MLP?
+
+      A 224 x 224 colour image has 150,528 numbers. A dense layer from that to 1,000 units needs
+      **150 million weights**, and it treats pixel (10, 10) and pixel (10, 11) as unrelated inputs.
+      Shift the cat one pixel to the right and every input changes.
+
+      Images have structure a dense layer ignores:
+      - **locality:** nearby pixels belong together (edges, strokes, textures);
+      - **translation:** a pattern means the same thing wherever it appears.
+
+      A convolution builds both in: a small set of weights (the **kernel**) looks at one small
+      patch at a time, and the **same** kernel is reused at every position.
+
+      ---
+
+      ## A convolution, by hand
+
+      Slide a $k \times k$ kernel over the image. At each position, multiply element-wise and sum:
+
+      $$\text{out}[i, j] = \sum_{a=0}^{k-1} \sum_{b=0}^{k-1} \text{img}[i + a,\, j + b] \cdot K[a, b]$$
+
+      ```python
+      K = torch.tensor([[1., 0., -1.],
+                        [1., 0., -1.],
+                        [1., 0., -1.]])          # responds to vertical edges
+      out = torch.zeros(H - 2, W - 2)
+      for i in range(H - 2):
+          for j in range(W - 2):
+              out[i, j] = (img[i:i+3, j:j+3] * K).sum()
+      ```
+
+      `F.conv2d` does exactly this (strictly, a cross-correlation: the kernel is not flipped),
+      vectorised, for every channel and every image in the batch. In a CNN the kernel values are
+      **learned**.
+
+      ---
+
+      ## Output size: kernel, stride, padding
+
+      $$\text{out} = \left\lfloor \frac{n + 2p - k}{s} \right\rfloor + 1$$
+
+      | input $n$ | kernel $k$ | stride $s$ | padding $p$ | output |
+      | --- | --- | --- | --- | --- |
+      | 8 | 3 | 1 | 0 | 6 |
+      | 8 | 3 | 1 | 1 | 8 ("same": $p = (k-1)/2$) |
+      | 32 | 5 | 2 | 2 | 16 |
+      | 28 | 3 | 2 | 0 | 13 (the floor drops a column) |
+
+      Padding adds a border of zeros so edge pixels get used as often as central ones. Stride
+      skips positions, which downsamples.
+
+      ---
+
+      ## Channels, and what weight sharing saves
+
+      `nn.Conv2d(in_channels, out_channels, kernel_size)` has weight shape
+      `(out_channels, in_channels, k, k)`: each output channel has its own kernel **per input
+      channel**, and sums over all of them.
+
+      $$\text{params} = \text{out} \cdot \text{in} \cdot k^2 + \text{out}$$
+
+      | layer on a 3 x 32 x 32 image | output | parameters |
+      | --- | --- | --- |
+      | `Conv2d(3, 16, 3)` | 16 x 30 x 30 | 448 |
+      | dense layer producing the same 14,400 outputs | 14,400 | 44,251,200 |
+
+      ---
+
+      ## Trade-off: conv or dense? big or small kernels?
+
+      | choice | parameters | strengths | weaknesses | wins when |
+      | --- | --- | --- | --- | --- |
+      | dense layer | in x out | no assumptions | huge on images; position-specific | tabular data, after features are extracted |
+      | convolution | out x in x k² | local, shared, works at any position | assumes spatial structure | images, audio spectrograms, any grid |
+      | one 5x5 kernel | 25 per in/out pair | sees a 5x5 area at once | more weights | first layer of some classic nets |
+      | two stacked 3x3 kernels | 18 per in/out pair | same 5x5 view, extra non-linearity | one more layer to run | the modern default |
+
+  - id: conv-by-hand
+    type: coding
+    title: A convolution with two loops
+    context: |
+      `img` is a 6 x 6 greyscale image: dark on the left, bright on the right. `K` is a 3 x 3
+      vertical-edge kernel. Compute the convolution with two loops, then check it against
+      `F.conv2d`.
+    instructions:
+      - "Fill `out` (shape `(4, 4)`): for each position `(i, j)`, sum the element-wise product of the 3 x 3 patch `img[i:i+3, j:j+3]` and `K`."
+      - "Store `F.conv2d(img[None, None], K[None, None])[0, 0]` in `torch_out`: `conv2d` needs `(batch, channels, H, W)` input and `(out, in, k, k)` weights."
+      - "Store `torch.allclose(out, torch_out)` in `same`, and print `out`."
+    hint: "Inside the loops: `out[i, j] = (img[i:i+3, j:j+3] * K).sum()`."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      img = torch.tensor([[0., 0., 0., 9., 9., 9.]] * 6)
+      img[2, 1] = 3.0
+      K = torch.tensor([[1., 0., -1.],
+                        [1., 0., -1.],
+                        [1., 0., -1.]])
+    sample_code: |
+      out = torch.zeros(4, 4)
+      for i in range(4):
+          for j in range(4):
+              out[i, j] = ____
+
+      torch_out = ____
+      same = torch.allclose(out, torch_out)
+      print(out)
+      print(same)
+    solution: |
+      out = torch.zeros(4, 4)
+      for i in range(4):
+          for j in range(4):
+              out[i, j] = (img[i:i+3, j:j+3] * K).sum()
+
+      torch_out = F.conv2d(img[None, None], K[None, None])[0, 0]
+      same = torch.allclose(out, torch_out)
+      print(out)
+      print(same)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "out", msg="`out[i, j]` should be `(img[i:i+3, j:j+3] * K).sum()` for every `i, j` in `range(4)`.")
+      check_tensor(user, sol, "torch_out", msg="`torch_out` should be `F.conv2d(img[None, None], K[None, None])[0, 0]`, shape `(4, 4)`.")
+      assert user.get("same") is True, "`same` should be True once both are right."
+    success_msg: |
+      The big negative values sit exactly where dark meets bright: the kernel found the edge. The
+      small dent from the pixel at (2, 1) shows it reacts to any left-right change.
+
+  - id: conv-shape-calculator
+    type: coding
+    title: Predict shapes and parameter counts
+    context: |
+      When a network's shapes do not line up, the fastest fix is knowing the formulas. Write two
+      small calculators; the tests compare them with real `nn.Conv2d` layers in many settings.
+    instructions:
+      - "Write `conv_out(n, k, s=1, p=0)` returning the output size `(n + 2p - k) // s + 1`."
+      - "Write `conv_params(c_in, c_out, k)` returning the number of weights plus biases of `nn.Conv2d(c_in, c_out, k)`."
+      - "Print `conv_out(32, 5, 2, 2)` and `conv_params(3, 16, 3)`."
+    hint: "Integer division `//` does the floor. Parameters: `c_out * c_in * k * k + c_out`."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+    sample_code: |
+      def conv_out(n, k, s=1, p=0):
+          return ____
+
+      def conv_params(c_in, c_out, k):
+          return ____
+
+      print(conv_out(32, 5, 2, 2), conv_params(3, 16, 3))
+    solution: |
+      def conv_out(n, k, s=1, p=0):
+          return (n + 2 * p - k) // s + 1
+
+      def conv_params(c_in, c_out, k):
+          return c_out * c_in * k * k + c_out
+
+      print(conv_out(32, 5, 2, 2), conv_params(3, 16, 3))
+    tests: |
+      import torch, torch.nn as nn
+      check_object("conv_out")
+      check_object("conv_params")
+      for n, k, s, p in [(8, 3, 1, 0), (8, 3, 1, 1), (32, 5, 2, 2), (28, 3, 2, 0), (7, 2, 2, 0), (64, 7, 2, 3), (5, 5, 1, 0)]:
+          real = nn.Conv2d(1, 1, k, stride=s, padding=p)(torch.zeros(1, 1, n, n)).shape[-1]
+          got = user["conv_out"](n, k, s, p)
+          assert got == real, f"`conv_out({n}, {k}, {s}, {p})` returned {got}, but a real Conv2d gives {real}. Use floor division: `(n + 2*p - k) // s + 1`."
+      for ci, co, k in [(3, 16, 3), (1, 8, 5), (16, 32, 3), (64, 64, 1)]:
+          real = sum(t.numel() for t in nn.Conv2d(ci, co, k).parameters())
+          got = user["conv_params"](ci, co, k)
+          assert got == real, f"`conv_params({ci}, {co}, {k})` returned {got}, but the real layer has {real}. Count `c_out * c_in * k * k` weights plus `c_out` biases."
+    success_msg: These two formulas are most of what you need to debug a CNN's shapes.
+
+  - id: predict-conv-shape
+    type: mc
+    title: Predict the output shape
+    question: |
+      `x` has shape `(8, 3, 32, 32)`. What is the shape of `nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2)(x)`?
+    context: Work it out with the formula, then check in the console (`conv` and `x` are ready).
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      x = torch.zeros(8, 3, 32, 32)
+      conv = nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2)
+    options:
+      - text: "`(8, 16, 16, 16)`"
+        correct: true
+        feedback: "Right: $\\lfloor (32 + 4 - 5) / 2 \\rfloor + 1 = 16$. The batch stays 8, and the channels become `out_channels` = 16."
+      - text: "`(8, 16, 28, 28)`"
+        feedback: "That is a 5x5 kernel with stride 1 and no padding. Here padding 2 adds 4 and stride 2 halves the result."
+      - text: "`(8, 3, 16, 16)`"
+        feedback: "The spatial size is right, but a conv layer outputs `out_channels` (16) channels, not the input's 3."
+      - text: "`(8, 16, 15, 15)`"
+        feedback: "Close: $(32 + 4 - 5) / 2 = 15.5$, floor 15, but do not forget the `+ 1` in the formula."
+    hint: "$\\text{out} = \\lfloor (n + 2p - k) / s \\rfloor + 1$, and channels become `out_channels`."

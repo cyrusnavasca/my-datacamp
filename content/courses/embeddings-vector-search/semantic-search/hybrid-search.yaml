@@ -1,0 +1,306 @@
+title: "Relevant docs not found: hybrid search"
+description: A playbook for search that misses relevant documents. Measure per query type, read the misses, choose among the common fixes, fuse keyword and semantic rankings, and verify nothing regressed.
+exercises:
+  - id: hybrid-search-slides
+    type: video
+    title: When search can't find the right page
+    slides: |
+      # Symptom: "ORBIT can't find anything about P-2"
+
+      Search is fast and the results look plausible, but crew keep saying the right page isn't there.
+      Don't guess. Run the loop:
+
+      | step | here |
+      | --- | --- |
+      | **Measure** | hit@3 on labelled crew queries, **split by query type** |
+      | **Diagnose** | read the misses; check whether the query vector is empty; ask whether another retriever finds them |
+      | **Fix** | pick the fix that matches the cause, from the menu below |
+      | **Verify** | same queries, same metric: the failing type improves **and** no other type gets worse |
+
+      ---
+
+      ## Diagnose: why relevant docs go missing
+
+      Check these, roughly in this order:
+
+      1. **Is the doc in the index at all?** Ingestion failures and wrong metadata filters are common and easy to rule out.
+      2. **Is the query vector meaningful?** `np.linalg.norm(embed(q)) == 0` means the model saw no known tokens.
+      3. **Vocabulary the model never learned:** codes, ids, names, slang. Does keyword search find the doc?
+      4. **The answer is split across chunks**, or buried in a long noisy chunk (see *rag-systems*).
+      5. **k is too small:** the doc is at rank 4 or 5. Check `reciprocal_rank`, not just hit@3.
+
+      ---
+
+      ## Fix menu
+
+      | fix | helps with | cost and latency | catch |
+      | --- | --- | --- | --- |
+      | **hybrid**: keyword + semantic, fused | codes, names, rare terms | a second index; a few ms, run in parallel | fusion weight to tune |
+      | better embedding model | paraphrases, general language | re-embed the whole corpus; maybe more dims | still won't know your codes or slang |
+      | query rewriting (glossary or LLM) | jargon, abbreviations | glossary: ~0 ms; LLM: +1 call (100s of ms, money) | glossary upkeep; LLM drift |
+      | retrieve more, then rerank | right doc at rank 4-20 | a reranker pass over k candidates | doesn't help if the doc isn't retrieved at all |
+      | fix ingestion or filters | doc missing from the index | cheap | find it first |
+
+      Match the fix to the **bucket** that fails most. Hybrid is the standard answer for exact codes.
+
+      ---
+
+      ## Fusing two rankings
+
+      **Reciprocal rank fusion (RRF)** uses only ranks, so the two scores never have to be comparable:
+
+      $$\text{RRF}(d) = \sum_{\text{rankings}} \frac{1}{k + \text{rank}(d)}, \quad k = 60 \text{ by convention}$$
+
+      **Weighted score fusion** keeps each retriever's confidence, but the scores must be put on the same scale first:
+
+      ```python
+      def minmax(x):
+          lo, hi = x.min(), x.max()
+          return (x - lo) / (hi - lo) if hi > lo else np.zeros_like(x)
+      fused = alpha * minmax(semantic_scores) + (1 - alpha) * minmax(keyword_scores)
+      ```
+
+      | | RRF | weighted (alpha) |
+      | --- | --- | --- |
+      | tuning | none (k rarely matters on long lists) | alpha, tuned on labelled queries |
+      | uses confidence | no: a rank-1 lucky match counts as much as a rank-1 exact code hit | yes |
+      | when it wins | many retrievers, scores on unrelated scales | two retrievers, and you have labels to tune alpha |
+
+      ---
+
+      ## Verify without fooling yourself
+
+      - Re-run **every** query type, not just the one you fixed. A keyword-heavy alpha can fix codes and quietly break paraphrases.
+      - Compare against the **baseline numbers you saved**, not your memory of them.
+      - Tune alpha on one set of queries and confirm on another (chapter 4 makes this a habit).
+      - Watch latency too. Hybrid adds a keyword lookup (ms), which you can run in parallel with the embedding call.
+
+  - id: rrf-by-hand
+    type: coding
+    title: Reciprocal rank fusion by hand
+    context: |
+      `semantic` and `keyword` are two ranked lists of doc ids (best first) for the query *"Is P-2 running?"*.
+      Write RRF and fuse them.
+    instructions:
+      - "Write `rrf_scores(rankings, k=60)`: return a dict mapping each doc id to the sum of `1 / (k + rank)` over the rankings it appears in. Ranks start at 1."
+      - "Store `rrf_scores([semantic, keyword])` in `scores`, and the doc ids sorted by score, highest first, in `fused`."
+      - "Store the fused list with `k=1` in `fused_k1`. A small k makes the top ranks count much more."
+    hint: |
+      Loop `for ranking in rankings:` then `for rank, doc in enumerate(ranking, start=1):` and add
+      `1 / (k + rank)` to `scores.get(doc, 0)`. Sort with `sorted(scores, key=scores.get, reverse=True)`.
+    pre_code: |
+      semantic = ["airlock-procedure", "cargo-resupply", "hydroponics-schedule", "hydroponics-troubleshooting", "co2-scrubbers"]
+      keyword = ["hydroponics-troubleshooting", "incident-2025-hydro-flood", "airlock-procedure", "galley-and-meals"]
+    sample_code: |
+      def rrf_scores(rankings, k=60):
+          scores = {}
+          for ranking in rankings:
+              for rank, doc in enumerate(ranking, start=1):
+                  scores[doc] = ____
+          return scores
+
+      scores = rrf_scores([semantic, keyword])
+      fused = ____
+      s1 = rrf_scores([semantic, keyword], k=1)
+      fused_k1 = ____
+      print(fused[:3])
+      print(fused_k1[:3])
+    solution: |
+      def rrf_scores(rankings, k=60):
+          scores = {}
+          for ranking in rankings:
+              for rank, doc in enumerate(ranking, start=1):
+                  scores[doc] = scores.get(doc, 0) + 1 / (k + rank)
+          return scores
+
+      scores = rrf_scores([semantic, keyword])
+      fused = sorted(scores, key=scores.get, reverse=True)
+      s1 = rrf_scores([semantic, keyword], k=1)
+      fused_k1 = sorted(s1, key=s1.get, reverse=True)
+      print(fused[:3])
+      print(fused_k1[:3])
+    tests: |
+      f = check_object("rrf_scores")
+      A, B, C = ["a", "b", "c"], ["c", "d"], ["d", "a", "e", "b"]
+      got = f([A, B, C], k=10)
+      want = {"a": 1/11 + 1/12, "b": 1/12 + 1/14, "c": 1/13 + 1/11, "d": 1/11 + 1/12, "e": 1/13}
+      assert set(got) == set(want), f"`rrf_scores` should have one key per doc that appears in any ranking; got {sorted(got)}."
+      for d in want:
+          assert abs(got[d] - want[d]) < 1e-12, f"Score for {d!r} should be {want[d]:.5f}, got {got[d]:.5f}. Add 1 / (k + rank) with rank starting at 1."
+      sc = check_object("scores")
+      for d, v in sol["scores"].items():
+          assert abs(sc.get(d, -1) - v) < 1e-12, "`scores` should be `rrf_scores([semantic, keyword])`."
+      fz = list(check_object("fused"))
+      assert sorted(fz) == sorted(sol["fused"]) and all(sc[a] >= sc[b] - 1e-15 for a, b in zip(fz, fz[1:])), "`fused` should list every doc id, sorted by RRF score, highest first."
+      fk = list(check_object("fused_k1"))
+      s1 = sol["s1"]
+      assert sorted(fk) == sorted(sol["fused_k1"]) and all(s1[a] >= s1[b] - 1e-15 for a, b in zip(fk, fk[1:])), "`fused_k1` should be sorted by the scores from `rrf_scores([semantic, keyword], k=1)`."
+    success_msg: "Look at the top of `fused`: `airlock-procedure` (1st and 3rd) edges out the P-2 page (4th and 1st), with k=60 and even with k=1. RRF rewards agreement, and it can't tell that keyword search's rank 1 was an exact code match while semantic search's rank 1 was a weak, generic match. That is why the mission below uses weighted score fusion."
+
+  - id: which-fix-first
+    type: mc
+    title: Pick the fix
+    question: |
+      ORBIT's semantic search scores these hit@3 values on 60 labelled crew queries:
+
+      | query type | share of queries | hit@3 |
+      | --- | --- | --- |
+      | exact (part, panel and error codes) | 40% | 0.45 |
+      | paraphrase | 45% | 0.88 |
+      | jargon | 15% | 0.82 |
+
+      Most misses contain a code, and the query vectors for several of them are all zeros. The latency budget allows a few
+      extra milliseconds but not another LLM call. What do you try first?
+    options:
+      - text: Switch to a larger embedding model.
+        feedback: "A bigger model helps with general language, which already works (0.88). It still won't know your part codes, and you'd pay to re-embed the whole corpus. Fix the failing bucket, not the healthy one."
+      - text: Add keyword search and fuse it with the semantic ranking (hybrid).
+        correct: true
+        feedback: "Right. Exact codes are the failing bucket and the largest group of misses, and keyword search matches codes exactly. It costs a few milliseconds and runs alongside the embedding call. Then verify that paraphrase hit@3 doesn't drop."
+      - text: Rewrite every query with an LLM before searching.
+        feedback: "Rewriting helps with jargon, and it breaks the latency budget: an extra LLM call per query. It also can't make an all-zero vector useful, because the model still doesn't know the code."
+      - text: Retrieve 20 chunks instead of 3.
+        feedback: "That helps when the right doc sits at rank 4-20. A zero query vector ranks everything at 0, so the right doc is anywhere. More chunks mainly add noise and tokens."
+    hint: Which bucket fails, and which retriever handles that kind of query well?
+
+  - id: find-p2
+    type: sequential
+    title: "Mission: ORBIT can't find P-2"
+    context: |
+      ORBIT's search ranks the 171 handbook chunks with the general model (`V = embed_general(chunk_texts)`) and returns
+      deduplicated doc ids. `semantic_search(query, k=3)` is that current system. `queries` holds 24 labelled crew
+      queries (`kind` is `"exact"` or `"paraphrase"`). `kw` is a code-aware keyword index whose `kw.scores(query)` returns
+      one score per chunk. `hit_at_k`, `dedupe` and `minmax` are imported.
+    pre_code: |
+      import numpy as np
+      from kits.embeddings_vector_search import (handbook_chunks, embed_general, KeywordIndex,
+                                                 crew_queries, hit_at_k, dedupe, _minmax as minmax)
+      _chunks = handbook_chunks()
+      chunk_texts = [c["text"] for c in _chunks]
+      chunk_doc_ids = [c["doc_id"] for c in _chunks]
+      V = embed_general(chunk_texts)
+      kw = KeywordIndex(chunk_texts)
+      queries = crew_queries(["exact", "paraphrase"])
+
+      def semantic_search(query, k=3):
+          order = np.argsort(-(V @ embed_general(query)), kind="stable")
+          return dedupe(chunk_doc_ids[i] for i in order)[:k]
+    steps:
+      - instructions:
+          - "**Measure.** Write `per_kind(search)`: return a dict mapping each kind (`\"exact\"`, `\"paraphrase\"`) to the mean hit@3 of `search(q[\"query\"])` over that kind's queries."
+          - "Store `per_kind(semantic_search)` in `baseline` and print it."
+        hint: "`np.mean([hit_at_k(search(q['query']), q['doc_ids'], 3) for q in queries if q['kind'] == kind])` for each kind."
+        sample_code: |
+          def per_kind(search):
+              out = {}
+              for kind in ["exact", "paraphrase"]:
+                  out[kind] = ____
+              return out
+
+          baseline = per_kind(semantic_search)
+          print(baseline)
+        solution: |
+          def per_kind(search):
+              out = {}
+              for kind in ["exact", "paraphrase"]:
+                  out[kind] = float(np.mean([hit_at_k(search(q["query"]), q["doc_ids"], 3)
+                                             for q in queries if q["kind"] == kind]))
+              return out
+
+          baseline = per_kind(semantic_search)
+          print(baseline)
+        tests: |
+          b = check_object("baseline")
+          for kind in ["exact", "paraphrase"]:
+              assert abs(float(b[kind]) - sol["baseline"][kind]) < 1e-9, f"`baseline[{kind!r}]` should be {sol['baseline'][kind]:.3f}, got {float(b[kind]):.3f}. Average hit@3 over the queries of that kind only."
+      - instructions:
+          - "**Diagnose.** Store the queries that `semantic_search` misses (hit@3 is 0) as a list of dicts in `misses`."
+          - "For each **exact** miss, check whether keyword search alone finds a gold doc: rank chunks by `kw.scores(q[\"query\"])`, deduplicate to doc ids, and test hit@3. Store how many it rescues in `kw_rescues`."
+          - "Store the norm of `embed_general(\"P-2 is silent\")` in `p2_norm` and print all three."
+        hint: |
+          `misses = [q for q in queries if hit_at_k(semantic_search(q["query"]), q["doc_ids"], 3) == 0]`.
+          Keyword doc ranking: `dedupe(chunk_doc_ids[i] for i in np.argsort(-kw.scores(text), kind="stable"))`.
+        sample_code: |
+          misses = ____
+
+          def keyword_docs(query, k=3):
+              order = np.argsort(-kw.scores(query), kind="stable")
+              return dedupe(chunk_doc_ids[i] for i in order)[:k]
+
+          kw_rescues = ____
+          p2_norm = ____
+          for q in misses:
+              print(q["kind"], q["query"])
+          print(kw_rescues, p2_norm)
+        solution: |
+          misses = [q for q in queries if hit_at_k(semantic_search(q["query"]), q["doc_ids"], 3) == 0]
+
+          def keyword_docs(query, k=3):
+              order = np.argsort(-kw.scores(query), kind="stable")
+              return dedupe(chunk_doc_ids[i] for i in order)[:k]
+
+          kw_rescues = sum(hit_at_k(keyword_docs(q["query"]), q["doc_ids"], 3) == 1
+                           for q in misses if q["kind"] == "exact")
+          p2_norm = float(np.linalg.norm(embed_general("P-2 is silent")))
+          for q in misses:
+              print(q["kind"], q["query"])
+          print(kw_rescues, p2_norm)
+        tests: |
+          m = check_object("misses")
+          assert sorted(q["id"] for q in m) == sorted(q["id"] for q in sol["misses"]), f"`misses` should hold the {len(sol['misses'])} queries whose hit@3 under `semantic_search` is 0."
+          check_equal("kw_rescues", msg="`kw_rescues` should count the exact-kind misses for which `keyword_docs` puts a gold doc in its top 3.")
+          check_equal("p2_norm", 0.0, msg="`p2_norm` should be `np.linalg.norm(embed_general(\"P-2 is silent\"))`, which is 0.")
+      - instructions:
+          - "**Fix.** Every exact miss is rescued by keyword search, so fuse the two. Write `hybrid_search(query, k=3, alpha=0.5)`: score chunks with `alpha * minmax(semantic) + (1 - alpha) * minmax(keyword)`, rank them, deduplicate to doc ids and return the top `k`."
+          - "Semantic chunk scores are `V @ embed_general(query)`; keyword chunk scores are `kw.scores(query)`."
+        hint: |
+          `fused = alpha * minmax(V @ embed_general(query)) + (1 - alpha) * minmax(kw.scores(query))`, then
+          `order = np.argsort(-fused, kind="stable")` and `dedupe(chunk_doc_ids[i] for i in order)[:k]`.
+        sample_code: |
+          def hybrid_search(query, k=3, alpha=0.5):
+              sem = ____
+              key = ____
+              fused = ____
+              order = np.argsort(-fused, kind="stable")
+              return dedupe(chunk_doc_ids[i] for i in order)[:k]
+
+          print(hybrid_search("P-2 is silent"))
+        solution: |
+          def hybrid_search(query, k=3, alpha=0.5):
+              sem = V @ embed_general(query)
+              key = kw.scores(query)
+              fused = alpha * minmax(sem) + (1 - alpha) * minmax(key)
+              order = np.argsort(-fused, kind="stable")
+              return dedupe(chunk_doc_ids[i] for i in order)[:k]
+
+          print(hybrid_search("P-2 is silent"))
+        tests: |
+          f = check_object("hybrid_search")
+          r = list(f("P-2 is silent"))
+          assert len(r) == 3 and len(set(r)) == 3, "`hybrid_search(query)` should return 3 distinct doc ids by default."
+          assert "hydroponics-troubleshooting" in r, f"`hybrid_search('P-2 is silent')` should now find the hydroponics troubleshooting page; got {r}. Check the keyword half of the fusion."
+          for q in ["What does F-1 display?", "When is the evening meal?"]:
+              assert list(f(q, 3, 1.0)) == sol["semantic_search"](q, 3), "With alpha=1.0, `hybrid_search` should give the same docs as pure semantic search. Use `alpha * minmax(sem) + (1 - alpha) * minmax(key)`."
+      - instructions:
+          - "**Verify.** Store `per_kind(lambda q: hybrid_search(q, 3, alpha))` in `after` for an `alpha` of your choice (store it in `alpha`), and print `baseline` and `after`."
+          - "To pass, exact hit@3 must reach at least 0.9, and paraphrase hit@3 must not fall below the baseline. If paraphrases drop, your alpha leans too far towards keyword search."
+        hint: Try a few values of alpha, such as 0.3, 0.5 and 0.7, and keep one where both conditions hold.
+        sample_code: |
+          alpha = ____
+          after = per_kind(lambda q: hybrid_search(q, 3, alpha))
+          print("before", baseline)
+          print("after ", after)
+        solution: |
+          alpha = 0.5
+          after = per_kind(lambda q: hybrid_search(q, 3, alpha))
+          print("before", baseline)
+          print("after ", after)
+        tests: |
+          a = check_object("alpha")
+          aft = check_object("after")
+          base = sol["baseline"]
+          fresh = user["per_kind"](lambda q: user["hybrid_search"](q, 3, a))
+          assert all(abs(float(aft[k]) - fresh[k]) < 1e-9 for k in fresh), "`after` should be `per_kind(lambda q: hybrid_search(q, 3, alpha))` with your `alpha`."
+          assert fresh["exact"] >= 0.9, f"Exact hit@3 is {fresh['exact']:.2f}; it should be at least 0.9. Give keyword search more weight (lower alpha)."
+          assert fresh["paraphrase"] >= base["paraphrase"] - 1e-9, f"Paraphrase hit@3 fell from {base['paraphrase']:.2f} to {fresh['paraphrase']:.2f}. Your alpha leans too far towards keyword search; raise it."
+    success_msg: Exact-code queries went from 0.75 to above 0.9 hit@3 while paraphrases held steady. You can show the numbers that prove it, which is what a fix needs.

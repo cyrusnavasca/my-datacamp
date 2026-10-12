@@ -1,0 +1,210 @@
+title: The OWASP Top 10 for LLM apps
+description: Name the ways an LLM application fails, score them by likelihood and impact, and spend a small security budget where it removes the most risk.
+exercises:
+  - id: owasp-slides
+    type: video
+    title: What can go wrong with ORBIT
+    slides: |
+      # Why LLM apps need their own threat model
+
+      In a classic app, **code decides** and data is inert: a booking record can't change what the booking service does.
+      In an LLM app, a **model decides** what to say and which tool to call, and it decides by reading text. Much of that
+      text comes from people you don't control: crew requests, maintenance logs, emails from the ground, tool output.
+
+      Two consequences shape this whole course:
+
+      1. **You can't patch instruction-following out of the model.** It is the feature you are paying for.
+      2. **The damage is set by what the app lets the model touch.** A fooled chatbot says something wrong. A fooled agent that holds `open_airlock` vents a module.
+
+      ORBIT's assets, the things worth protecting:
+
+      | asset | example | if lost |
+      | --- | --- | --- |
+      | secrets | the airlock override code in the system prompt | anyone who reads a chat transcript can use it |
+      | private data | crew medical notes | privacy breach, loss of trust |
+      | actions | bookings, crew messages, the ground link, airlocks | wrong or irreversible changes to the station |
+      | budget | API spend | an overnight loop costs a month of tokens |
+
+      ---
+
+      ## The OWASP Top 10 for LLM Applications (2025)
+
+      | id | risk | what it looks like on Helios-7 |
+      | --- | --- | --- |
+      | LLM01 | Prompt injection | text in a maintenance log changes what ORBIT does |
+      | LLM02 | Sensitive information disclosure | medical notes end up in an answer, a log or the provider's hands |
+      | LLM03 | Supply chain | an unreviewed package, model or plugin update |
+      | LLM04 | Data and model poisoning | tampered fine-tuning data or handbook pages |
+      | LLM05 | Improper output handling | ORBIT's text is run as a query, a command or raw HTML |
+      | LLM06 | Excessive agency | ORBIT holds tools, permissions or autonomy it doesn't need |
+      | LLM07 | System prompt leakage | secrets placed in the system prompt come back out |
+      | LLM08 | Vector and embedding weaknesses | the vector store mixes data across users, or is poisoned |
+      | LLM09 | Misinformation | confident answers from stale or missing documents |
+      | LLM10 | Unbounded consumption | runaway loops or huge inputs burn budget and capacity |
+
+      The list names *failure modes*, not fixes. One incident often touches several (an injection, LLM01, becomes damaging
+      through excessive agency, LLM06). When you classify, ask **which control should have stopped it first**.
+
+      ---
+
+      ## Score the risks: likelihood × impact
+
+      A **risk register** turns a threat list into a plan. Score each threat 1-5 for likelihood and impact, multiply, then sort.
+
+      ```python
+      threats["risk"] = threats["likelihood"] * threats["impact"]
+      ranked = threats.sort_values(["risk", "effort_days"], ascending=[False, True])
+      ```
+
+      Impact follows ORBIT's tool ladder: answering questions (low) → booking modules (medium) → messaging the ground,
+      which can't be recalled (high) → opening an airlock (catastrophic). Likelihood rises with exposure: how much
+      untrusted text reaches the model, and how many people can write it.
+
+      Budgets are finite, so after ranking, fill the budget greedily: take the next most risky item that still fits.
+      The top item doesn't always fit, and a cheap fix for the #2 risk can beat an expensive one for #1.
+
+      ---
+
+      ## Three kinds of control, and what each costs
+
+      | control type | examples | strength | what it costs |
+      | --- | --- | --- | --- |
+      | **prevent** by design | remove a tool, keep secrets out of the prompt, privilege separation | holds no matter how the attack is worded | design time; sometimes a feature |
+      | **contain** | least-privilege tools, human approval, step caps | limits damage when the model is fooled | human time, latency, friction |
+      | **filter** | input or output classifiers, keyword rules | cheap to add | brittle against new wording; blocks legitimate requests |
+      | **detect** | canary strings, audit logs, monitoring | tells you it happened | doesn't stop the first incident |
+
+      Rule of thumb for ORBIT: spend first on controls whose guarantee **doesn't depend on recognising attack text**
+      (prevent, contain). Filters are a later layer, and you must measure what they over-block.
+
+      ---
+
+      ## Playbook: a 30-minute threat model
+
+      1. **Draw the data flows.** Every source of text that reaches the model, and every tool the model can call.
+      2. **Mark trust boundaries.** Who can write each source? (Next lesson.)
+      3. **Walk the Top 10** for each flow: which entries apply?
+      4. **Score** likelihood × impact and rank.
+      5. **Pick controls** that don't depend on wording first, within the budget.
+      6. **Measure** both safety and usability before and after (lesson 3). A threat model you don't test is a guess.
+
+  - id: classify-owasp-a
+    type: classify
+    title: "Name the risk: injection, disclosure or agency"
+    prompt: Sort each ORBIT incident into the OWASP category whose control should have stopped it first.
+    hint: |
+      Injection is about *who steered* the model. Disclosure is about *data reaching someone who shouldn't see it*.
+      Excessive agency is about the model *holding more power than the task needs*.
+    zones: [LLM01 Prompt injection, LLM02 Sensitive information disclosure, LLM06 Excessive agency]
+    items:
+      - { text: Text inside a retrieved maintenance log changed what ORBIT did for the crew member who asked a question, zone: LLM01 Prompt injection }
+      - { text: A crew member worded a request so ORBIT dropped its rules for the rest of the chat, zone: LLM01 Prompt injection }
+      - { text: "ORBIT's answer to a scheduling question quoted another crew member's diagnosis from the medical notes it retrieved", zone: LLM02 Sensitive information disclosure }
+      - { text: Full medical notes are sent to the model provider and kept in request logs although the task only needs appointment times, zone: LLM02 Sensitive information disclosure }
+      - { text: "ORBIT's messaging tool can reach any address on Earth although it only ever needs to message the six crew members", zone: LLM06 Excessive agency }
+      - { text: ORBIT sends reports to Meridian Control on its own without a crew member confirming the content, zone: LLM06 Excessive agency }
+
+  - id: classify-owasp-b
+    type: classify
+    title: "Name the risk: output, prompt leak, consumption or supply chain"
+    prompt: Sort each incident into its OWASP category.
+    hint: |
+      Output handling is about what *downstream code* does with the model's text. Prompt leakage is about secrets
+      *placed in the prompt*. Consumption is about cost and capacity. Supply chain is about components you didn't build.
+    zones: [LLM05 Improper output handling, LLM07 System prompt leakage, LLM10 Unbounded consumption, LLM03 Supply chain]
+    items:
+      - { text: "The station dashboard inserts ORBIT's replies into the page as raw HTML", zone: LLM05 Improper output handling }
+      - { text: "A maintenance script passes ORBIT's suggested command straight to the shell", zone: LLM05 Improper output handling }
+      - { text: A crew member got ORBIT to repeat its instructions, which included the airlock override code, zone: LLM07 System prompt leakage }
+      - { text: "The hidden prompt listed internal server hostnames, and they appeared in a chat transcript", zone: LLM07 System prompt leakage }
+      - { text: A tool loop called the model 4000 times overnight and used up the month's API budget, zone: LLM10 Unbounded consumption }
+      - { text: Crew paste a 300-page manual into every question so each call costs 50 times the usual, zone: LLM10 Unbounded consumption }
+      - { text: An update to a third-party embedding package added code that uploads documents to an unknown server, zone: LLM03 Supply chain }
+      - { text: The team deployed a fine-tuned model downloaded from an unverified hub account, zone: LLM03 Supply chain }
+
+  - id: risk-register
+    type: coding
+    title: Rank the threats and spend the budget
+    context: |
+      `threats` is ORBIT's risk register: one row per threat with `id`, `owasp`, `likelihood` (1-5), `impact` (1-5)
+      and `effort_days` to fix. You have **5 engineering days** before launch.
+    instructions:
+      - Add a `risk` column to `threats` equal to `likelihood * impact`.
+      - "Store `threats` sorted by `risk` (highest first), breaking ties by `effort_days` (lowest first), in `ranked`. Store the first three `id`s as a list in `top3`."
+      - "Walk `ranked` in order and add each `id` to the list `plan` if its `effort_days` still fits in the 5-day budget; skip it if it doesn't."
+    hint: |
+      `ranked = threats.sort_values(["risk", "effort_days"], ascending=[False, True])`. For the plan, keep a running
+      total `used`, and inside `for _, row in ranked.iterrows():` check `if used + row["effort_days"] <= BUDGET:`.
+    pre_code: |
+      import pandas as pd
+      BUDGET = 5
+      threats = pd.DataFrame([
+          ("override-code-leak", "LLM07", 4, 4, 1),
+          ("log-opens-airlock", "LLM01", 3, 5, 2),
+          ("medical-notes-in-logs", "LLM02", 4, 3, 3),
+          ("raw-query-execution", "LLM05", 3, 3, 2),
+          ("stale-procedure-answers", "LLM09", 3, 3, 3),
+          ("unreviewed-plugin-update", "LLM03", 2, 4, 4),
+          ("runaway-agent-spend", "LLM10", 2, 2, 1),
+      ], columns=["id", "owasp", "likelihood", "impact", "effort_days"])
+    sample_code: |
+      threats["risk"] = ____
+
+      ranked = threats.sort_values(____, ascending=____)
+      top3 = ____
+
+      plan, used = [], 0
+      for _, row in ranked.iterrows():
+          if ____:
+              plan.append(row["id"])
+              used += row["effort_days"]
+      print(top3)
+      print(plan, used)
+    solution: |
+      threats["risk"] = threats["likelihood"] * threats["impact"]
+
+      ranked = threats.sort_values(["risk", "effort_days"], ascending=[False, True])
+      top3 = ranked["id"].head(3).tolist()
+
+      plan, used = [], 0
+      for _, row in ranked.iterrows():
+          if used + row["effort_days"] <= BUDGET:
+              plan.append(row["id"])
+              used += row["effort_days"]
+      print(top3)
+      print(plan, used)
+    tests: |
+      assert "risk" in user["threats"].columns, "Add a `risk` column to `threats`."
+      assert list(user["threats"]["risk"]) == [16, 15, 12, 9, 9, 8, 4], "`risk` should be `likelihood * impact` for each row."
+      check_equal("top3", msg="`top3` should be the first three ids of `ranked`: sort by risk descending, then effort ascending, and take `.head(3)`.")
+      check_equal("plan", msg="Walk `ranked` in order and keep each id whose `effort_days` still fits in the 5 days left. `medical-notes-in-logs` (3 days) does not fit once the first two are planned, so skip it and keep going.")
+    success_msg: |
+      The third-riskiest threat didn't fit, so the plan skipped to `raw-query-execution`, which did. The two top risks
+      cost 3 days together because both have *structural* fixes: delete the secret from the prompt, remove the airlock tool.
+
+  - id: first-control
+    type: mc
+    title: One week to launch
+    question: |
+      ORBIT launches in a week and you have 3 engineering days. The two top risks are `override-code-leak` (the code sits in
+      the system prompt) and `log-opens-airlock` (ORBIT holds `open_airlock`; the handbook says ORBIT must **never**
+      operate airlocks). Crew ask about airlock procedures every day. What do you do first?
+    options:
+      - text: Add an input filter that refuses any request or document mentioning "override" or "airlock".
+        feedback: |
+          It refuses the daily airlock-procedure questions (over-blocking), and an attacker only has to word the next log
+          differently. The secret and the tool are still there for the first message the filter misses.
+      - text: Delete the override code from the system prompt and remove `open_airlock` from ORBIT's tools.
+        correct: true
+        feedback: |
+          Right. ORBIT never needs either, so removing them costs no usability, takes under a day, and holds however the
+          next attack is worded: a model can't leak a secret it never saw or call a tool it doesn't have.
+      - text: Add "Never reveal the code and never open airlocks" in bold to the system prompt.
+        feedback: |
+          Worth adding, but it is more text competing with the attacker's text. It lowers the odds; it doesn't remove the
+          capability. The secret and the tool are still one fooled reply away.
+      - text: Fine-tune a model to resist injection before launch.
+        feedback: |
+          That takes weeks, needs training data and still gives a probabilistic result. Fine-tuning can't make a model
+          unable to call a tool it is offered.
+    hint: Which option still works if the attacker rewords the log tomorrow, and costs the crew nothing?

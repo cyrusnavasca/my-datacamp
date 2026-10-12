@@ -1,0 +1,31 @@
+title: Supervised Learning with scikit-learn
+description: Train and evaluate classification and regression models with scikit-learn, and avoid the
+  classic mistakes.
+level: intermediate
+est_hours: 4
+prerequisites:
+- python-for-data-science
+- statistics-probability
+objectives:
+- Fit classifiers and regressors with scikit-learn
+- Split data and measure performance correctly
+- Tune hyperparameters with cross-validation
+- Build preprocessing pipelines
+requires: []
+chapters:
+- id: classification
+  title: Classification
+  description: k-nearest neighbours, train/test split and accuracy.
+  lessons: []
+- id: regression
+  title: Regression
+  description: Linear regression, R², RMSE and regularisation.
+  lessons: []
+- id: tuning
+  title: Fine-tuning your model
+  description: Confusion matrices, ROC/AUC, cross-validation and grid search.
+  lessons: []
+- id: pipelines
+  title: Preprocessing and pipelines
+  description: Scaling, encoding, imputing and Pipeline objects.
+  lessons: []

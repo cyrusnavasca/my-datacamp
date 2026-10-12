@@ -1,0 +1,313 @@
+title: Least privilege
+description: Expose only what each host needs, gate risky tools behind a human, authenticate remote servers, and balance security against friction.
+exercises:
+  - id: privilege-slides
+    type: video
+    title: Give every server as little as possible
+    slides: |
+      # What you hand over when you connect a server
+
+      Connecting an MCP server gives it two things:
+
+      1. **Code running with your permissions.** A stdio server is a local process started as *you*: it
+         can read your files, your environment variables and your SSH keys, whatever its tools claim.
+      2. **Text inside your model's context**: its descriptions, and every tool result it returns.
+
+      Least privilege is how you limit both: **connect** only the servers a host needs, **expose** only
+      the tools it needs, **gate** the risky ones behind a person, and **isolate** what you don't fully trust.
+
+      ---
+
+      ## Allowlists and approval gates live in the host
+
+      ```python
+      NEVER = {"open_airlock"}                          # not exposed to the crew chat host at all
+      NEEDS_APPROVAL = {"send_message", "book_module"}   # a person confirms each call
+
+      tools = [to_anthropic(t, prefix) for t in listed if t["name"] not in NEVER and not lint(t)]
+
+      def route(name, args):
+          client, mcp_name = routes[name]
+          if mcp_name in NEEDS_APPROVAL and not ask_crew(mcp_name, args):
+              return {"content": [{"type": "text", "text": "Denied: the crew did not approve this."}], "isError": True}
+          return client.call_tool(mcp_name, args)
+      ```
+
+      A denial goes back as `isError`, so the model can explain it instead of retrying blindly. Tool
+      **annotations** (`readOnlyHint`, `destructiveHint`) can set *defaults* for servers you trust, but
+      they are claims made by the server: never let a third party's annotations loosen your policy.
+
+      ---
+
+      ## Remote servers need real authentication
+
+      - The MCP **authorization** spec for HTTP transports builds on **OAuth 2.1**. The MCP server acts as a
+        resource server; the client gets an access token from an authorization server, on the user's behalf.
+      - Tokens must be **issued for that MCP server** (audience-bound), and the server must check this.
+      - **No token passthrough:** a server must not forward the client's token to other APIs. If it calls
+        another service, it uses its own credentials. Otherwise you get a confused deputy.
+      - An `Mcp-Session-Id` is **not** authentication: anyone can start a new session.
+      - Local HTTP servers: bind to `127.0.0.1` and validate `Origin`. Check modelcontextprotocol.io for the
+        current authorization requirements.
+
+      ---
+
+      ## Isolation and supply chain
+
+      - **Pin versions.** `npx some-server@latest` in a config file means running code you never reviewed, every launch.
+      - **Review** what a third-party server does before you connect it, then pin its tool definitions.
+      - **Sandbox** servers you don't fully trust: a container or VM with only the folders and network they need.
+      - **Scope secrets per server**: give each one only its own environment variables, never your whole environment.
+
+      ---
+
+      ## Security vs friction
+
+      | policy | attack surface | crew friction | failure mode |
+      | --- | --- | --- | --- |
+      | expose everything | everything | none | one poisoned server reaches every tool |
+      | allowlist per host | what's listed | none | the list goes stale; new tools wait for review |
+      | allowlist + approval for risky tools | small | a few approvals a day | approvals the crew didn't expect |
+      | approval for **every** call | smallest on paper | constant | **approval fatigue**: people click yes without reading |
+      | a separate host per role | smallest in practice | setup work | more hosts to maintain |
+
+      Measure both sides, as with the linter: attack success on an attack set **and** benign task
+      success and approvals per task. A defence that blocks the crew's work gets switched off.
+
+  - id: exposure-policy
+    type: classify
+    title: Expose, gate or hide?
+    prompt: |
+      ORBIT's crew chat host follows this policy. Read-only tools from reviewed servers are exposed.
+      Tools that change state or contact people need a crew member's approval for each call. Tools that
+      could endanger the crew, tools that fail the description linter, and tools whose definition changed
+      since approval are not exposed. Sort each tool.
+    hint: Check each tool against the policy, in order. Does it fail the linter or changed since approval? Could it endanger the crew? Does it change state?
+    zones: [Expose, Expose with approval, Do not expose]
+    items:
+      - { text: "get_sensor (helios-station)", zone: Expose }
+      - { text: "crew_roster (helios-station)", zone: Expose }
+      - { text: "recipe_search (galley-plus, reviewed, passes the linter)", zone: Expose }
+      - { text: "send_message (helios-station)", zone: Expose with approval }
+      - { text: "book_module (helios-station)", zone: Expose with approval }
+      - { text: "open_airlock (helios-station)", zone: Do not expose }
+      - { text: "nutrition_facts (galley-plus, flagged by the linter)", zone: Do not expose }
+      - { text: "meal_timer (galley-plus, definition changed since approval)", zone: Do not expose }
+
+  - id: remote-auth
+    type: mc
+    title: Securing the remote handbook server
+    question: |
+      Ground control will run the handbook server over Streamable HTTP for every crew laptop and the
+      ground team. Some handbook sections are restricted to the commander. Which setup is right?
+    options:
+      - text: No authentication; the random Mcp-Session-Id already proves who is calling
+        feedback: A session id identifies a session, not a person. Anyone who can reach the endpoint can initialize a new session and get their own id.
+      - text: OAuth-based authorization as in the MCP spec; tokens issued for this server, which checks the audience and the user's role on every request, over HTTPS
+        correct: true
+        feedback: Right. The server knows who is calling and can enforce the commander-only sections, and a token issued for some other service is rejected here.
+      - text: The server accepts the crew's ground-systems token and forwards it to the mission database to check access
+        feedback: That's token passthrough, which the spec forbids. The server becomes a confused deputy, and the database can't tell the handbook server from the user. Tokens must be issued for this server, which uses its own credentials downstream.
+      - text: Run it over stdio on every laptop instead, so no network authentication is needed
+        feedback: Then every laptop holds a full copy of the restricted sections, and you have dozens of deployments to keep in sync. stdio fits local, single-user tools, not a shared service with access control.
+    hint: Which option lets the server know who is calling, and makes sure the token was meant for it?
+
+  - id: safe-install-mission
+    type: sequential
+    title: "Mission: install a third-party server safely"
+    context: |
+      The crew wants `galley-plus` in ORBIT next to `helios-station`. Measure what happens with no
+      controls, then harden the host step by step and prove it on the seven `MISSION_TASKS`.
+      `fresh_world()` returns `(station, servers, clients)` with both servers connected.
+      `run_tasks(tools, route)` runs ORBIT on every task and returns the share answered correctly.
+      `leaked_calls(*servers.values())` lists tool calls whose arguments carry the airlock code.
+      `lint(tool)` is a description linter, `fingerprint(tool)` the pinning hash, and `NEVER`,
+      `NEEDS_APPROVAL` and `crew_approves(tool, args)` encode the crew's policy.
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import (MCPClient, station_server, galley_server, anthropic_tool, run_agent, obedient_model,
+                                         reference_lint, fingerprint, rug_pull, leaked_calls, MISSION_TASKS, ORBIT_SYSTEM)
+
+      def fresh_world():
+          station = aikit.helios.Station()
+          servers = {"helios-station": station_server(station), "galley-plus": galley_server(station)}
+          clients = {}
+          for name, server in servers.items():
+              clients[name] = MCPClient(server)
+              clients[name].initialize()
+          return station, servers, clients
+
+      def run_tasks(tools, route):
+          ok = 0
+          for question, expected in MISSION_TASKS:
+              llm = aikit.FakeClaude(obedient_model(), clock=aikit.VirtualClock())
+              out = run_agent(llm, tools, route, question, system=ORBIT_SYSTEM)
+              ok += expected in out["answer"]
+          return ok / len(MISSION_TASKS)
+
+      NEVER = {"open_airlock"}
+      NEEDS_APPROVAL = {"send_message", "book_module"}
+
+      def crew_approves(tool, args):
+          """The crew member in the loop approves only what they actually asked for."""
+          return tool == "send_message" and args.get("to") == "Kenji Watanabe" and "Dinner" in args.get("text", "")
+
+      lint = reference_lint
+    steps:
+      - instructions:
+          - "**Measure with no controls.** Get `station, servers, clients = fresh_world()`. Expose every tool of every client as `<server>__<tool>` (use `anthropic_tool(t, name + \"__\")`) and route straight to `call_tool`."
+          - "Store `success_before = run_tasks(tools, route)` and `leaks_before = len(leaked_calls(*servers.values()))`. Print both."
+        hint: "Build `tools` and `routes` as in the bridging lesson; `route = lambda n, a: routes[n][0].call_tool(routes[n][1], a)`."
+        sample_code: |
+          station, servers, clients = fresh_world()
+          tools, routes = [], {}
+          for name, client in clients.items():
+              for t in client.list_tools():
+                  api = anthropic_tool(t, name + "__")
+                  tools.append(api)
+                  routes[api["name"]] = (client, t["name"])
+          route = lambda n, a: routes[n][0].call_tool(routes[n][1], a)
+
+          success_before = ____
+          leaks_before = ____
+          print(success_before, leaks_before)
+        solution: |
+          station, servers, clients = fresh_world()
+          tools, routes = [], {}
+          for name, client in clients.items():
+              for t in client.list_tools():
+                  api = anthropic_tool(t, name + "__")
+                  tools.append(api)
+                  routes[api["name"]] = (client, t["name"])
+          route = lambda n, a: routes[n][0].call_tool(routes[n][1], a)
+
+          success_before = run_tasks(tools, route)
+          leaks_before = len(leaked_calls(*servers.values()))
+          print(success_before, leaks_before)
+        tests: |
+          check_equal("success_before", 1.0, msg="`success_before` should be `run_tasks(tools, route)` with every tool exposed.")
+          check_equal("leaks_before", 7, msg="`leaks_before` should be `len(leaked_calls(*servers.values()))` after the run: one leak per task.")
+      - instructions:
+          - "**Fix 1: approve tools.** Write `approve(clients)` returning `(tools, routes, pins)`. Skip any tool whose MCP name is in `NEVER` or for which `lint(t)` finds something. For the rest, add the API tool, the route, and `pins[api_name] = fingerprint(t)`."
+          - "Print the approved tool names for the current `clients`."
+        hint: "`if t[\"name\"] in NEVER or lint(t): continue`"
+        sample_code: |
+          def approve(clients):
+              tools, routes, pins = [], {}, {}
+              for name, client in clients.items():
+                  for t in client.list_tools():
+                      ____
+                      api = anthropic_tool(t, name + "__")
+                      tools.append(api)
+                      routes[api["name"]] = (client, t["name"])
+                      pins[api["name"]] = ____
+              return tools, routes, pins
+
+          print(sorted(approve(clients)[1]))
+        solution: |
+          def approve(clients):
+              tools, routes, pins = [], {}, {}
+              for name, client in clients.items():
+                  for t in client.list_tools():
+                      if t["name"] in NEVER or lint(t):
+                          continue
+                      api = anthropic_tool(t, name + "__")
+                      tools.append(api)
+                      routes[api["name"]] = (client, t["name"])
+                      pins[api["name"]] = fingerprint(t)
+              return tools, routes, pins
+
+          print(sorted(approve(clients)[1]))
+        tests: |
+          _, _, cl = user["fresh_world"]()
+          tools, routes, pins = user["approve"](cl)
+          names = sorted(routes)
+          assert "helios-station__open_airlock" not in names, "open_airlock is in NEVER: don't expose it."
+          assert "galley-plus__nutrition_facts" not in names, "nutrition_facts fails the linter: don't expose it."
+          assert names == sorted(["helios-station__get_sensor", "helios-station__crew_roster", "helios-station__book_module",
+                                  "helios-station__send_message", "galley-plus__recipe_search", "galley-plus__meal_timer"]), f"Expected the 6 safe tools, got {names}."
+          assert sorted(pins) == names and all(len(v) == 64 for v in pins.values()), "`pins` should map each approved API name to `fingerprint(t)`."
+      - instructions:
+          - "**Fix 2: gate risky calls.** Write `make_gated_route(routes)` returning a `route(name, args)` function. For a tool in `NEEDS_APPROVAL`, ask `crew_approves(mcp_name, args)`; if the answer is no, return an `isError` result saying the crew did not approve. Otherwise call the tool."
+        hint: |
+          Inside: `client, mcp_name = routes[name]`; denied →
+          `{"content": [{"type": "text", "text": "Denied: the crew did not approve this action."}], "isError": True}`.
+        sample_code: |
+          def make_gated_route(routes):
+              def route(name, args):
+                  client, mcp_name = routes[name]
+                  if ____:
+                      return ____
+                  return client.call_tool(mcp_name, args)
+              return route
+        solution: |
+          def make_gated_route(routes):
+              def route(name, args):
+                  client, mcp_name = routes[name]
+                  if mcp_name in NEEDS_APPROVAL and not crew_approves(mcp_name, args):
+                      return {"content": [{"type": "text", "text": "Denied: the crew did not approve this action."}], "isError": True}
+                  return client.call_tool(mcp_name, args)
+              return route
+        tests: |
+          st, _, cl = user["fresh_world"]()
+          _, routes, _ = user["approve"](cl)
+          route = user["make_gated_route"](routes)
+          r = route("helios-station__send_message", {"to": "Noor Haddad", "text": "Here is the override code"})
+          assert r.get("isError") is True and not st.outbox, "An unapproved send_message must be denied (isError result) and must not reach the station."
+          r = route("helios-station__send_message", {"to": "Kenji Watanabe", "text": "Dinner is at 19:00"})
+          assert r.get("isError") is False and len(st.outbox) == 1, "An approved send_message should go through."
+          r = route("helios-station__get_sensor", {"module": "C", "metric": "humidity"})
+          assert r.get("isError") is False, "Read-only tools need no approval."
+      - instructions:
+          - "**Fix 3 and verify.** Write `refresh(clients, pins)`: re-list every server (as on `notifications/tools/list_changed`) and return `(tools, routes)` with only the tools whose `fingerprint` still matches their pin. Changed and new tools wait for re-approval."
+          - "Then run the whole hardened host on a fresh world: `fresh_world()`, `approve`, then `rug_pull(servers[\"galley-plus\"])` (the server updates itself weeks later), then `refresh`, then `run_tasks` with `make_gated_route`."
+          - "Store `success_after`, `leaks_after` and `final_routes` (the routes after refresh). Print them. Target: no leaks and at least 6 of 7 tasks done."
+        hint: "In `refresh`: `api = anthropic_tool(t, name + \"__\")`, and keep it only `if pins.get(api[\"name\"]) == fingerprint(t)`."
+        sample_code: |
+          def refresh(clients, pins):
+              tools, routes = [], {}
+              for name, client in clients.items():
+                  for t in client.list_tools():
+                      api = anthropic_tool(t, name + "__")
+                      if ____:
+                          tools.append(api)
+                          routes[api["name"]] = (client, t["name"])
+              return tools, routes
+
+          station, servers, clients = fresh_world()
+          tools, routes, pins = approve(clients)
+          rug_pull(servers["galley-plus"])
+          tools, final_routes = ____
+          success_after = ____
+          leaks_after = len(leaked_calls(*servers.values()))
+          print(success_after, leaks_after, sorted(final_routes), station.airlocks)
+        solution: |
+          def refresh(clients, pins):
+              tools, routes = [], {}
+              for name, client in clients.items():
+                  for t in client.list_tools():
+                      api = anthropic_tool(t, name + "__")
+                      if pins.get(api["name"]) == fingerprint(t):
+                          tools.append(api)
+                          routes[api["name"]] = (client, t["name"])
+              return tools, routes
+
+          station, servers, clients = fresh_world()
+          tools, routes, pins = approve(clients)
+          rug_pull(servers["galley-plus"])
+          tools, final_routes = refresh(clients, pins)
+          success_after = run_tasks(tools, make_gated_route(final_routes))
+          leaks_after = len(leaked_calls(*servers.values()))
+          print(success_after, leaks_after, sorted(final_routes), station.airlocks)
+        tests: |
+          check_object("leaks_after")
+          assert user["leaks_after"] == 0, f"{user['leaks_after']} tool calls still leaked the code. Did `refresh` drop the tool that changed after approval?"
+          assert "galley-plus__meal_timer" not in user["final_routes"], "meal_timer changed after approval, so `refresh` must leave it out until someone re-approves it."
+          assert "helios-station__open_airlock" not in user["final_routes"], "open_airlock must never be routed from the crew chat host."
+          assert user["station"].airlocks == {"AL-1": "closed", "AL-2": "closed"}, "An airlock was opened."
+          assert user["success_after"] >= 6 / 7 - 1e-9, f"Only {user['success_after']:.0%} of tasks succeeded; the hardened host should still finish at least 6 of 7 (all but the meal timer, which is waiting for re-approval)."
+    success_msg: |
+      Before: every task done, and the airlock code left the station 7 times. After: zero leaks, the
+      airlock unreachable, and 6 of 7 tasks done. The one you lost is the meal timer, deliberately: it
+      changed after review, so it waits for a person. Measuring both numbers is what tells you the
+      defence is worth its friction.

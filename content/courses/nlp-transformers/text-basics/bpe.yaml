@@ -1,0 +1,328 @@
+title: Subwords with byte-pair encoding
+description: Learn BPE merges by hand, apply them to unseen words, and see how real tokenisers split text.
+exercises:
+  - id: intro
+    type: video
+    title: How BPE builds a vocabulary
+    slides: |
+      # Byte-pair encoding: merge what is frequent
+
+      BPE learns a vocabulary from data instead of fixing it by hand:
+
+      1. Start with every word split into characters, plus an end-of-word marker `</w>`.
+      2. Count every **adjacent pair** of symbols, weighted by how often the word occurs.
+      3. **Merge** the most frequent pair into one new symbol, everywhere.
+      4. Repeat until the vocabulary reaches the size you chose.
+
+      The ordered list of merges **is** the tokeniser. Ship it with the model.
+
+      ---
+
+      ## One step by hand
+
+      Word counts from the station log: `seal` 7, `sealed` 5, `heal` 4, `healed` 6, ...
+
+      ```python
+      words = {("s","e","a","l","</w>"): 7, ("h","e","a","l","e","d","</w>"): 6, ...}
+
+      pair_counts = Counter()
+      for symbols, n in words.items():
+          for a, b in zip(symbols, symbols[1:]):
+              pair_counts[(a, b)] += n
+      best = max(pair_counts, key=pair_counts.get)    # ('e', 'a')
+      ```
+
+      Merging `('e', 'a')` turns `s e a l </w>` into `s ea l </w>`. Next round, `('ea', 'l')`
+      wins, then `('s', 'eal')`... Frequent words end up as **one** token, rare ones as a few pieces.
+
+      ---
+
+      ## Encoding a word the tokeniser never saw
+
+      To tokenise new text, split it into characters and replay the merges **in the order learned**:
+
+      ```
+      resealed → r e s e a l e d </w>
+        ('e','a')   → r e s ea l e d </w>
+        ('ea','l')  → r e s eal e d </w>
+        ('s','eal') → r e seal e d </w>
+        ('e','d')   → r e seal ed </w>   ...
+      ```
+
+      `resealed` was never in the training data, yet it becomes `re` + `seal` + `ed`
+      pieces the model has embeddings for. No `<unk>`.
+
+      ---
+
+      ## Real tokenisers
+
+      | tokeniser | used by | detail |
+      | --- | --- | --- |
+      | byte-level BPE | GPT-2, most LLMs | works on bytes, so **any** string encodes; `Ġ` marks a leading space |
+      | WordPiece | BERT, DistilBERT | greedy longest match from the left; `##` marks a piece that continues a word |
+      | SentencePiece / Unigram | T5, many multilingual models | treats spaces as a symbol; no pre-splitting on whitespace |
+
+      ```python
+      bert_tok.tokenize("hydroponics")   # ['hydro', '##pon', '##ics']
+      gpt2_tok.tokenize(" hydroponics")  # ['Ġhyd', 'rop', 'onics']
+      ```
+
+      Splits follow **frequency in the tokeniser's training corpus**, not grammar.
+
+      ---
+
+      ## Trade-off: how big should the vocabulary be?
+
+      | bigger vocabulary (e.g. 200k) | smaller vocabulary (e.g. 8k) |
+      | --- | --- |
+      | shorter sequences: cheaper attention, more text fits in context | longer sequences |
+      | bigger embedding table and output softmax ($V \times d$ each) | small tables, faster output layer |
+      | rare tokens get few training examples, so poor embeddings | every piece is seen often |
+      | fewer tokens per non-English word or code | non-English text and numbers fragment badly |
+
+      This is also why API prices "per token" vary across languages: the same sentence in
+      a language under-represented in the tokeniser's corpus costs more tokens.
+
+  - id: count-pairs
+    type: coding
+    title: Count adjacent pairs
+    context: |
+      `words` maps each word, already split into symbols with an end marker, to its count, e.g.
+      `("s", "e", "a", "l", "</w>"): 7`. `Counter` is imported. Find the pair BPE would merge first.
+    instructions:
+      - "Write `get_pair_counts(words)`: a `Counter` mapping each adjacent pair `(a, b)` to the number of times it occurs, weighted by the word's count."
+      - Store `get_pair_counts(words)` in `pair_counts`.
+      - "Store the most frequent pair in `best` (use `max(pair_counts, key=pair_counts.get)`) and print it with its count."
+    hint: "`zip(symbols, symbols[1:])` gives the adjacent pairs of one word. Add `n`, the word's count, for each pair."
+    pre_code: |
+      from collections import Counter
+      counts = {"seal": 7, "seals": 3, "sealed": 5, "reseal": 2, "heal": 4, "healed": 6, "leak": 5, "leaked": 3}
+      words = {tuple(w) + ("</w>",): n for w, n in counts.items()}
+    sample_code: |
+      def get_pair_counts(words):
+          pair_counts = Counter()
+          for symbols, n in words.items():
+              for a, b in ____:
+                  pair_counts[(a, b)] += ____
+          return pair_counts
+
+      pair_counts = get_pair_counts(words)
+      best = ____
+      print(best, pair_counts[best])
+    solution: |
+      def get_pair_counts(words):
+          pair_counts = Counter()
+          for symbols, n in words.items():
+              for a, b in zip(symbols, symbols[1:]):
+                  pair_counts[(a, b)] += n
+          return pair_counts
+
+      pair_counts = get_pair_counts(words)
+      best = max(pair_counts, key=pair_counts.get)
+      print(best, pair_counts[best])
+    tests: |
+      check_object("get_pair_counts")
+      got = user["get_pair_counts"]({("a", "b", "a", "b"): 2, ("b", "a"): 1})
+      assert dict(got) == {("a", "b"): 4, ("b", "a"): 3}, \
+          "`get_pair_counts` should add the word's count once per occurrence of each adjacent pair. For {('a','b','a','b'): 2, ('b','a'): 1} expect {('a','b'): 4, ('b','a'): 3}; got " + repr(dict(got))
+      check_equal("pair_counts")
+      check_equal("best", msg="`best` should be the pair with the highest count in `pair_counts`.")
+    success_msg: "`('e', 'a')` occurs 35 times, in every `seal`, `heal` and `leak` word. It becomes the first new token."
+
+  - id: merge-step
+    type: coding
+    title: Apply one merge
+    context: |
+      `words` and `get_pair_counts` from the last exercise are loaded. Now write the merge:
+      every occurrence of the chosen pair becomes one symbol.
+    instructions:
+      - "Write `merge(pair, words)` that returns a **new** dict where every adjacent occurrence of `pair` inside each word is replaced by the joined symbol `pair[0] + pair[1]`. Counts stay the same."
+      - "Apply it with the pair `('e', 'a')` and store the result in `words2`."
+      - "Print the entry for `seal` in `words2` to check it."
+    hint: |
+      Walk through the symbols with an index `i`. If `symbols[i:i+2] == pair`, append the joined
+      symbol and jump by 2; otherwise append `symbols[i]` and step by 1. Remember `symbols` is a tuple,
+      so compare `tuple(symbols[i:i+2]) == pair`.
+    pre_code: |
+      from collections import Counter
+      counts = {"seal": 7, "seals": 3, "sealed": 5, "reseal": 2, "heal": 4, "healed": 6, "leak": 5, "leaked": 3}
+      words = {tuple(w) + ("</w>",): n for w, n in counts.items()}
+      def get_pair_counts(words):
+          pair_counts = Counter()
+          for symbols, n in words.items():
+              for a, b in zip(symbols, symbols[1:]):
+                  pair_counts[(a, b)] += n
+          return pair_counts
+    sample_code: |
+      def merge(pair, words):
+          merged = {}
+          for symbols, n in words.items():
+              out, i = [], 0
+              while i < len(symbols):
+                  if tuple(symbols[i:i + 2]) == pair:
+                      out.append(____)
+                      i += ____
+                  else:
+                      out.append(symbols[i])
+                      i += 1
+              merged[tuple(out)] = n
+          return merged
+
+      words2 = ____
+      print([w for w in words2 if "".join(w) == "seal</w>"])
+    solution: |
+      def merge(pair, words):
+          merged = {}
+          for symbols, n in words.items():
+              out, i = [], 0
+              while i < len(symbols):
+                  if tuple(symbols[i:i + 2]) == pair:
+                      out.append(pair[0] + pair[1])
+                      i += 2
+                  else:
+                      out.append(symbols[i])
+                      i += 1
+              merged[tuple(out)] = n
+          return merged
+
+      words2 = merge(("e", "a"), words)
+      print([w for w in words2 if "".join(w) == "seal</w>"])
+    tests: |
+      check_object("merge")
+      got = user["merge"](("a", "a"), {("a", "a", "a", "</w>"): 3})
+      assert got == {("aa", "a", "</w>"): 3}, \
+          "Merge left to right without overlapping: ('a','a','a','</w>') with pair ('a','a') should become ('aa','a','</w>'). Got " + repr(got)
+      got = user["merge"](("x", "y"), {("x", "z", "y", "</w>"): 1})
+      assert got == {("x", "z", "y", "</w>"): 1}, "Only merge symbols that are **adjacent**; ('x','z','y') has no ('x','y') pair."
+      check_equal("words2", msg="`words2` should be `merge(('e', 'a'), words)`.")
+    success_msg: Every `e a` became `ea`. Repeat count-then-merge and you have trained a BPE tokeniser.
+
+  - id: learn-and-encode
+    type: coding
+    title: Learn ten merges and encode a new word
+    context: |
+      `words`, `get_pair_counts(words)` and `merge(pair, words)` are loaded. Train a tiny BPE
+      tokeniser, then use it on words it has never seen.
+    instructions:
+      - "Run 10 rounds of: count pairs, pick `best = max(pair_counts, key=pair_counts.get)`, append `best` to the list `merges`, and replace `words` with `merge(best, words)`."
+      - "Write `encode_word(word)`: start from `list(word) + [\"</w>\"]`, apply every pair in `merges` **in order**, and return the final list of symbols."
+      - "Store `encode_word(\"resealed\")` in `pieces` and print it."
+    hint: |
+      For `encode_word`, you can reuse `merge`: `symbols = list(merge(pair, {tuple(symbols): 1}))[0]`
+      inside a loop over `merges`, then `return list(symbols)`.
+    pre_code: |
+      from collections import Counter
+      counts = {"seal": 7, "seals": 3, "sealed": 5, "reseal": 2, "heal": 4, "healed": 6, "leak": 5, "leaked": 3}
+      words = {tuple(w) + ("</w>",): n for w, n in counts.items()}
+      def get_pair_counts(words):
+          pair_counts = Counter()
+          for symbols, n in words.items():
+              for a, b in zip(symbols, symbols[1:]):
+                  pair_counts[(a, b)] += n
+          return pair_counts
+      def merge(pair, words):
+          merged = {}
+          for symbols, n in words.items():
+              out, i = [], 0
+              while i < len(symbols):
+                  if tuple(symbols[i:i + 2]) == pair:
+                      out.append(pair[0] + pair[1])
+                      i += 2
+                  else:
+                      out.append(symbols[i])
+                      i += 1
+              merged[tuple(out)] = n
+          return merged
+    sample_code: |
+      merges = []
+      for _ in range(10):
+          pair_counts = get_pair_counts(words)
+          best = ____
+          merges.append(best)
+          words = ____
+
+      def encode_word(word):
+          symbols = tuple(list(word) + ["</w>"])
+          for pair in ____:
+              symbols = list(merge(pair, {symbols: 1}))[0]
+          return list(symbols)
+
+      pieces = ____
+      print(merges)
+      print(pieces)
+    solution: |
+      merges = []
+      for _ in range(10):
+          pair_counts = get_pair_counts(words)
+          best = max(pair_counts, key=pair_counts.get)
+          merges.append(best)
+          words = merge(best, words)
+
+      def encode_word(word):
+          symbols = tuple(list(word) + ["</w>"])
+          for pair in merges:
+              symbols = list(merge(pair, {symbols: 1}))[0]
+          return list(symbols)
+
+      pieces = encode_word("resealed")
+      print(merges)
+      print(pieces)
+    tests: |
+      check_equal("merges", msg="`merges` should hold the 10 pairs picked by `max(pair_counts, key=pair_counts.get)`, in the order they were merged, starting with ('e', 'a').")
+      check_object("encode_word")
+      check_equal("pieces", msg="`pieces` should be `encode_word('resealed')`: apply every merge in `merges` in order to the characters plus '</w>'.")
+      assert user["encode_word"]("leaks") == sol["encode_word"]("leaks"), \
+          "`encode_word` should work for any word: replay all merges, in order, starting from its characters plus '</w>'."
+    success_msg: "`resealed` never appeared in training, but it encodes as `r e seal ed</w>`: pieces the model already knows, and no `<unk>`."
+
+  - id: unhappiness
+    type: mc
+    title: Why does BERT split unhappiness like that?
+    question: |
+      DistilBERT's WordPiece tokeniser (vocabulary of 30,522 pieces) gives:
+
+      ```
+      tok.tokenize("happiness")    → ['happiness']
+      tok.tokenize("unhappiness")  → ['un', '##ha', '##pp', '##iness']
+      ```
+
+      Why is `unhappiness` not split into `un` + `happiness`?
+    context: The console has `tok` (DistilBERT) and `gpt2_tok` (DistilGPT2) loaded. Try `tok.tokenize(...)` and check `"##happiness" in tok.get_vocab()`.
+    pre_code: |
+      from kits.nlp_transformers import quiet, SENTIMENT_MODEL, GPT2_MODEL
+      quiet()
+      from transformers import AutoTokenizer
+      tok = AutoTokenizer.from_pretrained(SENTIMENT_MODEL)
+      gpt2_tok = AutoTokenizer.from_pretrained(GPT2_MODEL)
+    options:
+      - text: The tokeniser splits words into morphemes (prefix, stem, suffix), and `happ` is the stem
+        feedback: |
+          Tokenisers know nothing about grammar. `##ha` + `##pp` is not a linguistic unit at all; the
+          split comes from which pieces happen to be in the learned vocabulary.
+      - text: "`happiness` is in the vocabulary only as a word-start piece. After `un`, WordPiece needs a `##` continuation piece, and `##happiness` does not exist, so it takes the longest continuations it has: `##ha`, `##pp`, `##iness`"
+        correct: true
+        feedback: |
+          Right. WordPiece matches the longest vocabulary piece from the left: `un`, then the longest
+          `##...` piece that fits. Word-start and continuation pieces are separate entries, so knowing
+          `happiness` does not help inside a longer word.
+      - text: The input was treated as a typo, so it fell back to characters
+        feedback: WordPiece has no notion of typos. It falls back to smaller pieces only because longer ones are missing from its vocabulary.
+      - text: Long words are always split into pieces of at most four characters
+        feedback: "There is no length cap: `happiness` (9 characters) is a single token. Check it in the console."
+    hint: "Look for `##happiness` in `tok.get_vocab()`, and compare with `'happiness' in tok.get_vocab()`."
+
+  - id: vocab-size-effects
+    type: classify
+    title: What happens when the vocabulary grows?
+    prompt: |
+      You retrain a BPE tokeniser with a vocabulary of 100,000 pieces instead of 8,000 and keep the
+      model width $d$ the same. Sort each quantity by whether it goes **up** or **down**.
+    hint: More merges means longer pieces, so the same text needs fewer of them. But every piece needs its own row in the embedding and output layers.
+    zones: [Goes up, Goes down]
+    items:
+      - { text: Parameters in the embedding table, zone: Goes up }
+      - { text: Cost of the output softmax over the vocabulary, zone: Goes up }
+      - { text: Number of rare pieces with very few training examples, zone: Goes up }
+      - { text: Tokens needed to encode the same message, zone: Goes down }
+      - { text: Attention cost for the same message, zone: Goes down }
+      - { text: Pieces a rare word like 'spectrometer' is split into, zone: Goes down }

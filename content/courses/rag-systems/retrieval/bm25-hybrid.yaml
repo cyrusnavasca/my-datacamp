@@ -1,0 +1,322 @@
+title: BM25 and hybrid search
+description: Build BM25 and reciprocal rank fusion by hand, see where keyword search beats embeddings, and fix identifier questions with hybrid retrieval.
+exercises:
+  - id: hybrid-slides
+    type: video
+    title: Keywords still matter
+    slides: |
+      # What the embedder can't see
+
+      From this chapter on, ORBIT's index is the chunking lab's lesson applied: **one sentence per chunk, with title
+      headers, superseded docs removed**, k=3. Crews also ask with identifiers: *"How long did SCR-1 run alone?"*
+
+      Here is what ORBIT's embedder actually sees of that question:
+
+      ```python
+      ['long', 'did', 'scr', 'run', ...]      # "1" is dropped; SCR-1 and SCR-2 look identical
+      ```
+
+      Our stand-in embedder (TF-IDF + SVD) drops one-character tokens. Real embedding models keep more, but they still
+      blur **rare exact strings**: part numbers, error codes, panel ids, names. The vector says "something about
+      scrubbers", and three general scrubber chunks outrank the one sentence that answers it.
+
+      **Keyword search** matches exact tokens. If your tokenizer keeps `scr-1` whole, it can't confuse the two.
+
+      ---
+
+      ## BM25: three ideas in one formula
+
+      For a query $q$ and a chunk $d$:
+
+      $$\text{BM25}(d, q) = \sum_{w \in q} \text{idf}(w) \cdot \frac{f(w,d)\,(k_1+1)}{f(w,d) + k_1\left(1 - b + b\,\frac{|d|}{\text{avgdl}}\right)}$$
+
+      $$\text{idf}(w) = \ln\!\left(1 + \frac{N - n_w + 0.5}{n_w + 0.5}\right)$$
+
+      1. **Rare words count more** (idf): `scr-1` is in 2 of 171 chunks, so it scores high; `module` is in 38 and counts much less.
+      2. **Repeats saturate** ($k_1 \approx 1.2$-$2$): the 5th "airlock" in a chunk adds much less than the 1st.
+      3. **Long chunks are discounted** ($b \approx 0.75$): $|d|$ is the chunk's length in tokens, avgdl the average.
+
+      $f(w,d)$ is how often word $w$ appears in chunk $d$, $N$ the number of chunks, and $n_w$ how many chunks contain $w$.
+
+      ---
+
+      ## BM25 in code
+
+      ```python
+      tokens = [tokenize(c["text"]) for c in chunks]     # lowercase words; keeps "scr-1", "df-1" whole
+      N, avgdl = len(tokens), sum(map(len, tokens)) / len(tokens)
+      df = Counter(w for t in tokens for w in set(t))    # n_w: how many chunks contain w
+
+      def idf(w):
+          return math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5))
+
+      def bm25_scores(query, k1=1.5, b=0.75):
+          scores = np.zeros(N)
+          for i, t in enumerate(tokens):
+              tf = Counter(t)
+              for w in tokenize(query):
+                  f = tf[w]
+                  if f:
+                      scores[i] += idf(w) * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
+          return scores
+      ```
+
+      Production systems use an inverted index (word → chunks containing it), so only chunks sharing a word are
+      scored. Search engines such as Elasticsearch and OpenSearch, and most vector databases, ship BM25 built in.
+
+      ---
+
+      ## Fusing two rankings: reciprocal rank fusion
+
+      Dense scores are cosines (about 0-1), BM25 scores are unbounded (0-20 here). You can't just add them. **RRF**
+      ignores the scores and uses ranks:
+
+      $$\text{RRF}(d) = \sum_{\text{rankings}} \frac{1}{k + \text{rank}(d)} \qquad (k = 60,\ \text{rank starts at } 1)$$
+
+      ```text
+      dense:  a b c        a: 1/61 + 1/62 = 0.0325
+      bm25:   c a d        c: 1/63 + 1/61 = 0.0323     fused: a, c, b, d
+                           b: 1/62 = 0.0161,  d: 1/63 = 0.0159
+      ```
+
+      A chunk ranked well by **both** rises to the top. $k=60$ flattens the curve so that rank 1 vs 2 matters less
+      than appearing in both lists. Fuse the top 20-50 of each list, then keep k.
+
+      ---
+
+      ## Keyword, dense or hybrid?
+
+      | | keyword (BM25) | dense (embeddings) | hybrid (both + RRF) |
+      | --- | --- | --- | --- |
+      | Exact ids, codes, names | strong | weak | strong |
+      | Paraphrases, synonyms ("plant lamps" for "grow lights") | fails | strong with a good model | strong |
+      | Latency | ms, inverted index | ms, ANN index + one embedding call | both, run in parallel |
+      | Infrastructure | a text index | a vector index + embedding API | both, plus fusion |
+      | Typical failure | vocabulary mismatch | rare tokens blurred away | more moving parts to tune and monitor |
+
+      Measured on ORBIT, k=3: identifier questions go from 0.83 (dense) to **1.00** (hybrid), the 45 handbook questions
+      from 0.89 to 0.91. Hybrid rarely loses to either side alone, which is why it's the common default.
+
+      ---
+
+      ## Playbook: "questions with codes and ids fail"
+
+      1. **Measure by question type.** A drop on identifier questions hides inside a good overall average.
+      2. **Look at what the retriever sees**: run the tokenizer or embedder's analyzer on a failing query.
+      3. **Try BM25 alone** on the failing queries. If it finds them, the vocabulary is fine and the embedding is the bottleneck.
+      4. **Fix with hybrid**, rather than replacing dense with keyword: keyword alone would lose the paraphrase questions.
+      5. **Verify on every type**, not just the one you fixed.
+
+  - id: bm25-by-hand
+    type: coding
+    title: BM25 from scratch
+    context: |
+      `chunks` is ORBIT's index (titled one-sentence chunks). `tokens[i]` is `tokenize(chunks[i]["text"])`, `N` the
+      number of chunks, `avgdl` the average token count and `df[w]` the number of chunks containing `w`.
+      `Counter`, `math` and `np` are imported.
+    instructions:
+      - "Write `idf(w)` as $\\ln(1 + (N - n_w + 0.5) / (n_w + 0.5))$ with `n_w = df[w]`."
+      - "Write `bm25_scores(query, k1=1.5, b=0.75)`: a NumPy array with one BM25 score per chunk, summing over the words of `tokenize(query)` as in the slides."
+      - "Store the `id`s of the 3 highest-scoring chunks for `\"How long did SCR-1 run alone?\"` in `top_ids`, best first, and print them."
+    hint: |
+      For each chunk `i`, build `tf = Counter(tokens[i])`; for each query word with `f = tf[w] > 0` add
+      `idf(w) * f * (k1 + 1) / (f + k1 * (1 - b + b * len(tokens[i]) / avgdl))`. Then `np.argsort(-scores)[:3]`.
+    pre_code: |
+      import math
+      from collections import Counter
+      import numpy as np
+      from kits.rag_systems import orbit_chunks, tokenize
+      chunks = orbit_chunks()
+      tokens = [tokenize(c["text"]) for c in chunks]
+      N = len(tokens)
+      avgdl = sum(len(t) for t in tokens) / N
+      df = Counter(w for t in tokens for w in set(t))
+      print(N, "chunks; tokenize keeps ids whole:", tokenize("How long did SCR-1 run alone?"))
+    sample_code: |
+      def idf(w):
+          return ____
+
+      def bm25_scores(query, k1=1.5, b=0.75):
+          scores = np.zeros(N)
+          q = tokenize(query)
+          for i, t in enumerate(tokens):
+              tf = Counter(t)
+              for w in q:
+                  f = tf[w]
+                  if f:
+                      scores[i] += ____
+          return scores
+
+      scores = bm25_scores("How long did SCR-1 run alone?")
+      top_ids = [chunks[i]["id"] for i in ____]
+      print(top_ids)
+    solution: |
+      def idf(w):
+          return math.log(1 + (N - df[w] + 0.5) / (df[w] + 0.5))
+
+      def bm25_scores(query, k1=1.5, b=0.75):
+          scores = np.zeros(N)
+          q = tokenize(query)
+          for i, t in enumerate(tokens):
+              tf = Counter(t)
+              for w in q:
+                  f = tf[w]
+                  if f:
+                      scores[i] += idf(w) * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
+          return scores
+
+      scores = bm25_scores("How long did SCR-1 run alone?")
+      top_ids = [chunks[i]["id"] for i in np.argsort(-scores)[:3]]
+      print(top_ids)
+    tests: |
+      check_object("idf")
+      import math as _m
+      assert abs(user["idf"]("scr-1") - _m.log(1 + (user["N"] - user["df"]["scr-1"] + 0.5) / (user["df"]["scr-1"] + 0.5))) < 1e-9, "`idf(w)` should be log(1 + (N - df[w] + 0.5) / (df[w] + 0.5))."
+      assert user["idf"]("scr-1") > user["idf"]("module"), "A rare word like 'scr-1' should get a higher idf than a common one like 'module'."
+      check_object("bm25_scores")
+      from kits.rag_systems import BM25Index
+      ref = BM25Index(user["chunks"])
+      import numpy as _np
+      for q in ["How long did SCR-1 run alone?", "What is kept in DF-1?", "airlock airlock leak check"]:
+          got = _np.asarray(user["bm25_scores"](q))
+          assert got.shape == (user["N"],), f"`bm25_scores` should return one score per chunk ({user['N']}); got shape {got.shape}."
+          assert _np.allclose(got, ref.scores(q), atol=1e-6), f"Scores for {q!r} don't match BM25. Check the tf saturation term `f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))`, and repeat words in the query count each time."
+      check_equal("top_ids", msg="`top_ids` should be the ids of the 3 highest-scoring chunks, best first.")
+    success_msg: |
+      BM25 puts the incident chunk "SCR-1 ran alone for 36 hours..." first, because `scr-1` is rare and
+      appears in only two chunks. Dense retrieval didn't have it in its top 3 at all: general scrubber chunks won.
+
+  - id: rrf-by-hand
+    type: coding
+    title: Reciprocal rank fusion
+    context: |
+      Each retriever returns a ranking: a list of chunk ids, best first. `dense_ids` and `bm25_ids` are the top 10 of
+      each for "What is kept in DF-1?". `GOLD` is the id of the chunk that answers it.
+    instructions:
+      - "Write `rrf(rankings, k=60)`: give each id the sum of `1 / (k + rank)` over the rankings it appears in (rank starts at **1**), and return the ids sorted by that score, highest first."
+      - "Store `rrf([dense_ids, bm25_ids])` in `fused` and the 1-based position of `GOLD` in `dense_ids`, `bm25_ids` and `fused` in `positions` (a list of 3 ints). Print `positions`."
+    hint: |
+      Build `score = {}` and loop `for ranking in rankings: for r, cid in enumerate(ranking, start=1): score[cid] = score.get(cid, 0) + 1 / (k + r)`.
+      Then `sorted(score, key=lambda c: -score[c])`. A list's `.index(x) + 1` gives a 1-based position.
+    pre_code: |
+      from kits.rag_systems import orbit_chunks, DenseIndex, BM25Index
+      chunks = orbit_chunks()
+      Q = "What is kept in DF-1?"
+      dense_ids = [c["id"] for c in DenseIndex(chunks).search(Q, 10)]
+      bm25_ids = [c["id"] for c in BM25Index(chunks).search(Q, 10)]
+      GOLD = "sample-handling#2"
+      print("dense:", dense_ids[:5])
+      print("bm25: ", bm25_ids[:5])
+    sample_code: |
+      def rrf(rankings, k=60):
+          score = {}
+          for ranking in rankings:
+              for r, cid in enumerate(ranking, start=____):
+                  score[cid] = ____
+          return sorted(score, key=____)
+
+      fused = rrf([dense_ids, bm25_ids])
+      positions = [ids.index(GOLD) + 1 for ids in ____]
+      print(positions)
+    solution: |
+      def rrf(rankings, k=60):
+          score = {}
+          for ranking in rankings:
+              for r, cid in enumerate(ranking, start=1):
+                  score[cid] = score.get(cid, 0) + 1 / (k + r)
+          return sorted(score, key=lambda c: -score[c])
+
+      fused = rrf([dense_ids, bm25_ids])
+      positions = [ids.index(GOLD) + 1 for ids in [dense_ids, bm25_ids, fused]]
+      print(positions)
+    tests: |
+      check_object("rrf")
+      f = user["rrf"]
+      got = f([["a", "b", "c"], ["c", "a", "d"]])
+      assert got == ["a", "c", "b", "d"], f"rrf([['a','b','c'], ['c','a','d']]) should be ['a', 'c', 'b', 'd']; got {got}. Ranks start at 1 and each list adds 1/(k + rank)."
+      got = f([["x", "y"], ["y", "z"]], k=1)
+      assert got == ["y", "x", "z"], f"With k=1, [['x','y'], ['y','z']] should fuse to ['y', 'x', 'z']; got {got}. Use the `k` argument."
+      check_equal("fused")
+      check_equal("positions", msg="`positions` should be the 1-based rank of GOLD in dense_ids, bm25_ids and fused.")
+    success_msg: |
+      Dense ranks the DF-1 chunk 5th because "1" is invisible to it; BM25 ranks it 1st; fused, it's 2nd, inside a
+      top 3. RRF never needed the two score scales to agree: it only looked at ranks.
+
+  - id: identifier-misses
+    type: coding
+    title: "Troubleshoot: identifier questions fail"
+    context: |
+      **Symptom**: the crew says ORBIT is "useless with part numbers". `QS` holds the 45 handbook questions plus 12
+      identifier questions (`type == "identifier"`). `dense` and `bm25` are search functions over ORBIT's index.
+      `evaluate(search, QS, k=3)` returns `accuracy` and `rows` (with a `type` and `correct` column). `rrf` is the reference fusion.
+    instructions:
+      - "**Measure**: evaluate `dense` with `k=3` and store accuracy per question type in `dense_by_type` (a dict type → mean of `correct`)."
+      - "**Fix**: write `hybrid(query, k)`: take the top 30 ids from `dense` and from `bm25`, fuse them with `rrf`, and return the chunk dicts (`by_id[cid]`) of the first `k`."
+      - "**Verify**: store the same per-type dict for `hybrid` in `hybrid_by_type` and print both."
+    hint: |
+      `r = evaluate(dense, QS, k=3)` then `r["rows"].groupby("type")["correct"].mean().to_dict()`. In `hybrid`:
+      `d = [c["id"] for c in dense(query, 30)]`, same for `bm25`, then `[by_id[cid] for cid in rrf([d, b])[:k]]`.
+    pre_code: |
+      from kits.rag_systems import orbit_chunks, DenseIndex, BM25Index, rrf, evaluate, questions, SLANG_QUESTIONS
+      chunks = orbit_chunks()
+      by_id = {c["id"]: c for c in chunks}
+      dense = DenseIndex(chunks).search
+      bm25 = BM25Index(chunks).search
+      QS = questions() + [q for q in SLANG_QUESTIONS if q["type"] == "identifier"]
+    sample_code: |
+      r_dense = evaluate(dense, QS, k=3)
+      dense_by_type = ____
+
+      def hybrid(query, k):
+          d = [c["id"] for c in dense(query, 30)]
+          b = ____
+          return ____
+
+      r_hybrid = evaluate(hybrid, QS, k=3)
+      hybrid_by_type = ____
+      print("dense: ", dense_by_type)
+      print("hybrid:", hybrid_by_type)
+    solution: |
+      r_dense = evaluate(dense, QS, k=3)
+      dense_by_type = r_dense["rows"].groupby("type")["correct"].mean().to_dict()
+
+      def hybrid(query, k):
+          d = [c["id"] for c in dense(query, 30)]
+          b = [c["id"] for c in bm25(query, 30)]
+          return [by_id[cid] for cid in rrf([d, b])[:k]]
+
+      r_hybrid = evaluate(hybrid, QS, k=3)
+      hybrid_by_type = r_hybrid["rows"].groupby("type")["correct"].mean().to_dict()
+      print("dense: ", dense_by_type)
+      print("hybrid:", hybrid_by_type)
+    tests: |
+      d = check_object("dense_by_type")
+      assert isinstance(d, dict) and set(d) == set(sol["dense_by_type"]), f"`dense_by_type` should map each question type ({sorted(sol['dense_by_type'])}) to its accuracy."
+      check_equal("dense_by_type")
+      check_object("hybrid")
+      res = user["hybrid"]("What is kept in DF-1?", 3)
+      assert len(res) == 3 and all(isinstance(c, dict) and "doc_id" in c for c in res), "`hybrid(query, k)` should return k chunk dicts."
+      h = check_object("hybrid_by_type")
+      assert h.get("identifier", 0) >= 0.99, f"Hybrid should answer every identifier question; got {h.get('identifier')}. Fuse the top 30 of both retrievers with `rrf`."
+      for t in d:
+          assert h[t] >= d[t] - 1e-9, f"Hybrid should not be worse than dense on {t!r} questions ({h[t]:.3f} vs {d[t]:.3f})."
+    success_msg: |
+      Identifier accuracy went from 0.83 to 1.0 and no question type got worse. You measured by type, found the blind
+      spot (ids dropped by the embedder), fixed it with a second retriever instead of replacing the first, and verified
+      across every type.
+
+  - id: which-retriever
+    type: classify
+    title: Which retriever wins?
+    prompt: For each crew query, decide which retriever is most likely to find the right chunk on its own.
+    hint: Exact codes, ids and rare names favour keywords. Different words for the same idea favour embeddings.
+    zones: [Keyword (BM25), Dense embeddings]
+    items:
+      - { text: "Error E-4417 on panel B-3", zone: Keyword (BM25) }
+      - { text: "What did ticket HX-20931 say?", zone: Keyword (BM25) }
+      - { text: "Is SCR-1 or SCR-2 the one that failed?", zone: Keyword (BM25) }
+      - { text: "Anything about the Tern manifest deadline", zone: Keyword (BM25) }
+      - { text: "I feel dizzy after coming back inside from a spacewalk", zone: Dense embeddings }
+      - { text: "How do I keep my bones strong up here?", zone: Dense embeddings }
+      - { text: "The plants look sad and droopy", zone: Dense embeddings }
+      - { text: "Who do I talk to if my laptop got a weird email?", zone: Dense embeddings }

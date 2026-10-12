@@ -1,0 +1,346 @@
+title: Concurrency and batching
+description: Overlap independent calls with asyncio and a semaphore, size the concurrency from your rate limit, use batch APIs for offline work, then fix ORBIT's latency and cost end to end.
+exercises:
+  - id: batching-async-slides
+    type: video
+    title: Waiting in parallel
+    slides: |
+      # Sum vs max
+
+      LLM calls spend almost all their time **waiting** for the provider. Waiting can overlap.
+
+      ```
+      sequential   [call 1 ][call 2 ][call 3 ][call 4 ]        time ≈ sum of calls
+      concurrent   [call 1 ]
+                   [call 2  ]
+                   [call 3]
+                   [call 4 ]                                 time ≈ the slowest call
+      ```
+
+      With $n$ independent calls of about $L$ seconds and at most $k$ in flight: $\text{time} \approx \lceil n/k \rceil \times L$.
+
+      This works for calls that **do not depend on each other**: the morning briefing's 41 questions, three sensor
+      reads for one status reply, sub-questions of a compound question. An agent's next step, which needs the
+      previous result, stays sequential.
+
+      ---
+
+      ## asyncio with a semaphore
+
+      ```python
+      import asyncio
+      import anthropic
+
+      client = anthropic.AsyncAnthropic()
+
+      async def ask(sem, question):
+          async with sem:                                   # at most k calls in flight
+              r = await client.messages.create(model="claude-sonnet-5-5", max_tokens=300,
+                                               system=SYSTEM, messages=[{"role": "user", "content": question}])
+              return r.content[0].text
+
+      async def main(questions, k=6):
+          sem = asyncio.Semaphore(k)
+          return await asyncio.gather(*(ask(sem, q) for q in questions))   # results keep input order
+
+      answers = asyncio.run(main(questions))
+      ```
+
+      In the exercises, `aikit.AsyncFakeClaude` really awaits, scaled down by `time_scale`, and records `max_in_flight`.
+
+      ---
+
+      ## How many in flight? Little's law
+
+      $$\text{in flight} = \text{throughput} \times \text{latency}$$
+
+      Your rate limit caps throughput. With a limit of **50 requests per minute** (0.83 per second) and calls of
+      **3 s**, about $0.83 \times 3 \approx 2.5$ calls are in flight at the limit. A semaphore of 20 would not make
+      anything faster; it would only fire bursts that come back as **429s** (next chapter). Providers also limit
+      input and output **tokens** per minute, so long prompts hit the limit sooner.
+
+      Pick $k$ from the limit, keep some headroom, and still handle 429s.
+
+      ---
+
+      ## Batch APIs for work nobody is waiting for
+
+      ```python
+      batch = client.messages.batches.create(requests=[
+          {"custom_id": f"ticket-{t['ticket_id']}",
+           "params": {"model": "claude-haiku-4-5", "max_tokens": 200,
+                      "messages": [{"role": "user", "content": PROMPT + t["text"]}]}}
+          for t in tickets
+      ])
+      # later: poll until batch.processing_status == "ended", then
+      for res in client.messages.batches.results(batch.id):
+          print(res.custom_id, res.result.type)      # "succeeded", "errored", "expired", ...
+      ```
+
+      Batches cost about **half** the normal price, but results can take up to a day (often much less).
+      Handle failures **per item**, matched by `custom_id`.
+
+      ---
+
+      ## Trade-off: sequential, concurrent or batch
+
+      | | sequential | concurrent (async) | batch API |
+      | --- | --- | --- | --- |
+      | wall time | sum of calls | ≈ slowest call per wave | minutes to hours |
+      | cost | normal | normal | about 50% off |
+      | rate-limit pressure | low | **high**: bound it | handled by the provider |
+      | complexity | lowest | async code, semaphores, error per task | submit, poll, match results |
+      | use when | steps depend on each other | a person waits for many independent calls | nobody waits: evals, backfills, reports |
+
+  - id: gather-semaphore
+    type: coding
+    title: Fan out with a semaphore
+    context: |
+      The morning briefing asks ORBIT all 41 eval questions. `aclient` is an async ORBIT client that sleeps for each
+      call's simulated latency × `aclient.time_scale` of real time, and records `aclient.max_in_flight`. You may have
+      at most `LIMIT` calls in flight.
+    instructions:
+      - "Complete `ask(sem, question)`: inside `async with sem:`, await `aclient.messages.create(...)` with `model=MODEL`, `max_tokens=600`, `system=SYSTEM` and the question, and return the reply's `.text`."
+      - "Complete `main()`: create `asyncio.Semaphore(LIMIT)` and `gather` one `ask` per EVAL question, in EVAL order."
+      - "Time `asyncio.run(main())` with `time.perf_counter()`: store the answers in `answers` and the seconds in `elapsed`."
+      - "Store `speedup`: the sequential time (`sum` of the calls' `latency_ms` / 1000 × `aclient.time_scale`) divided by `elapsed`."
+    hint: |
+      `return await asyncio.gather(*(ask(sem, item["question"]) for item in EVAL))`. The calls are in `aclient.calls`.
+    pre_code: |
+      import asyncio, time
+      from kits.llmops_production import AsyncFakeClaude, orbit_model, VirtualClock, MODEL, SYSTEM, EVAL
+      aclient = AsyncFakeClaude(orbit_model(), clock=VirtualClock(), time_scale=0.03)
+      LIMIT = 6
+    sample_code: |
+      async def ask(sem, question):
+          async with sem:
+              r = await ____
+              return r.text
+
+      async def main():
+          sem = ____
+          return await asyncio.gather(*(____ for item in EVAL))
+
+      start = time.perf_counter()
+      answers = asyncio.run(main())
+      elapsed = ____
+
+      sequential = sum(c["latency_ms"] for c in aclient.calls) / 1000 * aclient.time_scale
+      speedup = ____
+      print(f"{len(answers)} answers in {elapsed:.2f} s instead of about {sequential:.2f} s "
+            f"({speedup:.1f}x), max in flight {aclient.max_in_flight}")
+    solution: |
+      async def ask(sem, question):
+          async with sem:
+              r = await aclient.messages.create(model=MODEL, max_tokens=600, system=SYSTEM,
+                                                messages=[{"role": "user", "content": question}])
+              return r.text
+
+      async def main():
+          sem = asyncio.Semaphore(LIMIT)
+          return await asyncio.gather(*(ask(sem, item["question"]) for item in EVAL))
+
+      start = time.perf_counter()
+      answers = asyncio.run(main())
+      elapsed = time.perf_counter() - start
+
+      sequential = sum(c["latency_ms"] for c in aclient.calls) / 1000 * aclient.time_scale
+      speedup = sequential / elapsed
+      print(f"{len(answers)} answers in {elapsed:.2f} s instead of about {sequential:.2f} s "
+            f"({speedup:.1f}x), max in flight {aclient.max_in_flight}")
+    tests: |
+      check_object("answers")
+      assert list(user["answers"]) == list(sol["answers"]), "`answers` should hold the 41 reply texts in EVAL order. `gather` keeps the order of the tasks you pass it."
+      mif = user["aclient"].max_in_flight
+      assert mif <= 6, f"{mif} calls were in flight at once; the limit is 6. Do the call inside `async with sem:`."
+      assert mif >= 4, f"Only {mif} call(s) were ever in flight: the calls ran one after another. Start them all with `asyncio.gather`."
+      check_object("speedup")
+      exp = sum(c["latency_ms"] for c in user["aclient"].calls) / 1000 * user["aclient"].time_scale / user["elapsed"]
+      assert abs(user["speedup"] - exp) < 0.05 * exp, "`speedup` is the sequential time divided by `elapsed`."
+      assert user["speedup"] >= 2.5, f"Speedup is only {user['speedup']:.1f}x. Are the calls really overlapping?"
+    success_msg: |
+      Same answers, same cost, several times faster, and never more than 6 calls in flight. (The speedup is less
+      than 6x because the slowest call in each wave sets the pace.) Concurrency changes wall time only: it does not
+      make any single answer faster.
+
+  - id: sync-async-batch
+    type: classify
+    title: Sequential, concurrent or batch?
+    prompt: Sort each ORBIT job by how its LLM calls should run.
+    hint: Does each call need the previous result? Is a person waiting for the result right now?
+    zones: [Sequential, Concurrent, Batch API]
+    items:
+      - { text: An agent's next tool call depends on the sensor value it just read, zone: Sequential }
+      - { text: Write a follow-up question from the answer to the first one, zone: Sequential }
+      - { text: A status reply that needs three independent sensor summaries, zone: Concurrent }
+      - { text: "The 07:00 briefing: 41 crew questions answered before breakfast", zone: Concurrent }
+      - { text: Split a compound question into two sub-questions and answer both while the crew waits, zone: Concurrent }
+      - { text: Run the LLM judge over 2,000 logged answers overnight, zone: Batch API }
+      - { text: Re-summarise all 200 crew tickets for Friday's weekly report, zone: Batch API }
+      - { text: Translate the handbook before next month's crew rotation, zone: Batch API }
+
+  - id: morning-rush
+    type: sequential
+    title: "Mission: the slow, expensive ORBIT"
+    context: |
+      Two complaints reach you on the same day. The crew: *"ORBIT is slow."* Command: *"ORBIT costs too much."*
+      Targets: **p95 ≤ 1,500 ms**, **cost ≤ 30% of today's**, **accuracy ≥ 90%** on the eval set, and the 41-question
+      morning briefing must run at least **3× faster** than one question at a time. Measure, diagnose, fix, verify.
+    pre_code: |
+      import asyncio, re, time
+      import numpy as np
+      from kits.llmops_production import (make_client, run_eval, summarize, orbit_model, cached_system, AsyncFakeClaude,
+                                          VirtualClock, MODEL, SMALL, SYSTEM, CONCISE, EVAL, grade, PRICES)
+    steps:
+      - instructions:
+          - "Run today's config: `base_df = run_eval(make_client())` and `base = summarize(base_df)`."
+          - "Store `decode_share`: sum of (latency − TTFT) over sum of latency."
+          - "Store `input_cost_share`: the cost of the input tokens (`input_tokens` × the medium input price / 1,000,000, summed) over the total cost."
+        hint: |
+          `(base_df["latency_ms"] - base_df["ttft_ms"]).sum() / base_df["latency_ms"].sum()`, and
+          `(base_df["input_tokens"] * PRICES["medium"]["input"] / 1_000_000).sum() / base_df["cost"].sum()`.
+        sample_code: |
+          base_df = run_eval(make_client())
+          base = summarize(base_df)
+          decode_share = ____
+          input_cost_share = ____
+          print(base)
+          print(f"decode is {decode_share:.0%} of latency; input is {input_cost_share:.0%} of cost")
+        solution: |
+          base_df = run_eval(make_client())
+          base = summarize(base_df)
+          decode_share = (base_df["latency_ms"] - base_df["ttft_ms"]).sum() / base_df["latency_ms"].sum()
+          input_cost_share = (base_df["input_tokens"] * PRICES["medium"]["input"] / 1_000_000).sum() / base_df["cost"].sum()
+          print(base)
+          print(f"decode is {decode_share:.0%} of latency; input is {input_cost_share:.0%} of cost")
+        tests: |
+          check_object("base")
+          check_equal("decode_share", tol=1e-6, msg="`decode_share` is sum(latency_ms - ttft_ms) / sum(latency_ms) over `base_df`.")
+          check_equal("input_cost_share", tol=1e-6, msg="`input_cost_share` is the summed input-token cost (medium prices) divided by the total cost.")
+      - instructions:
+          - "Diagnose: pick the lever that attacks the biggest bucket of each problem. Set `latency_fix` and `cost_fix` to one of `\"streaming\"`, `\"brevity\"`, `\"caching\"`, `\"small_model\"`."
+        hint: |
+          Latency is mostly decode, which grows with output tokens. Cost is mostly the same input prefix sent again
+          and again. Streaming changes neither number.
+        sample_code: |
+          latency_fix = ____
+          cost_fix = ____
+        solution: |
+          latency_fix = "brevity"
+          cost_fix = "caching"
+        tests: |
+          options = {"streaming", "brevity", "caching", "small_model"}
+          check_object("latency_fix")
+          check_object("cost_fix")
+          assert user["latency_fix"] in options and user["cost_fix"] in options, f"Use one of {sorted(options)}."
+          assert user["latency_fix"] == "brevity", "About 80% of latency is decode, so shorter outputs attack it directly. Streaming improves perceived latency but not p95, and a smaller model risks accuracy."
+          assert user["cost_fix"] == "caching", "About 80% of the cost is input tokens, almost all of it the same handbook prefix on every call: that is what prompt caching discounts, with no accuracy risk."
+      - instructions:
+          - "Write `create_kwargs(question)`: it returns the keyword arguments for `messages.create` (model, max_tokens, system, messages) for your fixed config. Use at least your two fixes; routing is optional."
+          - "Run every EVAL question once through a fresh `client = make_client()` with `client.messages.create(**create_kwargs(q))`. Store `fixed`: a dict with `p95_ms` (of the replies' `latency_ms`), `accuracy` and `cost` (`client.total_cost()`)."
+        hint: |
+          `"system": cached_system(SYSTEM + "\n" + CONCISE)` adds the brevity instruction and a cache breakpoint.
+          Collect `r.latency_ms` and `grade(item, r.text)` in the loop.
+        sample_code: |
+          def create_kwargs(question):
+              return {
+                  "model": MODEL,
+                  "max_tokens": 600,
+                  "system": ____,
+                  "messages": [{"role": "user", "content": question}],
+              }
+
+          client = make_client()
+          latencies, correct = [], []
+          for item in EVAL:
+              r = client.messages.create(**create_kwargs(item["question"]))
+              latencies.append(r.latency_ms)
+              correct.append(grade(item, r.text))
+          fixed = {"p95_ms": ____, "accuracy": ____, "cost": ____}
+          print(fixed, f"cost is {fixed['cost'] / base['cost']:.0%} of before")
+        solution: |
+          def create_kwargs(question):
+              return {
+                  "model": MODEL,
+                  "max_tokens": 300,
+                  "system": cached_system(SYSTEM + "\n" + CONCISE),
+                  "messages": [{"role": "user", "content": question}],
+              }
+
+          client = make_client()
+          latencies, correct = [], []
+          for item in EVAL:
+              r = client.messages.create(**create_kwargs(item["question"]))
+              latencies.append(r.latency_ms)
+              correct.append(grade(item, r.text))
+          fixed = {"p95_ms": float(np.percentile(latencies, 95)), "accuracy": float(np.mean(correct)), "cost": client.total_cost()}
+          print(fixed, f"cost is {fixed['cost'] / base['cost']:.0%} of before")
+        tests: |
+          import numpy as np
+          check_object("fixed")
+          calls = [c for c in user["client"].calls if not c["error"]]
+          assert len(calls) >= 41, "Run every EVAL question through `client`."
+          p95 = float(np.percentile([c["latency_ms"] for c in calls], 95))
+          cost = user["client"].total_cost()
+          base_cost = user["base"]["cost"]
+          acc = float(user["fixed"]["accuracy"])
+          assert abs(acc - float(np.mean(user["correct"]))) < 1e-9, "`fixed['accuracy']` should be the mean of `correct`."
+          assert p95 <= 1500, f"p95 is {p95:.0f} ms; the target is 1,500 ms. Ask for brief answers (CONCISE)."
+          assert cost <= 0.30 * base_cost, f"Cost is {cost / base_cost:.0%} of before; the target is 30%. Cache the system prompt."
+          assert acc >= 0.90, f"Accuracy is {acc:.0%}; it must stay at least 90%. Did a cap on max_tokens or the small model hurt it?"
+      - instructions:
+          - "Run the morning briefing concurrently: with `aclient` (created for you) and a semaphore of 8, gather `create_kwargs(q)` calls for all EVAL questions. Store the texts in `briefing` and the wall time in `elapsed`."
+          - "Store `speedup`: the sequential time (sum of `aclient.calls` latencies / 1000 × `aclient.time_scale`) over `elapsed`."
+        hint: |
+          `async with sem: r = await aclient.messages.create(**create_kwargs(q))`. Reuse the gather pattern from
+          the first exercise.
+        sample_code: |
+          aclient = AsyncFakeClaude(orbit_model(), clock=VirtualClock(), time_scale=0.05)
+
+          async def one(sem, q):
+              async with sem:
+                  r = await ____
+                  return r.text
+
+          async def briefing_run():
+              sem = asyncio.Semaphore(8)
+              return await asyncio.gather(*(____ for item in EVAL))
+
+          start = time.perf_counter()
+          briefing = asyncio.run(briefing_run())
+          elapsed = time.perf_counter() - start
+          speedup = ____
+          print(f"{speedup:.1f}x faster, max in flight {aclient.max_in_flight}")
+        solution: |
+          aclient = AsyncFakeClaude(orbit_model(), clock=VirtualClock(), time_scale=0.05)
+
+          async def one(sem, q):
+              async with sem:
+                  r = await aclient.messages.create(**create_kwargs(q))
+                  return r.text
+
+          async def briefing_run():
+              sem = asyncio.Semaphore(8)
+              return await asyncio.gather(*(one(sem, item["question"]) for item in EVAL))
+
+          start = time.perf_counter()
+          briefing = asyncio.run(briefing_run())
+          elapsed = time.perf_counter() - start
+          speedup = sum(c["latency_ms"] for c in aclient.calls) / 1000 * aclient.time_scale / elapsed
+          print(f"{speedup:.1f}x faster, max in flight {aclient.max_in_flight}")
+        tests: |
+          check_object("briefing")
+          b = user["briefing"]
+          EVAL, grade = user["EVAL"], user["grade"]
+          assert len(b) == 41, "`briefing` should hold one answer per EVAL question."
+          acc = sum(grade(i, t) for i, t in zip(EVAL, b)) / 41
+          assert acc >= 0.9, f"Briefing accuracy is {acc:.0%}: keep the answers in EVAL order and use `create_kwargs`."
+          mif = user["aclient"].max_in_flight
+          assert 4 <= mif <= 8, f"Max in flight was {mif}; it should be up to 8 (the semaphore) and the calls should overlap."
+          exp = sum(c["latency_ms"] for c in user["aclient"].calls) / 1000 * user["aclient"].time_scale / user["elapsed"]
+          assert abs(user["speedup"] - exp) < 0.05 * exp, "`speedup` is the sequential time over `elapsed`."
+          assert user["speedup"] >= 3, f"Speedup is {user['speedup']:.1f}x; it should be at least 3x."
+    success_msg: |
+      Symptom → measure → diagnose → fix → verify, twice over. Latency and cost had **different** causes (decode vs
+      repeated input), so they needed different levers, and the eval set proved accuracy held. Concurrency then made
+      the batch of questions fast as a whole. Keep the before/after table: it is your change report.

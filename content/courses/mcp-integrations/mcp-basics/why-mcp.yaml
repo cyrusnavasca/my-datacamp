@@ -1,0 +1,211 @@
+title: Why MCP
+description: The N×M integration problem, and how hosts, clients and servers split the work.
+exercises:
+  - id: why-slides
+    type: video
+    title: From N×M glue code to one protocol
+    slides: |
+      # Three apps, four systems
+
+      Helios-7 now has three AI apps that need station data:
+
+      - **ORBIT**, the crew chat assistant
+      - **Claude Code**, which the engineers use to work on station software
+      - a **mission-control dashboard** agent on the ground
+
+      Each wants the sensors, the crew roster, the handbook and the booking system.
+      Without a shared protocol, every app writes its own adapter for every system:
+
+      | | without a standard | with MCP |
+      | --- | --- | --- |
+      | adapters to write | apps × systems = 3 × 4 = **12** | apps + systems = 3 + 4 = **7** |
+      | add a 5th system | 3 new adapters | 1 new server |
+      | fix a bug in the sensor adapter | fix it 3 times | fix it once |
+
+      The **Model Context Protocol (MCP)** is that shared protocol. A system is wrapped once as an
+      MCP **server**; any MCP-speaking app can use it. Language servers (LSP) did the same for editors
+      and programming languages.
+
+      ---
+
+      ## Hosts, clients and servers
+
+      ```
+       ┌──────────── host: ORBIT chat app ─────────────┐
+       │  model loop · conversation · permissions       │
+       │   ┌─ client ─┐   ┌─ client ─┐   ┌─ client ─┐   │
+       └───┤          ├───┤          ├───┤          ├───┘
+           └────┬─────┘   └────┬─────┘   └────┬─────┘
+          helios-sensors   helios-crew     helios-ops      ← servers
+      ```
+
+      - **Host**: the app the person uses. It runs the model, owns the conversation and decides what
+        the model may do (which servers, which tools, when to ask the user).
+      - **Client**: a connection *inside* the host. **One client per server**. It speaks the protocol:
+        handshake, discovery, calls.
+      - **Server**: a program that exposes capabilities. It can be a local process the host starts, or a
+        remote service.
+
+      The model never speaks MCP. The **host** turns what servers offer into tool definitions for the
+      model, and turns the model's tool calls back into MCP requests.
+
+      ---
+
+      ## One round trip, step by step
+
+      1. The host starts a client per configured server and **connects**.
+      2. **Handshake**: client and server agree on a protocol version and on which features each supports.
+      3. **Discovery**: the client asks for the server's tools (`tools/list`). Nothing is hard-coded.
+      4. The host gives those tool definitions to the model with the user's message.
+      5. The model replies with a `tool_use` block. The host finds which client owns that tool and
+         sends `tools/call`.
+      6. The result goes back to the model as a `tool_result`, and the loop continues.
+
+      Step 3 is what makes N + M work: a host learns what a new server can do **at runtime**.
+
+      ---
+
+      ## What a server looks like with the official SDK
+
+      ```python
+      # helios_sensors.py  (official Python SDK: pip install mcp)
+      from mcp.server.fastmcp import FastMCP
+
+      mcp = FastMCP("helios-sensors")
+
+      @mcp.tool()
+      def get_sensor(module: str, metric: str) -> str:
+          """Read one environment sensor in a station module."""
+          return read_from_station_bus(module, metric)
+
+      if __name__ == "__main__":
+          mcp.run()          # stdio transport by default
+      ```
+
+      Registering it with a host is configuration, not code: Claude Desktop reads
+      `{"mcpServers": {"helios-sensors": {"command": "python", "args": ["helios_sensors.py"]}}}`, and in
+      Claude Code it's `claude mcp add helios-sensors -- python helios_sensors.py`.
+
+      This course has no SDK installed. You'll build the messages and the server by hand, so that when
+      you use FastMCP you know exactly what it's doing for you.
+
+      ---
+
+      ## Is MCP worth it here?
+
+      | | in-process tool (a function in your app) | local MCP server (stdio) | remote MCP server (HTTP) |
+      | --- | --- | --- | --- |
+      | setup | lowest | a process to launch | a service to deploy, auth to set up |
+      | latency per call | microseconds | ~1 ms (pipe) | network round trip |
+      | reuse across hosts | none | any host on that machine | any host anywhere |
+      | isolation | none: shares your process | own process, your user's permissions | separate machine |
+      | who maintains it | you | whoever ships the server | whoever runs the service |
+      | new failure modes | few | process crashes, bad output | network, sessions, auth |
+
+      **Rule of thumb:** one app, one simple capability, tight latency → a plain function tool.
+      Several hosts, a capability someone else maintains, or a system you want isolated → MCP.
+
+  - id: discover-tools
+    type: coding
+    title: Discover tools instead of hard-coding them
+    context: |
+      Three Helios servers are running: `servers` maps each server name to a server object.
+      `MCPClient(server)` opens one client connection; `.initialize()` does the handshake,
+      `.list_tools()` returns the server's tool definitions (dicts with a `"name"`) and
+      `.call_tool(name, arguments)` runs one. Build ORBIT's tool registry by discovery.
+    instructions:
+      - "For each `name, server` in `servers.items()`, create an `MCPClient(server)`, call `.initialize()` on it and store it in `clients[name]`."
+      - "Build `registry`: a dict mapping every discovered tool name to the name of the server that offers it."
+      - "Write `call(tool_name, arguments)`: look up the server in `registry` and return `clients[...].call_tool(tool_name, arguments)`."
+      - "Store `reading = call(\"get_sensor\", {\"module\": \"C\", \"metric\": \"humidity\"})` and print it."
+    hint: |
+      Inside the loop: `for tool in clients[name].list_tools(): registry[tool["name"]] = name`.
+      In `call`: `server_name = registry[tool_name]`.
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import MCPClient, sensor_server, crew_server, ops_server
+      station = aikit.helios.Station()
+      servers = {
+          "helios-sensors": sensor_server(station),
+          "helios-crew": crew_server(station),
+          "helios-ops": ops_server(station),
+      }
+    sample_code: |
+      clients = {}
+      registry = {}
+      for name, server in servers.items():
+          clients[name] = ____
+          clients[name].initialize()
+          for tool in clients[name].list_tools():
+              ____
+
+      def call(tool_name, arguments):
+          server_name = ____
+          return ____
+
+      reading = call("get_sensor", {"module": "C", "metric": "humidity"})
+      print(reading)
+    solution: |
+      clients = {}
+      registry = {}
+      for name, server in servers.items():
+          clients[name] = MCPClient(server)
+          clients[name].initialize()
+          for tool in clients[name].list_tools():
+              registry[tool["name"]] = name
+
+      def call(tool_name, arguments):
+          server_name = registry[tool_name]
+          return clients[server_name].call_tool(tool_name, arguments)
+
+      reading = call("get_sensor", {"module": "C", "metric": "humidity"})
+      print(reading)
+    tests: |
+      check_object("clients")
+      assert set(user["clients"]) == set(user["servers"]), "`clients` should have one entry per server name in `servers`."
+      assert all(c.server_capabilities is not None for c in user["clients"].values()), "Call `.initialize()` on every client before using it: that's the handshake."
+      check_equal("registry", msg="`registry` should map each tool name (get_sensor, crew_roster, send_message, book_module, open_airlock) to its server's name.")
+      check_object("reading")
+      r = user["reading"]
+      assert isinstance(r, dict) and "68" in r["content"][0]["text"], "`reading` should be the result of calling get_sensor for module C humidity through `call`."
+      roster = user["call"]("crew_roster", {})
+      assert "Amara Okafor" in roster["content"][0]["text"], "`call` should route any discovered tool, e.g. `call('crew_roster', {})`, to the server that offers it."
+    success_msg: |
+      ORBIT now knows five tools without a line of tool-specific code. Add a fourth server tomorrow and the
+      registry picks it up on the next connection. That's the "+ M" in N + M.
+
+  - id: roles
+    type: classify
+    title: Host, client or server?
+    prompt: Sort each piece of the Helios setup by the role it plays in MCP.
+    hint: The host is the app with the model and the user. A client is one connection inside it. A server exposes capabilities.
+    zones: [Host, Client, Server]
+    items:
+      - { text: "Claude Desktop, where a crew member types questions", zone: Host }
+      - { text: "ORBIT's chat app, which runs the model loop and asks before risky actions", zone: Host }
+      - { text: "Claude Code running in an engineer's terminal", zone: Host }
+      - { text: "The connection object inside ORBIT that talks only to helios-sensors", zone: Client }
+      - { text: "One of the three connections Claude Code opens, one per configured server", zone: Client }
+      - { text: "The code that sends initialize, then tools/call, over a single connection", zone: Client }
+      - { text: "helios-sensors, a Python process exposing get_sensor", zone: Server }
+      - { text: "A GitHub integration exposing issues and pull requests as tools", zone: Server }
+      - { text: "A remote service at an https URL that serves the station handbook", zone: Server }
+
+  - id: when-mcp
+    type: mc
+    title: Function tool or MCP server?
+    question: |
+      ORBIT needs a new `water_level` reading. Only ORBIT will ever use it, the code is ten lines that
+      read a value ORBIT's process already has in memory, and the crew wants answers to feel instant.
+      What's the best way to give the model this capability?
+    options:
+      - text: A plain function tool inside ORBIT, passed to the model with the other tools
+        correct: true
+        feedback: Right. One host, trivial code, data already in-process. An MCP server would add a process, a handshake and a protocol hop for no reuse. Revisit if a second host ever needs it.
+      - text: A local MCP server over stdio
+        feedback: It would work, but you pay for a separate process, a handshake and serialisation, and get reuse you don't need. MCP wins when several hosts share a capability or someone else maintains it.
+      - text: A remote MCP server over Streamable HTTP
+        feedback: This adds a network round trip, sessions and authentication, which goes against "feel instant", for a value that already lives in ORBIT's memory.
+      - text: Fine-tune ORBIT so it knows the water level
+        feedback: A water level changes every minute. Fine-tuning bakes in facts at training time; live readings have to come from a tool call.
+    hint: Check the trade-off table on the last slide. How many hosts need this, and where does the data live?

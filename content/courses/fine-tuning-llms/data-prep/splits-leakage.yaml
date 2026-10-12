@@ -1,0 +1,210 @@
+title: Splits that don't leak
+description: "Troubleshoot a validation score that is too good: measure exact and near-duplicate leakage, fix the split, verify, and choose the split that answers your question."
+exercises:
+  - id: intro
+    type: video
+    title: "Symptom: validation says 100%"
+    slides: |
+      # Too good to be true
+
+      You fine-tune the triager on a random 70/30 split of the 200 crew tickets.
+
+      | set | accuracy |
+      | --- | --- |
+      | validation (random 30%) | **1.00** |
+      | 40 tickets from the next crew rotation | 0.90 |
+
+      A validation score is only worth something if validation tickets are **new to the model**. Two
+      things break that:
+
+      - **Exact duplicates**: the export repeats tickets (you saw 82 last lesson). A random split puts
+        copies on both sides.
+      - **Near duplicates**: templated text ("The **fan** display in Module **F** froze again" /
+        "The **pump** display in Module **F** froze again") differs by a word or two.
+
+      Either way, validation measures **memory**, not generalisation.
+
+      ---
+
+      ## Measure the overlap
+
+      ```python
+      def leak_rate(train_texts, val_texts):
+          seen = {normalize(t) for t in train_texts}
+          return sum(normalize(v) in seen for v in val_texts) / len(val_texts)
+
+      def jaccard(a, b):                       # word-set overlap, 0..1
+          x, y = set(a.lower().split()), set(b.lower().split())
+          return len(x & y) / len(x | y)
+
+      near_dup_rate = sum(max(jaccard(v, t) for t in train_texts) >= 0.6
+                          for v in val_texts) / len(val_texts)
+      ```
+
+      Run both on every split you make. Anything above zero means some of your score is memory.
+
+      ---
+
+      ## Why it matters more when you fine-tune
+
+      Validation isn't just the number you report. It also **drives decisions**:
+
+      - **Early stopping** picks the epoch with the best validation loss. If validation is made of
+        copies of training data, its loss keeps falling as the model memorises, so overfitting stays
+        hidden and you train too long.
+      - **The release gate** compares validation scores. A leaked score can push a weaker candidate past the gate.
+      - **Hyperparameter search** (rank, learning rate) quietly chooses whatever memorises best.
+
+      ---
+
+      ## The fixes and what each one measures
+
+      | split | how | answers the question | watch out for |
+      | --- | --- | --- | --- |
+      | Random | shuffle rows | none, if there are duplicates | leaks copies |
+      | Dedupe, then random | drop normalised duplicates first | "new tickets that look like old ones" | near duplicates still leak |
+      | Group split | keep each near-duplicate cluster (template, user, session) on one side | "brand-new *kinds* of request" | pessimistic if production repeats old kinds |
+      | Time split | train on older data, validate on the newest | "next month's traffic" | needs timestamps; drift makes it noisy |
+
+      **Always dedupe before you split.** Then pick the split that matches the question you are asking.
+
+      ---
+
+      ## Verify, and report the noise
+
+      - Verify that `leak_rate` and `near_dup_rate` are 0 for the new split.
+      - Small validation sets are noisy. With $n$ examples and accuracy $p$, one standard error is
+        $\sqrt{p(1-p)/n}$: with 40 tickets at 80%, that is about ±6 points. Report an interval, not just a point.
+      - Freeze the final test set. Every time you look at it to make a choice, it becomes a little more training data.
+
+  - id: measure-leak
+    type: coding
+    title: Measure the leak
+    context: |
+      `train` and `val` are a random 70/30 split of the 200 crew tickets (`text`, `category`). `fresh` holds
+      40 tickets from the next crew rotation. `normalize(text)`, `jaccard(a, b)` and `triage_pipeline()`
+      (a fresh TF-IDF + logistic regression classifier) are loaded.
+    instructions:
+      - "Store the share of `val` texts whose `normalize(text)` also appears among the normalised `train` texts in `leak_rate`."
+      - "Store the share of `val` texts whose **highest** `jaccard` with any `train` text is at least 0.6 in `near_dup_rate`."
+      - "Fit `model = triage_pipeline().fit(train.text, train.category)`, then store its accuracy on `val` in `val_acc` and on `fresh` in `fresh_acc`."
+    hint: "`seen = {normalize(t) for t in train.text}`. For the near-duplicate rate: `max(jaccard(v, t) for t in train.text) >= 0.6` per validation text. Accuracy is `(model.predict(X) == y).mean()`."
+    pre_code: |
+      import aikit
+      from sklearn.model_selection import train_test_split
+      from kits.fine_tuning_llms import normalize, jaccard, triage_pipeline, fresh_tickets
+      train, val = train_test_split(aikit.helios.tickets(), test_size=0.3, random_state=0)
+      fresh = fresh_tickets()
+    sample_code: |
+      seen = {normalize(t) for t in train.text}
+      leak_rate = sum(____ for v in val.text) / len(val)
+      near_dup_rate = sum(____ for v in val.text) / len(val)
+
+      model = triage_pipeline().fit(train.text, train.category)
+      val_acc = ____
+      fresh_acc = ____
+      print(f"leak {leak_rate:.2f}, near-dup {near_dup_rate:.2f}, val acc {val_acc:.2f}, fresh acc {fresh_acc:.2f}")
+    solution: |
+      seen = {normalize(t) for t in train.text}
+      leak_rate = sum(normalize(v) in seen for v in val.text) / len(val)
+      near_dup_rate = sum(max(jaccard(v, t) for t in train.text) >= 0.6 for v in val.text) / len(val)
+
+      model = triage_pipeline().fit(train.text, train.category)
+      val_acc = (model.predict(val.text) == val.category).mean()
+      fresh_acc = (model.predict(fresh.text) == fresh.category).mean()
+      print(f"leak {leak_rate:.2f}, near-dup {near_dup_rate:.2f}, val acc {val_acc:.2f}, fresh acc {fresh_acc:.2f}")
+    tests: |
+      check_equal("leak_rate", msg="`leak_rate` is the share of `val` texts whose `normalize(text)` is in the set of normalised `train` texts (about 0.57).")
+      check_equal("near_dup_rate", msg="`near_dup_rate` is the share of `val` texts whose best `jaccard` against all of `train.text` is >= 0.6.")
+      check_equal("val_acc", msg="`val_acc` is the model's accuracy on `val`.")
+      check_equal("fresh_acc", msg="`fresh_acc` is the model's accuracy on `fresh`.")
+    success_msg: "57% of validation tickets are exact copies of training tickets and every one has a near twin. Validation reports 1.00 while new tickets score 0.90. The validation number is measuring memory."
+
+  - id: fix-the-split
+    type: coding
+    title: Fix the split and verify
+    context: |
+      Same tickets in `df`. Now dedupe first, then split by near-duplicate group so no cluster sits on
+      both sides. `near_dup_groups(texts)` gives a group id per text (texts linked by Jaccard ≥ 0.6
+      share a group), and `leak_rate(train_texts, val_texts)` and `near_dup_rate(...)` are loaded,
+      along with `normalize`, `triage_pipeline`, `fresh` and sklearn's `GroupShuffleSplit`.
+    instructions:
+      - "Store `df` without duplicate normalised texts in `dedup` (keep the first of each), with a fresh 0..n-1 index."
+      - "Store `near_dup_groups(dedup.text)` in `groups`, then split `dedup` with `GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=0)` into `train2` and `val2`."
+      - "**Verify**: store `leak_rate(...)` and `near_dup_rate(...)` for the new split in `leak2` and `near2`. Both must be 0."
+      - "Fit a new `triage_pipeline()` on `train2` and store its accuracy on `val2` in `val2_acc` and on `fresh` in `fresh2_acc`."
+    hint: "`dedup = df[~df.text.map(normalize).duplicated()].reset_index(drop=True)`. `idx_train, idx_val = next(splitter.split(dedup, groups=groups))`, then `dedup.iloc[idx_train]`."
+    pre_code: |
+      import aikit
+      from sklearn.model_selection import GroupShuffleSplit
+      from kits.fine_tuning_llms import normalize, near_dup_groups, leak_rate, near_dup_rate, triage_pipeline, fresh_tickets
+      df = aikit.helios.tickets()
+      fresh = fresh_tickets()
+    sample_code: |
+      dedup = ____
+      groups = near_dup_groups(dedup.text)
+      splitter = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=0)
+      idx_train, idx_val = next(splitter.split(dedup, groups=____))
+      train2, val2 = ____, ____
+
+      leak2 = ____
+      near2 = ____
+
+      model = triage_pipeline().fit(train2.text, train2.category)
+      val2_acc = ____
+      fresh2_acc = ____
+      print(f"{len(train2)} train / {len(val2)} val; leak {leak2:.2f}, near-dup {near2:.2f}")
+      print(f"val acc {val2_acc:.2f}, fresh acc {fresh2_acc:.2f}")
+    solution: |
+      dedup = df[~df.text.map(normalize).duplicated()].reset_index(drop=True)
+      groups = near_dup_groups(dedup.text)
+      splitter = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=0)
+      idx_train, idx_val = next(splitter.split(dedup, groups=groups))
+      train2, val2 = dedup.iloc[idx_train], dedup.iloc[idx_val]
+
+      leak2 = leak_rate(train2.text, val2.text)
+      near2 = near_dup_rate(train2.text, val2.text)
+
+      model = triage_pipeline().fit(train2.text, train2.category)
+      val2_acc = (model.predict(val2.text) == val2.category).mean()
+      fresh2_acc = (model.predict(fresh.text) == fresh.category).mean()
+      print(f"{len(train2)} train / {len(val2)} val; leak {leak2:.2f}, near-dup {near2:.2f}")
+      print(f"val acc {val2_acc:.2f}, fresh acc {fresh2_acc:.2f}")
+    tests: |
+      from kits.fine_tuning_llms import leak_rate, near_dup_rate, normalize
+      d = check_object("dedup")
+      assert len(d) == len(sol["dedup"]), f"`dedup` should have {len(sol['dedup'])} rows (one per distinct normalised text); it has {len(d)}."
+      assert not d.text.map(normalize).duplicated().any(), "`dedup` still contains duplicate normalised texts."
+      t2, v2 = check_object("train2"), check_object("val2")
+      assert len(t2) + len(v2) == len(d), "`train2` and `val2` together should contain every row of `dedup`."
+      real_leak, real_near = leak_rate(t2.text, v2.text), near_dup_rate(t2.text, v2.text)
+      assert real_leak == 0, f"Your split still leaks: {real_leak:.0%} of `val2` texts appear in `train2`. Dedupe before splitting."
+      assert real_near == 0, f"{real_near:.0%} of `val2` texts have a near twin in `train2`. Pass `groups=groups` to the splitter so each cluster stays on one side."
+      assert check_object("leak2") == 0 and check_object("near2") == 0, "Store the verified rates for the new split in `leak2` and `near2`."
+      check_equal("val2_acc", msg="`val2_acc` is the accuracy of a model fitted on `train2`, measured on `val2`.")
+      check_equal("fresh2_acc", msg="`fresh2_acc` is the same model's accuracy on `fresh`.")
+    success_msg: "Leak and near-duplicates are both 0: the split is clean. Now validation says 0.41 while fresh tickets score 0.65. A group split holds out whole kinds of request, which is a harder question than next month's traffic asks. Clean is necessary, but you still have to choose the right question."
+
+  - id: which-number
+    type: mc
+    title: Which number goes in the release gate?
+    context: |
+      | split | leak | near-dup | validation acc |
+      | --- | --- | --- | --- |
+      | random | 0.57 | 1.00 | 1.00 |
+      | dedupe, then random | 0.00 | 0.94 | 0.97 |
+      | dedupe, then group split | 0.00 | 0.00 | 0.41 |
+
+      The triager will be judged on tickets from the next crew rotations. Each ticket has a timestamp.
+    question: Which evaluation should the release gate use?
+    options:
+      - text: The random split, because it uses the most data.
+        feedback: "Its 1.00 comes from copies: 57% of the validation tickets are in the training set. It can't tell a model that generalises from one that memorises."
+      - text: The dedupe-then-random split, because it has no exact leaks.
+        feedback: "Better, but 94% of its validation tickets still have a near twin in training, so it mostly tests template recall. It will overstate how well the model handles new phrasings."
+      - text: The group split, because it is the strictest.
+        feedback: "Strictest isn't the same as right. It holds out entire kinds of request, but next month's crew will mostly ask the same kinds of thing in new words. It understates real accuracy and makes model comparisons noisy (29 tickets)."
+      - text: A time split, deduplicated against training, holding out the most recent tickets, and topped up with new samples each rotation.
+        correct: true
+        feedback: "Right. The question is 'how will it do on future tickets?', and the closest evidence is the most recent real tickets, kept separate from training and refreshed as new crews arrive. Dedupe it against training, and report it with an interval because it is small."
+    hint: Pick the split that asks the same question production will ask.

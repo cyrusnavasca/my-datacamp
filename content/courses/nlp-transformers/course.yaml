@@ -1,0 +1,47 @@
+title: NLP and Transformers
+description: 'How modern language models work: tokenisation, embeddings, attention and the transformer,
+  plus using pretrained models with Hugging Face.'
+level: intermediate
+est_hours: 5
+prerequisites:
+- deep-learning-pytorch
+objectives:
+- Explain tokenisation and embeddings
+- Implement scaled dot-product attention
+- Describe the transformer architecture
+- Use pretrained models for classification and generation
+requires:
+- torch
+- transformers
+chapters:
+- id: text-basics
+  title: Text as data
+  description: Tokenisation, vocabularies and bag-of-words.
+  lessons:
+  - tokenisation
+  - bpe
+  - bag-of-words
+  - unseen-words
+- id: embeddings
+  title: Word embeddings
+  description: Dense vectors, similarity and analogies.
+  lessons:
+  - dense-vectors
+  - learned-embeddings
+  - analogies
+- id: attention
+  title: Attention and transformers
+  description: Self-attention, multi-head attention and positional encodings.
+  lessons:
+  - attention-from-scratch
+  - causal-masking
+  - multi-head-positional
+  - transformer-block
+- id: pretrained
+  title: Pretrained models
+  description: Pipelines, fine-tuning basics and model cards.
+  lessons:
+  - pipelines
+  - generation-sampling
+  - fixing-generation
+  - model-cards

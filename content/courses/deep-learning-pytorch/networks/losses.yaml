@@ -1,0 +1,294 @@
+title: Losses, logits and sanity checks
+description: Match the loss to the task, compute cross-entropy by hand, keep softmax numerically stable, and sanity-check a fresh model's loss.
+exercises:
+  - id: intro
+    type: video
+    title: From logits to a loss
+    slides: |
+      # Logits, probabilities and cross-entropy
+
+      A classifier's last layer outputs one raw score per class: the **logits**, any real numbers.
+      Softmax turns them into probabilities, and cross-entropy scores the probability given to the
+      right class:
+
+      $$p_k = \frac{e^{z_k}}{\sum_j e^{z_j}} \qquad \text{loss} = -\log p_{\text{target}}$$
+
+      | probability on the right class | loss |
+      | --- | --- |
+      | 0.99 | 0.01 |
+      | 0.50 | 0.69 |
+      | 0.10 | 2.30 |
+      | 0.001 | 6.91 |
+
+      Confidently wrong answers are punished hard. A model that knows nothing gives every class
+      $1/C$, so its loss is $\ln C$: **2.30 for 10 classes**. That is your first sanity check.
+
+      ---
+
+      ## Underneath: log-softmax and the max trick
+
+      Computing `exp` then `log` is slow and fragile: $e^{1000}$ is `inf` in float32, and
+      `inf / inf` is `nan`. Rewrite with logs:
+
+      $$\log p_k = z_k - \log \sum_j e^{z_j} \qquad \log \sum_j e^{z_j} = m + \log \sum_j e^{z_j - m},\; m = \max_j z_j$$
+
+      Subtracting the max changes nothing mathematically (it cancels) but keeps every exponent at
+      or below 0, so nothing overflows. That is `torch.logsumexp`, `F.log_softmax`, and the inside
+      of `F.cross_entropy`, which is why it takes **logits**, never probabilities.
+
+      ```python
+      log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+      loss = -log_probs[torch.arange(len(y)), y].mean()     # == F.cross_entropy(logits, y)
+      ```
+
+      ---
+
+      ## Choosing a loss
+
+      | task | last layer | loss | target dtype and shape |
+      | --- | --- | --- | --- |
+      | regression | `out` numbers, no activation | `nn.MSELoss` (or Huber, L1) | float, same shape as output |
+      | binary classification | 1 logit | `nn.BCEWithLogitsLoss` | float 0/1, shape `(N, 1)` |
+      | multi-class (one label) | C logits | `nn.CrossEntropyLoss` | int64 class index, shape `(N,)` |
+      | multi-label (any number of labels) | C logits | `nn.BCEWithLogitsLoss` | float 0/1, shape `(N, C)` |
+
+      **MSE vs Huber vs L1 for regression:** MSE squares errors, so one outlier can dominate the
+      gradient. L1 is robust to outliers but has a constant gradient that makes the last bit of
+      fitting slow. Huber is MSE near zero and L1 far away: pick it when the targets have outliers.
+
+      ---
+
+      ## Playbook: loss problems at a glance
+
+      | symptom | measure | usual cause | fix |
+      | --- | --- | --- | --- |
+      | initial loss far above $\ln C$ | loss and logit std on one batch before training | weights too large: overconfident at init | default init, or scale down the last layer |
+      | loss is `nan` / `inf` | `torch.isnan(x).any()` after each step of the forward pass | hand-written `exp`/`log` overflow, `log(0)` | `F.log_softmax`, `F.cross_entropy`, `BCEWithLogitsLoss` |
+      | loss never gets near 0, gradients weak | loss on a batch the model gets right | softmax applied before `CrossEntropyLoss` (softmax twice) | return raw logits |
+      | `expected scalar type Long` | `y.dtype` | class targets stored as float | `y.long()` |
+      | `0D or 1D target tensor expected` | `y.shape` | targets shaped `(N, 1)` | `y.squeeze(1)` |
+
+  - id: task-to-loss
+    type: classify
+    title: Which loss for which task?
+    prompt: Sort each task under the loss you would train it with.
+    hint: One number to predict? MSE. Exactly one class out of several? Cross-entropy. Independent yes/no answers, one or many? BCE with logits.
+    zones: [MSELoss, CrossEntropyLoss, BCEWithLogitsLoss]
+    items:
+      - { text: "Predict tomorrow's electricity demand in MWh", zone: MSELoss }
+      - { text: "Estimate a flat's sale price", zone: MSELoss }
+      - { text: "Predict a delivery's arrival time in minutes", zone: MSELoss }
+      - { text: "Recognise which of 10 digits is in an image", zone: CrossEntropyLoss }
+      - { text: "Pick the next token from a 50,000-word vocabulary", zone: CrossEntropyLoss }
+      - { text: "Label a review positive, neutral or negative", zone: CrossEntropyLoss }
+      - { text: "Decide whether an email is spam", zone: BCEWithLogitsLoss }
+      - { text: "Tag a photo with every object in it (dog, car, tree, ...)", zone: BCEWithLogitsLoss }
+      - { text: "Predict whether a customer cancels this month", zone: BCEWithLogitsLoss }
+
+  - id: cross-entropy-by-hand
+    type: coding
+    title: Cross-entropy by hand
+    context: |
+      `logits` holds raw scores for 6 examples and 4 classes, and `targets` holds the right class
+      of each example. Compute the cross-entropy loss yourself with the log-sum-exp form, then
+      check it against PyTorch.
+    instructions:
+      - "Store the log-probabilities `logits - torch.logsumexp(logits, dim=1, keepdim=True)` in `log_probs`."
+      - "Store the log-probability of each example's target class in `picked` (shape `(6,)`)."
+      - "Store the loss, minus the mean of `picked`, in `my_loss`, and `F.cross_entropy(logits, targets)` in `torch_loss`. Print both."
+    hint: "Pick one entry per row with `log_probs[torch.arange(6), targets]` (or `log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)`)."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      logits = torch.randn(6, 4) * 2
+      targets = torch.randint(0, 4, (6,))
+    sample_code: |
+      log_probs = ____
+      picked = ____
+      my_loss = ____
+      torch_loss = F.cross_entropy(logits, targets)
+      print(my_loss, torch_loss)
+    solution: |
+      log_probs = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+      picked = log_probs[torch.arange(6), targets]
+      my_loss = -picked.mean()
+      torch_loss = F.cross_entropy(logits, targets)
+      print(my_loss, torch_loss)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "log_probs", msg="`log_probs` should be `logits - torch.logsumexp(logits, dim=1, keepdim=True)`, shape `(6, 4)`.")
+      check_tensor(user, sol, "picked", msg="`picked` should hold, for each row, the log-probability at the target's column: `log_probs[torch.arange(6), targets]`.")
+      check_tensor(user, sol, "my_loss", msg="`my_loss` should be `-picked.mean()`.")
+      check_tensor(user, sol, "torch_loss")
+    success_msg: Same number. `F.cross_entropy` is log-softmax plus picking the target, fused and stable.
+
+  - id: stable-softmax
+    type: coding
+    title: "Fix it: softmax that returns nan"
+    context: |
+      A colleague's hand-written softmax works in tests but returns `nan` in production, where some
+      logits are in the thousands. `logits` holds three rows: one with huge values, one ordinary,
+      one with huge negative values.
+    instructions:
+      - "Measure: store the number of `nan` values in `naive_softmax(logits)` in `n_nan` (an int)."
+      - "Fix: write `stable_softmax(z)` that subtracts each row's max before `exp`, then normalises each row."
+      - "Verify: store `stable_softmax(logits)` in `probs` and print it with its row sums."
+    hint: |
+      `torch.isnan(t).sum().item()` counts nans. Row max with broadcasting:
+      `z - z.max(dim=1, keepdim=True).values`.
+    pre_code: |
+      import torch
+      logits = torch.tensor([[1000.0, 999.0, 990.0],
+                             [5.0, 1.0, -2.0],
+                             [-1000.0, -1001.0, -1003.0]])
+
+      def naive_softmax(z):
+          e = torch.exp(z)
+          return e / e.sum(dim=1, keepdim=True)
+    sample_code: |
+      n_nan = ____
+
+      def stable_softmax(z):
+          shifted = ____
+          e = torch.exp(shifted)
+          return e / e.sum(dim=1, keepdim=True)
+
+      probs = stable_softmax(logits)
+      print(probs)
+      print(probs.sum(dim=1))
+    solution: |
+      n_nan = torch.isnan(naive_softmax(logits)).sum().item()
+
+      def stable_softmax(z):
+          shifted = z - z.max(dim=1, keepdim=True).values
+          e = torch.exp(shifted)
+          return e / e.sum(dim=1, keepdim=True)
+
+      probs = stable_softmax(logits)
+      print(probs)
+      print(probs.sum(dim=1))
+    tests: |
+      import torch
+      from kits.deep_learning_pytorch import check_tensor
+      check_equal("n_nan", 6, msg="`n_nan` should count the nans in `naive_softmax(logits)`: `torch.isnan(...).sum().item()`.")
+      check_object("probs")
+      assert torch.isfinite(user["probs"]).all(), "`probs` still contains nan or inf. Subtract each row's max before `torch.exp`."
+      check_tensor(user, sol, "probs", expected=torch.softmax(sol["logits"], dim=1), msg="`probs` should match `torch.softmax(logits, dim=1)`; each row must sum to 1.")
+      z = torch.randn(5, 7) * 300
+      out = user["stable_softmax"](z)
+      assert torch.allclose(out, torch.softmax(z, dim=1), atol=1e-5), "`stable_softmax` should work on any 2-D batch of logits, row by row."
+    success_msg: Subtracting the max is free and makes softmax safe for any input. In practice, call `F.log_softmax` or `F.cross_entropy` and let PyTorch do it.
+
+  - id: double-softmax
+    type: mc
+    title: Predict the loss of a double softmax
+    question: |
+      A model ends with `nn.Softmax(dim=1)`, and its output goes into `F.cross_entropy`. For one
+      example the model is perfectly confident and correct: it outputs probability 1.0 on class 3
+      out of 10. What loss does `F.cross_entropy` report?
+    context: The console has `probs` (that output) and `target` ready. Predict, then run `F.cross_entropy(probs, target)`.
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      probs = torch.zeros(1, 10)
+      probs[0, 3] = 1.0
+      target = torch.tensor([3])
+    options:
+      - text: "About 0, because the prediction is perfect"
+        feedback: "`F.cross_entropy` treats its input as logits and applies softmax again. A 'logit' of 1 against nine 0s only gets $e/(e+9) \\approx 0.23$ probability."
+      - text: "About 1.46, and it can never get close to 0"
+        correct: true
+        feedback: "Right: $-\\ln\\frac{e}{e + 9} \\approx 1.46$. Because the inputs are squeezed into [0, 1], the loss has a floor and the gradients are weak. Remove the softmax and return raw logits."
+      - text: "About 2.30, the same as random guessing"
+        feedback: "Close in spirit, but not quite: the right class gets a slightly bigger 'logit' (1 vs 0), so the loss is a bit below $\\ln 10$. Run it in the console."
+      - text: "`nan`, because log(0) appears"
+        feedback: "No log of zero happens: softmax of [0, ..., 1, ..., 0] is strictly positive everywhere."
+    hint: "`F.cross_entropy` always applies softmax to what you give it."
+
+  - id: initial-loss-check
+    type: sequential
+    title: "Chapter boss: sanity-check a classifier before training"
+    context: |
+      Before spending hours training, check a fresh model's loss: it should be close to $\ln C$.
+      `X` is a batch of 128 examples with 20 features, `y` holds labels from 10 classes, and
+      `bad` is a colleague's network (`Linear(20, 64)`, `ReLU`, `Linear(64, 10)`) whose
+      first epoch "always looks weird".
+    pre_code: |
+      import math
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.randn(128, 20)
+      y = torch.randint(0, 10, (128,))
+      torch.manual_seed(1)
+      bad = nn.Sequential(nn.Linear(20, 64), nn.ReLU(), nn.Linear(64, 10))
+      with torch.no_grad():
+          bad[2].weight.mul_(40)
+    steps:
+      - instructions:
+          - Build `model`, a fresh `nn.Sequential` that maps 20 features through a hidden layer of 64 ReLU units to 10 logits.
+          - Store `math.log(10)` in `expected` and the model's cross-entropy on `X`, `y` as a float in `start_loss`. Print both.
+        hint: "`nn.Sequential(nn.Linear(20, 64), nn.ReLU(), nn.Linear(64, 10))`, then `F.cross_entropy(model(X), y).item()`."
+        sample_code: |
+          model = ____
+          expected = math.log(10)
+          start_loss = ____
+          print(expected, start_loss)
+        solution: |
+          model = nn.Sequential(nn.Linear(20, 64), nn.ReLU(), nn.Linear(64, 10))
+          expected = math.log(10)
+          start_loss = F.cross_entropy(model(X), y).item()
+          print(expected, start_loss)
+        tests: |
+          import math, torch
+          check_object("model")
+          out = user["model"](sol["X"])
+          assert tuple(out.shape) == (128, 10), f"`model(X)` should have shape (128, 10), got {tuple(out.shape)}."
+          check_object("start_loss")
+          assert abs(float(user["start_loss"]) - math.log(10)) < 0.3, "A fresh model's loss should be within 0.3 of ln(10) = 2.30. Use the default initialisation and `F.cross_entropy` on raw logits."
+      - instructions:
+          - "Measure `bad`: store its cross-entropy on `X`, `y` (a float) in `bad_loss`."
+          - "Store the standard deviation of each weight matrix in `weight_stds`, a dict from parameter name to float, for every parameter whose name ends in `weight`. Print both."
+        hint: "`{name: p.std().item() for name, p in bad.named_parameters() if name.endswith('weight')}`."
+        sample_code: |
+          bad_loss = ____
+          weight_stds = ____
+          print(bad_loss)
+          print(weight_stds)
+        solution: |
+          bad_loss = F.cross_entropy(bad(X), y).item()
+          weight_stds = {name: p.std().item() for name, p in bad.named_parameters() if name.endswith("weight")}
+          print(bad_loss)
+          print(weight_stds)
+        tests: |
+          check_equal("bad_loss", tol=1e-4, msg="`bad_loss` should be `F.cross_entropy(bad(X), y).item()`.")
+          check_object("weight_stds")
+          assert set(user["weight_stds"]) == {"0.weight", "2.weight"}, "`weight_stds` should have one entry per weight: '0.weight' and '2.weight'."
+          check_equal("weight_stds", tol=1e-4, msg="Use `p.std().item()` for each weight matrix.")
+      - instructions:
+          - "Diagnose: one layer's weights are about 20 times larger than the other's, so the logits are huge and the model starts out confidently wrong."
+          - "Fix `bad` in place (re-initialise or rescale the offending layer) so its loss is within 0.3 of `expected`. Store the new loss in `fixed_loss` and print it."
+        hint: |
+          The output layer `bad[2]` is the outlier. `bad[2].reset_parameters()` restores the default
+          init; scaling it down inside `torch.no_grad()` also works.
+        sample_code: |
+          # fix bad here
+
+          fixed_loss = F.cross_entropy(bad(X), y).item()
+          print(fixed_loss)
+        solution: |
+          bad[2].reset_parameters()
+
+          fixed_loss = F.cross_entropy(bad(X), y).item()
+          print(fixed_loss)
+        tests: |
+          import math, torch.nn.functional as F
+          check_object("bad")
+          loss = F.cross_entropy(user["bad"](sol["X"]), sol["y"]).item()
+          assert abs(loss - math.log(10)) < 0.3, f"`bad` still starts at a loss of {loss:.2f}; it should be within 0.3 of 2.30. Shrink or re-initialise the layer with the large weights."
+          assert tuple(user["bad"](sol["X"]).shape) == (128, 10), "Keep `bad`'s architecture: it should still output 10 logits."
+    success_msg: |
+      From 12.8 to 2.3. An initial loss far above $\ln C$ means a confidently wrong model that wastes its
+      first epochs (or blows up) undoing the overconfidence. Check it on every new model.

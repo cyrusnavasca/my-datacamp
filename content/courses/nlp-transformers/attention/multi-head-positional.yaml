@@ -1,0 +1,214 @@
+title: Multiple heads and word order
+description: Split attention into heads, prove that attention ignores order, and fix it with positional encodings.
+exercises:
+  - id: intro
+    type: video
+    title: Heads and positions
+    slides: |
+      # Multi-head attention
+
+      One attention pattern per layer is limiting: `it` may need to look at its antecedent (`pump`) **and**
+      at the verb it belongs to. So the model runs $h$ smaller attentions side by side.
+
+      With $d_{model} = 768$ and $h = 12$, each head works in $d_{head} = 64$ dimensions:
+
+      ```python
+      def split_heads(x, h):                    # (B, n, d) -> (B, h, n, d/h)
+          B, n, d = x.shape
+          return x.view(B, n, h, d // h).transpose(1, 2)
+
+      def merge_heads(y):                       # (B, h, n, dh) -> (B, n, h*dh)
+          B, h, n, dh = y.shape
+          return y.transpose(1, 2).contiguous().view(B, n, h * dh)
+      ```
+
+      Project once to $Q, K, V$ (each $d \times d$), split, attend per head, merge, then apply an output
+      projection $W_O$. Same parameter count and roughly the same compute as one big head, but $h$
+      different attention patterns.
+
+      ---
+
+      ## Attention has no idea about order
+
+      Nothing in $\text{softmax}(QK^\top/\sqrt{d})V$ refers to positions. Shuffle the input tokens and
+      the outputs are shuffled **the same way**, with identical values:
+
+      $$\text{Attn}(PX) = P\,\text{Attn}(X) \quad \text{for any permutation } P$$
+
+      So "crew paged the doctor" and "doctor paged the crew" look like the same bag of tokens. Position
+      information has to be **added to the input**.
+
+      ---
+
+      ## Sinusoidal positional encodings
+
+      The original transformer adds a fixed vector per position:
+
+      $$PE_{pos,\,2i} = \sin\!\left(\frac{pos}{10000^{2i/d}}\right), \qquad PE_{pos,\,2i+1} = \cos\!\left(\frac{pos}{10000^{2i/d}}\right)$$
+
+      Each pair of dimensions is a sine wave of a different frequency, from fast (every token) to very
+      slow, a bit like the hands of a clock. Every position gets a unique pattern, and offsets between
+      positions correspond to fixed rotations, which attention can learn to use.
+
+      ```python
+      x = token_embeddings + PE[:n]     # (n, d) + (n, d)
+      ```
+
+      ---
+
+      ## Trade-offs: how to encode position
+
+      | method | used by | longer inputs than in training | cost |
+      | --- | --- | --- | --- |
+      | learned absolute (one vector per slot) | BERT (512), GPT-2 (1,024) | **impossible**: no vector for slot 1,025 | $n_{max} \times d$ parameters |
+      | sinusoidal | original transformer | defined, but quality drops | none |
+      | RoPE (rotate $q$ and $k$ by position) | most current LLMs | works a bit beyond; extendable with scaling tricks plus some fine-tuning | none |
+      | ALiBi (distance penalty on scores) | some LLMs | extrapolates well | none |
+
+      Practical rule: never feed a model more tokens than its card says it was trained on. Truncate, chunk,
+      or pick a model with a longer context.
+
+  - id: permutation-test
+    type: coding
+    title: Prove attention ignores order, then fix it
+    context: |
+      `X` holds 5 token vectors of width 8 (shape `(5, 8)`), and `self_attention(x)` is a single attention
+      layer with fixed random projections and **no** mask. `perm` is a shuffle of the 5 positions.
+      `torch` and `math` are imported.
+    instructions:
+      - "Store whether `self_attention(X[perm])` equals `self_attention(X)[perm]` (`torch.allclose`, `atol=1e-6`) in `equivariant`."
+      - "Write `sinusoidal(n, d)` that returns the `(n, d)` sinusoidal encoding: `sin` in even columns, `cos` in odd columns, with angle `pos / 10000 ** (2i / d)`."
+      - "Store `sinusoidal(5, 8)` in `pe`. Each slot keeps its encoding after a shuffle, so store whether `self_attention(X[perm] + pe)` equals `self_attention(X + pe)[perm]` in `equivariant_pe`."
+    hint: |
+      `pos = torch.arange(n).unsqueeze(1)` and `i2 = torch.arange(0, d, 2)` give the angles
+      `pos / 10000 ** (i2 / d)`. Fill `pe[:, 0::2] = torch.sin(angles)` and `pe[:, 1::2] = torch.cos(angles)`.
+    pre_code: |
+      import math
+      import torch
+      torch.manual_seed(0)
+      X = torch.randn(5, 8)
+      _Wq, _Wk, _Wv = torch.randn(3, 8, 8).unbind(0)
+      def self_attention(x):
+          q, k, v = x @ _Wq, x @ _Wk, x @ _Wv
+          w = torch.softmax(q @ k.T / math.sqrt(8), dim=-1)
+          return w @ v
+      perm = torch.tensor([3, 0, 4, 1, 2])
+    sample_code: |
+      equivariant = torch.allclose(____, ____, atol=1e-6)
+      print("shuffle in = shuffle out:", equivariant)
+
+      def sinusoidal(n, d):
+          pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+          i2 = torch.arange(0, d, 2, dtype=torch.float32)
+          angles = ____
+          pe = torch.zeros(n, d)
+          pe[:, 0::2] = ____
+          pe[:, 1::2] = ____
+          return pe
+
+      pe = sinusoidal(5, 8)
+      equivariant_pe = torch.allclose(self_attention(X[perm] + pe), self_attention(X + pe)[perm], atol=1e-6)
+      print("with positions:", equivariant_pe)
+    solution: |
+      equivariant = torch.allclose(self_attention(X[perm]), self_attention(X)[perm], atol=1e-6)
+      print("shuffle in = shuffle out:", equivariant)
+
+      def sinusoidal(n, d):
+          pos = torch.arange(n, dtype=torch.float32).unsqueeze(1)
+          i2 = torch.arange(0, d, 2, dtype=torch.float32)
+          angles = pos / 10000 ** (i2 / d)
+          pe = torch.zeros(n, d)
+          pe[:, 0::2] = torch.sin(angles)
+          pe[:, 1::2] = torch.cos(angles)
+          return pe
+
+      pe = sinusoidal(5, 8)
+      equivariant_pe = torch.allclose(self_attention(X[perm] + pe), self_attention(X + pe)[perm], atol=1e-6)
+      print("with positions:", equivariant_pe)
+    tests: |
+      import torch, math
+      check_equal("equivariant", True, msg="`equivariant` should be True: without positions, shuffling the input just shuffles the output.")
+      f = check_object("sinusoidal")
+      got = f(7, 6)
+      assert tuple(got.shape) == (7, 6), f"`sinusoidal(7, 6)` should have shape (7, 6); got {tuple(got.shape)}."
+      exp = torch.zeros(7, 6)
+      for p in range(7):
+          for i in range(0, 6, 2):
+              exp[p, i] = math.sin(p / 10000 ** (i / 6))
+              exp[p, i + 1] = math.cos(p / 10000 ** (i / 6))
+      assert torch.allclose(got.float(), exp, atol=1e-5), "`sinusoidal` values are off. Position 0 should be [0, 1, 0, 1, ...]; even columns use sin, odd use cos, angle = pos / 10000 ** (2i / d) where 2i is the even column index."
+      check_equal("equivariant_pe", False, msg="`equivariant_pe` should be False: once each slot carries its own encoding, order matters.")
+    success_msg: Without positions the layer cannot tell any ordering apart. One added sine pattern per slot breaks the symmetry.
+
+  - id: split-heads
+    type: coding
+    title: Split and merge heads
+    context: |
+      `x` is a batch of hidden states with shape `(2, 5, 12)`: batch 2, 5 tokens, width 12. `torch` is imported.
+      Reshape it for 3 attention heads and back.
+    instructions:
+      - "Write `split_heads(x, h)` that returns shape `(B, h, n, d // h)`, where head `i` holds columns `i*dh` to `(i+1)*dh` of the hidden state."
+      - "Write `merge_heads(y)` that undoes it, returning `(B, n, h * dh)`."
+      - "Store `split_heads(x, 3)` in `heads` and `merge_heads(heads)` in `back`."
+    hint: "`x.view(B, n, h, d // h).transpose(1, 2)`; to undo, `y.transpose(1, 2).contiguous().view(B, n, h * dh)`. Viewing straight to `(B, h, n, dh)` would mix tokens across heads."
+    pre_code: |
+      import torch
+      torch.manual_seed(0)
+      x = torch.randn(2, 5, 12)
+    sample_code: |
+      def split_heads(x, h):
+          B, n, d = x.shape
+          return x.view(____).transpose(____)
+
+      def merge_heads(y):
+          B, h, n, dh = y.shape
+          return y.transpose(1, 2).contiguous().view(____)
+
+      heads = split_heads(x, 3)
+      back = merge_heads(heads)
+      print(heads.shape, back.shape, torch.equal(back, x))
+    solution: |
+      def split_heads(x, h):
+          B, n, d = x.shape
+          return x.view(B, n, h, d // h).transpose(1, 2)
+
+      def merge_heads(y):
+          B, h, n, dh = y.shape
+          return y.transpose(1, 2).contiguous().view(B, n, h * dh)
+
+      heads = split_heads(x, 3)
+      back = merge_heads(heads)
+      print(heads.shape, back.shape, torch.equal(back, x))
+    tests: |
+      import torch
+      s, m = check_object("split_heads"), check_object("merge_heads")
+      t = torch.arange(2 * 4 * 6, dtype=torch.float32).view(2, 4, 6)
+      y = s(t, 2)
+      assert tuple(y.shape) == (2, 2, 4, 3), f"split_heads on (2, 4, 6) with h=2 should give (2, 2, 4, 3); got {tuple(y.shape)}."
+      assert torch.equal(y[:, 1], t[:, :, 3:6]), "Head 1 should hold columns 3:6 of every token. View as (B, n, h, dh) first, then transpose(1, 2)."
+      assert torch.equal(m(y), t), "merge_heads(split_heads(x, h)) should give back x exactly."
+      h = check_object("heads")
+      assert tuple(h.shape) == (2, 3, 5, 4), f"`heads` should have shape (2, 3, 5, 4); got {tuple(h.shape)}."
+      assert torch.equal(check_object("back"), user["x"]), "`back` should equal `x`."
+    success_msg: Heads are just a reshape. Each head sees every token but only its own slice of the width.
+
+  - id: long-reports
+    type: mc
+    title: Reports longer than the model allows
+    question: |
+      You want DistilBERT, which uses **learned absolute** position embeddings for 512 positions, to
+      classify incident reports that are often 2,000 tokens long. Which plan works?
+    options:
+      - text: Pass all 2,000 tokens; attention handles any length
+        feedback: Attention itself does, but the position table has only 512 rows. Position 513 has no embedding, so you get an index error, or garbage if the library silently clips.
+      - text: Split each report into overlapping 512-token chunks, classify each, and combine the results (or move to a long-context model)
+        correct: true
+        feedback: |
+          Right. Chunking keeps every input inside the trained range. Combine by max or mean of chunk scores,
+          or by a small second-stage model. If reports need cross-chunk reasoning, a model trained for long
+          context (usually RoPE- or ALiBi-based) is the better fix.
+      - text: Swap the learned position table for sinusoidal encodings at inference time
+        feedback: The weights were trained with the learned table; replacing it changes every input the model sees, and accuracy collapses without retraining.
+      - text: Keep only the first 512 tokens; the rest is rarely important
+        feedback: That is what `truncation=True` does, and it is a reasonable quick baseline, but incident reports often put the cause at the end. Measure before you trust it.
+    hint: What does a learned position table contain for position 600?

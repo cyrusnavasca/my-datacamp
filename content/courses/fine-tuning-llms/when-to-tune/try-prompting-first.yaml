@@ -1,0 +1,248 @@
+title: Measure before you tune
+description: "A team wants to fine-tune because accuracy is low. Run the troubleshooting loop first: measure, diagnose, try the cheapest fix, verify, then decide."
+exercises:
+  - id: intro
+    type: video
+    title: "Symptom: 'accuracy is low, let's fine-tune'"
+    slides: |
+      # The request
+
+      > "The triager only gets 65% of tickets right. Can we fine-tune it?"
+
+      Maybe. But "accuracy is low" is a **symptom**, not a diagnosis. Fine-tuning is the most expensive
+      fix on the ladder, so earn it with the loop you will use all course:
+
+      **Symptom → Measure → Diagnose → Fix → Verify**
+
+      | step | here |
+      | --- | --- |
+      | Symptom | 65% on a sample of tickets |
+      | Measure | accuracy on a fixed held-out set, per category, plus the list of failures |
+      | Diagnose | read the failures and group them by cause |
+      | Fix | the cheapest fix for the biggest group |
+      | Verify | re-measure on the *same* held-out set, and check cost |
+
+      ---
+
+      ## Measure: numbers you can act on
+
+      ```python
+      def predict(system, text):
+          msg = client.messages.create(model="claude-sonnet-5-5", max_tokens=50, system=system,
+                                       messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}])
+          return parse_label(msg.content[0].text)
+
+      test["pred"] = [predict(TRIAGE_SYSTEM, t) for t in test.text]
+      test["ok"] = test.pred == test.category
+      print(test.ok.mean())
+      print(test.groupby("category").ok.mean())        # where does it fail?
+      print(test[~test.ok][["text", "category", "pred"]])  # what do failures look like?
+      ```
+
+      One overall number hides the story. Per-category accuracy and the raw failures tell you *what* to fix.
+
+      ---
+
+      ## Diagnose: group failures by cause
+
+      | failure group | example | cheapest fix | cost of the fix |
+      | --- | --- | --- | --- |
+      | Local convention the model can't guess | "fan display froze" is IT on Helios, not maintenance | state the rule, or add 1-2 examples | about 40 tokens per example, on every call |
+      | Missing facts | needs today's rota | retrieval | an index, plus retrieved tokens |
+      | Inconsistent labels | the same ticket labelled two ways | fix the data and the label guide | human time |
+      | Output can't be parsed | prose instead of a label | a tighter format spec, prefill | almost free |
+
+      If most failures are conventions, a fine-tune would learn them too, but **a handful of targeted
+      examples** usually does it today, for a few hundred tokens per call.
+
+      ---
+
+      ## Fix, then verify honestly
+
+      - Pick examples from a **pool** of labelled tickets, never from the test set. Choosing examples
+        by looking at test failures and then scoring on the same tickets is training on the test set.
+      - Re-measure on the same held-out set and check the per-category numbers moved.
+      - Price the fix: more examples means more input tokens on every call.
+
+      ## When the prompt is not enough
+
+      Escalate to fine-tuning when: you need more examples than fit (or are affordable) in the prompt;
+      the volume makes even a cached prompt expensive; you need a small or on-device model; or a style
+      must hold across thousands of outputs and examples alone don't keep it consistent.
+
+  - id: loop-order
+    type: order
+    title: The loop before any fine-tune
+    prompt: Put the steps in the order you would run them when someone asks for a fine-tune because accuracy is low.
+    hint: You can't group failures you haven't collected, and you can't verify a fix you haven't made.
+    items:
+      - Fix a held-out test set and record the current accuracy
+      - Break accuracy down by category and list the failures
+      - Group the failures by cause
+      - Apply the cheapest fix for the biggest group
+      - Re-measure on the same held-out set
+      - Compare the cost of the fixed prompt with a fine-tune quote
+
+  - id: read-the-failures
+    type: mc
+    title: Read the failures
+    context: |
+      Zero-shot failures from the held-out set (gold → predicted):
+
+      | ticket | gold | predicted |
+      | --- | --- | --- |
+      | The fan display in Module F froze again. | it | maintenance |
+      | Printer in Module C says offline. | it | maintenance |
+      | The heater display in Module E froze again. | it | maintenance |
+      | Swap my galley duty on Friday with Tomas? | scheduling | maintenance |
+      | I need the glovebox on Monday morning. | scheduling | supplies |
+    question: What do you try first?
+    options:
+      - text: Fine-tune on all 200 labelled tickets so the model learns the station's categories.
+        feedback: "It would probably work, but it is the most expensive fix and you haven't tried the cheap ones. These are a few clear conventions, which a prompt can state."
+      - text: Add a handful of examples from the labelled pool that show these conventions (display and printer faults are IT; duty swaps and glovebox slots are scheduling), then re-measure.
+        correct: true
+        feedback: "Right. The failures are local conventions the model can't guess, and they fall into a few groups. A few targeted examples cost a few hundred tokens per call and can be verified in minutes."
+      - text: Add retrieval over the station handbook.
+        feedback: "Retrieval fixes missing facts. These tickets don't need facts; they need the station's labelling convention, which is behaviour."
+      - text: Switch to a larger model.
+        feedback: "A larger model is just as unable to guess that a frozen display counts as IT on Helios. That's a local rule, not a reasoning gap, and a bigger model costs more on every call."
+    hint: Are these failures about facts, or about a convention the model has never been told?
+
+  - id: boss-should-we-tune
+    type: sequential
+    title: "Mission: should ORBIT's triager be fine-tuned?"
+    context: |
+      The commander has a fine-tune quote on her desk. Run the loop and give her an answer backed by numbers.
+      `client` is ORBIT's model (offline, shaped like `anthropic.Anthropic()`), `MODEL` its name, `pool` 100
+      labelled tickets you may take examples from, and `test` 60 held-out tickets. `TRIAGE_SYSTEM`,
+      `examples_block(pairs)` and `parse_label(text)` are loaded, as are `pandas` (`pd`) and `aikit`.
+    pre_code: |
+      import aikit
+      import pandas as pd
+      from kits.llm_apis_prompting import ticket_triager, split_tickets, examples_block, parse_label, TRIAGE_SYSTEM, MODEL
+      client = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+      pool, test = split_tickets()
+      FT_ONE_OFF = 1500.0     # quote: data, training and evaluation, USD
+      FT_PER_1K = 0.40        # quote: serving cost of the fine-tuned model per 1,000 tickets, USD
+      MONTHLY = 9000          # tickets per month (300 a day)
+    steps:
+      - instructions:
+          - "**Measure.** Write `predict(system, text)`: call `client.messages.create(model=MODEL, max_tokens=50, system=system, messages=[...])` with the user message `f\"<ticket>{text}</ticket>\"` and return `parse_label(...)` of the reply text."
+          - "Add a `pred` column to `test` with the zero-shot predictions (`system=TRIAGE_SYSTEM`) and an `ok` column (`pred == category`)."
+          - "Store the overall accuracy in `zero_shot_acc` and the per-category accuracy (a Series indexed by category) in `by_cat`."
+        hint: "`msg.content[0].text` is the reply text. `test.groupby(\"category\").ok.mean()` gives `by_cat`."
+        sample_code: |
+          def predict(system, text):
+              msg = client.messages.create(model=MODEL, max_tokens=50, system=system,
+                                           messages=[{"role": "user", "content": ____}])
+              return ____
+
+          test["pred"] = [predict(TRIAGE_SYSTEM, t) for t in test.text]
+          test["ok"] = ____
+          zero_shot_acc = ____
+          by_cat = ____
+          print(f"zero-shot accuracy {zero_shot_acc:.2f}")
+          print(by_cat.round(2))
+        solution: |
+          def predict(system, text):
+              msg = client.messages.create(model=MODEL, max_tokens=50, system=system,
+                                           messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}])
+              return parse_label(msg.content[0].text)
+
+          test["pred"] = [predict(TRIAGE_SYSTEM, t) for t in test.text]
+          test["ok"] = test.pred == test.category
+          zero_shot_acc = test.ok.mean()
+          by_cat = test.groupby("category").ok.mean()
+          print(f"zero-shot accuracy {zero_shot_acc:.2f}")
+          print(by_cat.round(2))
+        tests: |
+          check_equal("zero_shot_acc", msg="`zero_shot_acc` should be the share of `test` rows where `pred == category` (about 0.65).")
+          bc = check_object("by_cat")
+          import pandas as pd
+          assert isinstance(bc, pd.Series), "`by_cat` should be a pandas Series: `test.groupby(\"category\").ok.mean()`."
+          assert set(bc.index) == set(sol["by_cat"].index), "`by_cat` should be indexed by the five categories."
+          assert all(abs(float(bc[c]) - float(sol["by_cat"][c])) < 1e-9 for c in bc.index), "`by_cat` values should be the mean of `ok` per category."
+      - instructions:
+          - "**Diagnose.** Store the failing rows (`ok` is False) with columns `text`, `category`, `pred` in `fails`, and print them."
+          - "Store the name of the category with the lowest accuracy in `worst`."
+          - Read the printed failures. Which local conventions does the model not know?
+        hint: "`test.loc[~test.ok, [\"text\", \"category\", \"pred\"]]` and `by_cat.idxmin()`."
+        sample_code: |
+          fails = ____
+          worst = ____
+          print(fails.to_string())
+          print("worst category:", worst)
+        solution: |
+          fails = test.loc[~test.ok, ["text", "category", "pred"]]
+          worst = by_cat.idxmin()
+          print(fails.to_string())
+          print("worst category:", worst)
+        tests: |
+          f = check_object("fails")
+          assert len(f) == len(sol["fails"]), f"`fails` should have one row per wrong prediction ({len(sol['fails'])} rows); it has {len(f)}."
+          assert set(f.text) == set(sol["fails"].text), "`fails` should hold exactly the rows where `ok` is False."
+          check_equal("worst", msg="`worst` is the category with the lowest value in `by_cat` (`by_cat.idxmin()`).")
+      - instructions:
+          - "**Fix.** Choose at most **12** `(text, category)` pairs from `pool` (never from `test`) that teach the conventions you found. Store them in `examples`."
+          - "Build `system = TRIAGE_SYSTEM + \"\\n\" + examples_block(examples)`, predict every test ticket with it and store the accuracy in `fixed_acc`. The target is **at least 0.90**."
+        hint: "One or two pool tickets per failure pattern is enough: a printer that says offline, a display that froze, a galley duty swap, the glovebox, 'Feeling ... after exercise', 'Can I get something for ...', 'Out of ...', 'Where are the spare ...'. Find them with `pool[pool.text.str.contains(\"froze\")]`."
+        sample_code: |
+          patterns = ["froze", ____]
+          examples = []
+          for p in patterns:
+              row = pool[pool.text.str.contains(p)].iloc[0]
+              examples.append((row.text, row.category))
+
+          system = TRIAGE_SYSTEM + "\n" + examples_block(examples)
+          fixed_acc = ____
+          print(f"{len(examples)} examples: accuracy {zero_shot_acc:.2f} -> {fixed_acc:.2f}")
+        solution: |
+          patterns = ["froze", "Printer", "galley duty", "glovebox", "Feeling", "Can I get something",
+                      "Out of", "Where are the spare", "I have had", "Cancel my lab"]
+          examples = []
+          for p in patterns:
+              row = pool[pool.text.str.contains(p)].iloc[0]
+              examples.append((row.text, row.category))
+
+          system = TRIAGE_SYSTEM + "\n" + examples_block(examples)
+          fixed_acc = sum(predict(system, t) == c for t, c in zip(test.text, test.category)) / len(test)
+          print(f"{len(examples)} examples: accuracy {zero_shot_acc:.2f} -> {fixed_acc:.2f}")
+        tests: |
+          from kits.llm_apis_prompting import triage_accuracy, split_tickets
+          ex = check_object("examples")
+          assert 1 <= len(ex) <= 12, f"Use between 1 and 12 examples; you have {len(ex)}. More examples cost more tokens on every call."
+          _pool, _test = split_tickets()
+          assert all(t in set(_pool.text) for t, _ in ex), "Every example must come from `pool`. Picking examples from `test` and then scoring on `test` is training on the test set."
+          assert all(dict(zip(_pool.text, _pool.category))[t] == c for t, c in ex), "Use each pool ticket with its own `category` label."
+          acc = triage_accuracy(list(ex), _test)
+          assert acc >= 0.9, f"With your examples the triager scores {acc:.2f} on the held-out set; the target is 0.90. Add an example for each failure pattern still in `fails`."
+          assert abs(check_object("fixed_acc") - acc) < 1e-9, "`fixed_acc` should be the accuracy on `test` with `system` built from your `examples`."
+      - instructions:
+          - "**Verify the cost and decide.** The last call in `client.calls` used your few-shot prompt. Store its cost times 1,000 in `prompt_per_1k`."
+          - "Store the monthly saving of the fine-tune, `(prompt_per_1k - FT_PER_1K) * MONTHLY / 1000`, in `monthly_saving`, and `FT_ONE_OFF / monthly_saving` in `payback_months`."
+          - "Set `decision` to `\"fine-tune\"` if `fixed_acc < 0.9` or `payback_months <= 12`, otherwise `\"prompt\"`, and print it."
+        hint: "`client.calls[-1][\"cost\"]` is the USD cost of the last call."
+        sample_code: |
+          prompt_per_1k = ____
+          monthly_saving = ____
+          payback_months = ____
+          decision = ____
+          print(f"prompt ${prompt_per_1k:.2f} per 1k tickets; the fine-tune saves ${monthly_saving:.2f}/month "
+                f"and pays back in {payback_months:.0f} months -> {decision}")
+        solution: |
+          prompt_per_1k = client.calls[-1]["cost"] * 1000
+          monthly_saving = (prompt_per_1k - FT_PER_1K) * MONTHLY / 1000
+          payback_months = FT_ONE_OFF / monthly_saving
+          decision = "fine-tune" if fixed_acc < 0.9 or payback_months <= 12 else "prompt"
+          print(f"prompt ${prompt_per_1k:.2f} per 1k tickets; the fine-tune saves ${monthly_saving:.2f}/month "
+                f"and pays back in {payback_months:.0f} months -> {decision}")
+        tests: |
+          p = check_object("prompt_per_1k")
+          want = user["client"].calls[-1]["cost"] * 1000
+          assert abs(p - want) < 1e-9, "`prompt_per_1k` should be `client.calls[-1][\"cost\"] * 1000`."
+          ms = check_object("monthly_saving")
+          assert abs(ms - (p - 0.40) * 9000 / 1000) < 1e-9, "`monthly_saving` = `(prompt_per_1k - FT_PER_1K) * MONTHLY / 1000`."
+          assert abs(check_object("payback_months") - 1500.0 / ms) < 1e-6, "`payback_months` = `FT_ONE_OFF / monthly_saving`."
+          check_equal("decision", "prompt", msg="With accuracy fixed and a payback measured in years, the decision should be `\"prompt\"`.")
+    success_msg: "From 0.65 to 1.00 with ten examples, for about $1.50 per 1,000 tickets. The fine-tune would take more than ten years to pay back. Tell the commander no, and keep the quote for when volume grows."

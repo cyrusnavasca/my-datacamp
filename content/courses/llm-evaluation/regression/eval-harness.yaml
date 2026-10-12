@@ -1,0 +1,208 @@
+title: An eval harness from scratch
+description: Dataset × systems × scorers → one results table. Build the loop yourself, slice the results, and add cost so you can compare versions on value as well as accuracy.
+exercises:
+  - id: harness-slides
+    type: video
+    title: One loop, one table
+    slides: |
+      # What an eval harness is
+
+      Everything so far comes together in one loop:
+
+      - a **dataset** of cases (your golden set),
+      - one or more **systems** (ORBIT v1, v2, a candidate prompt, a different model),
+      - **scorers** (code checks, validated metrics, a calibrated judge),
+
+      and the output is a **results table** with one row per (system, case) and one column per score.
+
+      Eval frameworks (promptfoo, Inspect, Braintrust, LangSmith, ...) all have this shape. Build it once by hand and
+      you'll know what they're doing for you.
+
+      ---
+
+      ## The loop
+
+      ```python
+      def run_eval(systems, cases, scorers):
+          rows = []
+          for name, system in systems.items():
+              for case in cases:
+                  out = system(case["question"])               # {"answer": ..., "retrieved": [...]}
+                  row = {"system": name, "id": case["id"], "type": case["type"], "answer": out["answer"]}
+                  for score_name, scorer in scorers.items():
+                      row[score_name] = scorer(case, out)
+                  rows.append(row)
+          return pd.DataFrame(rows)
+      ```
+
+      A system is anything that maps an input to an output, so a prompt change, a retrieval setting and a new model all
+      plug into the same harness.
+
+      ---
+
+      ## Slice the table
+
+      ```python
+      results.groupby("system")["correct"].mean()                  # headline
+      results.pivot_table(index="type", columns="system", values="correct")   # per slice
+      ```
+
+      Add **cost and latency** columns from the client's call log. Accuracy alone can't tell you that a change costs 46%
+      more for the same answers. **Cost per correct answer** = total cost / number correct puts value in one number.
+
+      ---
+
+      ## Running it for real
+
+      - **Cache outputs** keyed by (system version, input). Re-scoring with a new metric then costs nothing.
+      - **Determinism**: temperature 0 and fixed retrieval, so a re-run measures the change and not the dice.
+      - **Store every run** with the commit, prompt hash, model, date and dataset version.
+
+      | run | cases | when | cost and time | catches |
+      | --- | --- | --- | --- | --- |
+      | smoke | 20-50 | every commit | cents, about a minute | crashes, format breaks, big regressions |
+      | full | everything | nightly or before release | dollars, minutes to hours | slice regressions, small shifts |
+      | online | production traffic | continuously | labelling and monitoring | what the golden set doesn't cover |
+
+      Offline evals are fast and repeatable but only cover the cases you wrote down. Production monitoring is realistic
+      but slow and noisy. You need both.
+
+  - id: harness-loop
+    type: parsons
+    title: Assemble the harness loop
+    prompt: |
+      Arrange the lines so `run_eval` returns one row per (system, case), with a column for every scorer.
+    hint: The scorer loop runs once per case, after the system has produced its output, and before the row is appended.
+    lines:
+      - "def run_eval(systems, cases, scorers):"
+      - "    rows = []"
+      - "    for name, system in systems.items():"
+      - "        for case in cases:"
+      - "            out = system(case['question'])"
+      - "            row = {'system': name, 'id': case['id'], 'type': case['type']}"
+      - "            for score_name, scorer in scorers.items():"
+      - "                row[score_name] = scorer(case, out)"
+      - "            rows.append(row)"
+      - "    return pd.DataFrame(rows)"
+
+  - id: harness
+    type: coding
+    title: Run v1 and v2 through your harness
+    context: |
+      `cases` is the 45-question golden set as a list of dicts (`id`, `question`, `type`, ...). `systems` maps `"v1"` and
+      `"v2"` to functions that take a question and return `{"answer": ..., "retrieved": [...]}`. `scorers` has
+      `correct` (the key-facts check you validated) and `cited` (the answer refuses or has a `[doc-id]` citation).
+    instructions:
+      - "Write `run_eval(systems, cases, scorers)` returning a DataFrame with one row per (system, case) and the columns `system`, `id`, `type`, `answer` plus one column per scorer."
+      - Run it and store the table in `results` (90 rows).
+      - Store the mean `correct` per system in `overall`, and `results.pivot_table(index="type", columns="system", values="correct")` in `summary`.
+    hint: |
+      Follow the loop from the slides: `out = system(case["question"])`, then `row[score_name] = scorer(case, out)`.
+    pre_code: |
+      import re
+      import pandas as pd
+      from kits.llm_evaluation import make_orbit, questions_df, key_facts_pass
+      cases = questions_df().to_dict("records")
+      systems = {"v1": make_orbit("v1").answer, "v2": make_orbit("v2").answer}
+      scorers = {
+          "correct": lambda case, out: key_facts_pass(case["id"], out["answer"]),
+          "cited": lambda case, out: int("I don't know" in out["answer"] or bool(re.search(r"\[[a-z0-9-]+\]", out["answer"]))),
+      }
+    sample_code: |
+      def run_eval(systems, cases, scorers):
+          rows = []
+          for name, system in systems.items():
+              for case in cases:
+                  out = ____
+                  row = {"system": name, "id": case["id"], "type": case["type"], "answer": out["answer"]}
+                  for score_name, scorer in scorers.items():
+                      row[score_name] = ____
+                  rows.append(row)
+          return pd.DataFrame(rows)
+
+      results = run_eval(systems, cases, scorers)
+      overall = ____
+      summary = ____
+      print(overall, summary, sep="\n\n")
+    solution: |
+      def run_eval(systems, cases, scorers):
+          rows = []
+          for name, system in systems.items():
+              for case in cases:
+                  out = system(case["question"])
+                  row = {"system": name, "id": case["id"], "type": case["type"], "answer": out["answer"]}
+                  for score_name, scorer in scorers.items():
+                      row[score_name] = scorer(case, out)
+                  rows.append(row)
+          return pd.DataFrame(rows)
+
+      results = run_eval(systems, cases, scorers)
+      overall = results.groupby("system")["correct"].mean()
+      summary = results.pivot_table(index="type", columns="system", values="correct")
+      print(overall, summary, sep="\n\n")
+    tests: |
+      check_object("results")
+      r = user["results"]
+      assert len(r) == 90, f"`results` should have 90 rows (2 systems × 45 cases), it has {len(r)}."
+      for c in ["system", "id", "type", "answer", "correct", "cited"]:
+          assert c in r.columns, f"`results` is missing the `{c}` column."
+      s = sol["results"]
+      assert list(r.sort_values(["system", "id"])["correct"]) == list(s.sort_values(["system", "id"])["correct"]), "The `correct` column doesn't match. Call each scorer with `(case, out)`."
+      check_object("overall")
+      assert dict(user["overall"].round(6)) == dict(sol["overall"].round(6)), "`overall` should be `results.groupby('system')['correct'].mean()`."
+      check_object("summary")
+      assert user["summary"].round(6).equals(sol["summary"].round(6)), "`summary` should be the pivot table of mean `correct` by type (rows) and system (columns)."
+    success_msg: |
+      v2 beats v1 on factual questions (84% vs 73%) and ties on the other slices. Any future change, whether a prompt,
+      a retriever or a model, plugs into the same function and produces the same table.
+
+  - id: cost-per-correct
+    type: coding
+    title: Is more context worth it?
+    context: |
+      A teammate wants to retrieve 5 documents per question instead of 3, "to be safe". `configs` maps `"k=1"`, `"k=3"` and
+      `"k=5"` to ORBIT systems that differ only in `k`. Each has its own fake client, so `orbit.client.total_cost()` gives
+      what its calls cost (illustrative prices). `cases` and `key_facts_pass` are loaded.
+    instructions:
+      - "For each config, answer all `cases` and store the accuracy (mean of `key_facts_pass(case['id'], answer)`) in the dict `acc`, and `orbit.client.total_cost()` in the dict `cost`."
+      - Store total cost divided by the number of correct answers in the dict `cost_per_correct`.
+      - "Store in `choice` the config with the **lowest cost per correct answer** among those within 0.01 of the best accuracy."
+    hint: |
+      Number correct = `acc[name] * len(cases)`. For the choice: `best = max(acc.values())`, then
+      `min((n for n in acc if acc[n] >= best - 0.01), key=cost_per_correct.get)`.
+    pre_code: |
+      from kits.llm_evaluation import make_orbit, questions_df, key_facts_pass
+      cases = questions_df().to_dict("records")
+      configs = {f"k={k}": make_orbit("v2", k=k) for k in (1, 3, 5)}
+    sample_code: |
+      acc, cost, cost_per_correct = {}, {}, {}
+      for name, orbit in configs.items():
+          scores = [key_facts_pass(case["id"], orbit.answer(case["question"])["answer"]) for case in cases]
+          acc[name] = ____
+          cost[name] = ____
+          cost_per_correct[name] = ____
+
+      best = max(acc.values())
+      choice = ____
+      print(acc, cost, cost_per_correct, choice, sep="\n")
+    solution: |
+      acc, cost, cost_per_correct = {}, {}, {}
+      for name, orbit in configs.items():
+          scores = [key_facts_pass(case["id"], orbit.answer(case["question"])["answer"]) for case in cases]
+          acc[name] = sum(scores) / len(scores)
+          cost[name] = orbit.client.total_cost()
+          cost_per_correct[name] = cost[name] / sum(scores)
+
+      best = max(acc.values())
+      choice = min((n for n in acc if acc[n] >= best - 0.01), key=cost_per_correct.get)
+      print(acc, cost, cost_per_correct, choice, sep="\n")
+    tests: |
+      for d in ("acc", "cost", "cost_per_correct"):
+          check_object(d)
+          for k, v in sol[d].items():
+              assert k in user[d] and abs(user[d][k] - v) < 1e-9, f"`{d}['{k}']` should be {v:.6f}."
+      check_equal("choice", msg="`choice` should be the config with the lowest cost per correct answer among those within 0.01 of the best accuracy.")
+    success_msg: |
+      k=5 gets exactly the same answers right as k=3 and costs about 46% more, because every extra document is input
+      tokens on every call. k=1 is cheapest per call but loses 4 questions. Without a harness, "to be safe" would have
+      shipped.

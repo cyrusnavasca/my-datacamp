@@ -1,0 +1,395 @@
+title: Protocol errors vs tool errors
+description: Two error channels with different audiences. Pick the right one, write error messages a model can act on, and prove the server with a conformance transcript.
+exercises:
+  - id: errors-slides
+    type: video
+    title: Two error channels
+    slides: |
+      # Who needs to know?
+
+      An MCP server can report a failure in two very different ways:
+
+      ```python
+      # 1. Protocol error: the REQUEST was wrong, or the server broke
+      {"jsonrpc": "2.0", "id": 4, "error": {"code": -32602, "message": "Unknown tool: vent_module"}}
+
+      # 2. Tool execution error: the tool RAN and failed
+      {"jsonrpc": "2.0", "id": 5, "result": {
+          "content": [{"type": "text", "text": "Sensor E/co2 is offline. Try module E's o2 sensor, or ask engineering."}],
+          "isError": True}}
+      ```
+
+      A **protocol error** goes to the client and host code. Most hosts never show it to the model, or
+      show only a generic "tool call failed". A **tool error** is a normal result: the host passes the
+      text to the model as a `tool_result` with `is_error`, so **the model can read it and adjust**.
+
+      ---
+
+      ## Which channel? A decision table
+
+      | situation | channel | code |
+      | --- | --- | --- |
+      | the bytes aren't JSON | protocol | -32700, `id` null |
+      | valid JSON, broken envelope | protocol | -32600 |
+      | unknown method | protocol | -32601 |
+      | unknown tool name, missing `name`, params not an object | protocol | -32602 |
+      | your own code raised (a bug) | protocol | -32603 "Internal error": log details to stderr, never send a traceback |
+      | a bug *inside a tool* | either | SDKs differ: FastMCP returns tool exceptions as `isError` results. Either way: answer, don't leak |
+      | sensor offline, booking over 4 hours, unknown crew member | **tool** | `isError: true` |
+      | argument values the model could fix (`module: "hydroponics"`) | **tool** | `isError: true`, saying what's valid |
+      | any notification, even an unknown one | **no response** | |
+
+      Spec revisions have moved toward reporting **argument validation failures as tool errors**, so the
+      model can correct itself. Check the current spec at modelcontextprotocol.io for the exact wording.
+
+      ---
+
+      ## Write error messages for the model
+
+      The error text is the model's only clue. Compare:
+
+      | message | what the model can do next |
+      | --- | --- |
+      | `Invalid params` | nothing: give up or guess |
+      | `module must be one of A, B, C, D, E, F (C is hydroponics)` | retry with `C` |
+      | `Sensor E/co2 is offline; E/o2 and E/temperature work` | try a related reading, or tell the crew |
+
+      Name the field, list the valid values, and suggest a next step. It's prompt engineering inside an
+      error message. The cost: every retry is another model call, so cap retries in the host.
+
+      ---
+
+      ## Playbook: the agent gives up after one failed call
+
+      **Symptom:** traces show one tool call, an error, then "Sorry, I couldn't do that".
+
+      **Measure:** a task set where the first attempt is likely wrong (names instead of ids, wrong units).
+      Track the **recovery rate**: the share of tasks finished correctly anyway.
+
+      **Diagnose:** look at what the model actually received. Usual causes:
+      1. A fixable mistake came back as a **protocol error**, so the model saw nothing or "Tool call failed".
+      2. It came back as `isError`, but the **text is vague**.
+      3. The host caps retries at zero.
+
+      **Fix:** move model-fixable failures to `isError`, write specific messages, and keep protocol errors
+      for malformed requests. **Verify:** recovery rate on the same task set, plus the extra calls it cost.
+
+      ---
+
+      ## Conformance transcripts
+
+      A **conformance transcript** is a scripted list of messages, each with the response it must get:
+
+      ```python
+      ("unknown method -> -32601", {"jsonrpc": "2.0", "id": 7, "method": "tools/invoke"}, expect_error(7, -32601))
+      ("notification gets no reply", {"jsonrpc": "2.0", "method": "notifications/initialized"}, expect_nothing)
+      ```
+
+      Run it on every change, as a unit test for the protocol layer. It catches the bugs your happy-path
+      demo never hits: broken JSON, wrong versions, crashes inside tools, answers to notifications.
+
+  - id: error-channels
+    type: classify
+    title: Which error channel?
+    prompt: Your Helios server hits each situation below. Sort them by what it should send back.
+    hint: Did the tool run? If it did and failed, the model should hear about it. If the request itself was broken, it's a protocol error. Notifications never get a reply.
+    zones: [JSON-RPC error, "Result with isError: true", No response]
+    items:
+      - { text: "The request body is not valid JSON", zone: JSON-RPC error }
+      - { text: "The client called tools/invoke, which doesn't exist", zone: JSON-RPC error }
+      - { text: "tools/call names a tool the server doesn't have", zone: JSON-RPC error }
+      - { text: "A bug in the server's routing code raises an exception before any tool runs", zone: JSON-RPC error }
+      - { text: "The CO2 sensor in Module E is offline", zone: "Result with isError: true" }
+      - { text: "book_module asks for 6 hours; the limit is 4", zone: "Result with isError: true" }
+      - { text: "send_message is addressed to someone not on the crew roster", zone: "Result with isError: true" }
+      - { text: "notifications/initialized arrives", zone: No response }
+      - { text: "A notification with a method the server doesn't recognise", zone: No response }
+
+  - id: model-recovery
+    type: coding
+    title: "Troubleshoot: ORBIT gives up on sensor questions"
+    context: |
+      Crew ask things like "humidity in hydroponics?", and the model first passes the module *name*
+      (`"hydroponics"`) instead of its letter. `recovery_rate(call_tool)` builds a server whose `tools/call`
+      handler is `call_tool`, asks ORBIT 5 such questions, and returns the share answered with the right
+      reading. Like many hosts, it shows the model only "Tool call failed." when a protocol error comes back.
+      `call_tool_v1` is the current handler.
+    instructions:
+      - "**Measure:** store `before = recovery_rate(call_tool_v1)` and print it."
+      - "**Fix:** write `call_tool_v2(params)`. Keep a protocol error (`RpcError(INVALID_PARAMS, ...)`) for an unknown tool name, but return arguments that fail `validate_args(GET_SENSOR[\"inputSchema\"], args)` as an `isError: true` result whose text includes the problems found."
+      - "Also return an `isError` result when `station.run_tool` raises `ToolError`. Successful calls return the text with `isError` False."
+      - "**Verify:** store `after = recovery_rate(call_tool_v2)`; it must be at least 0.8."
+    hint: |
+      `probs = validate_args(GET_SENSOR["inputSchema"], args)` returns messages such as
+      "`module` must be one of A, B, C, D, E, F". Put them in the text:
+      `{"content": [{"type": "text", "text": "Invalid arguments: " + "; ".join(probs)}], "isError": True}`.
+    pre_code: |
+      import json
+      import aikit
+      from kits.mcp_integrations import (SUPPORTED, result, error, RpcError, MCPClient, MCPError, ToolError, INVALID_PARAMS,
+                                         self_correcting_model, SENSOR_QUESTIONS, anthropic_tool, run_agent, sensor_server, validate_args)
+      station = aikit.helios.Station()
+      GET_SENSOR = sensor_server().tool_definitions()[0]
+
+      def make_handle(call_tool):
+          handlers = {"initialize": lambda p: {"protocolVersion": SUPPORTED[0], "capabilities": {"tools": {}},
+                                               "serverInfo": {"name": "helios-sensors", "version": "0.3.0"}},
+                      "tools/list": lambda p: {"tools": [GET_SENSOR]}, "tools/call": call_tool}
+          def handle(msg):
+              if "id" not in msg:
+                  return None
+              try:
+                  return result(msg["id"], handlers[msg["method"]](msg.get("params", {})))
+              except RpcError as e:
+                  return error(msg["id"], e.code, e.message)
+          return handle
+
+      def recovery_rate(call_tool):
+          ok = 0
+          for question, module, metric in SENSOR_QUESTIONS:
+              client = MCPClient(make_handle(call_tool))
+              client.initialize()
+              tools = [anthropic_tool(t) for t in client.list_tools()]
+              def route(name, args):
+                  try:
+                      return client.call_tool(name, args)
+                  except MCPError:
+                      return {"content": [{"type": "text", "text": "Tool call failed."}], "isError": True}
+              llm = aikit.FakeClaude(self_correcting_model(), clock=aikit.VirtualClock())
+              answer = run_agent(llm, tools, route, question)["answer"]
+              want = json.loads(station.run_tool("get_sensor", {"module": module, "metric": metric}))["value"]
+              ok += str(want) in answer
+          return ok / len(SENSOR_QUESTIONS)
+
+      def call_tool_v1(params):
+          if params.get("name") != "get_sensor":
+              raise RpcError(INVALID_PARAMS, "Invalid params")
+          args = params.get("arguments", {})
+          if validate_args(GET_SENSOR["inputSchema"], args):
+              raise RpcError(INVALID_PARAMS, "Invalid params")
+          return {"content": [{"type": "text", "text": station.run_tool("get_sensor", args)}], "isError": False}
+    sample_code: |
+      before = ____
+      print("before:", before)
+
+      def call_tool_v2(params):
+          if params.get("name") != "get_sensor":
+              raise RpcError(INVALID_PARAMS, f"Unknown tool: {params.get('name')}")
+          args = params.get("arguments", {})
+          probs = validate_args(GET_SENSOR["inputSchema"], args)
+          if probs:
+              return ____
+          try:
+              text = station.run_tool("get_sensor", args)
+          except ToolError as e:
+              return ____
+          return {"content": [{"type": "text", "text": text}], "isError": False}
+
+      after = recovery_rate(call_tool_v2)
+      print("after:", after)
+    solution: |
+      before = recovery_rate(call_tool_v1)
+      print("before:", before)
+
+      def call_tool_v2(params):
+          if params.get("name") != "get_sensor":
+              raise RpcError(INVALID_PARAMS, f"Unknown tool: {params.get('name')}")
+          args = params.get("arguments", {})
+          probs = validate_args(GET_SENSOR["inputSchema"], args)
+          if probs:
+              return {"content": [{"type": "text", "text": "Invalid arguments: " + "; ".join(probs)}], "isError": True}
+          try:
+              text = station.run_tool("get_sensor", args)
+          except ToolError as e:
+              return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
+          return {"content": [{"type": "text", "text": text}], "isError": False}
+
+      after = recovery_rate(call_tool_v2)
+      print("after:", after)
+    tests: |
+      check_equal("before", 0.0, msg="`before` should be `recovery_rate(call_tool_v1)`.")
+      check_object("after")
+      assert user["after"] >= 0.8, f"Recovery rate is {user['after']:.1f}. Return bad arguments as an isError result whose text lists the valid values, so the model can retry."
+      handle = user["make_handle"](user["call_tool_v2"])
+      handle({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+      r = handle({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "vent_module", "arguments": {}}})
+      assert "error" in r and r["error"]["code"] == -32602, "An unknown tool name is still a protocol error: raise `RpcError(INVALID_PARAMS, ...)`."
+      st = user["aikit"].helios.Station(offline=[("E", "co2")])
+      user["station"], old = st, user["station"]
+      try:
+          r = handle({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_sensor", "arguments": {"module": "E", "metric": "co2"}}})
+      finally:
+          user["station"] = old
+      assert "result" in r and r["result"].get("isError") is True, "When `station.run_tool` raises ToolError (e.g. an offline sensor), return an isError result instead of letting it escape."
+    success_msg: |
+      Same model, same questions: recovery went from 0 to 1.0 by moving a fixable mistake to the
+      channel the model can read, and naming the valid values. Each recovery cost one extra model call,
+      which is why hosts still cap retries.
+
+  - id: conformance-mission
+    type: sequential
+    title: "Mission: pass the conformance transcript"
+    context: |
+      Before `helios-sensors` ships to the whole station it must pass the 12-message conformance
+      transcript. `run_conformance(handle)` sends the messages (step 9 as raw, broken text) and returns a
+      report with `.passed`, `.failed_steps`, and a printout of each step. `handle_v1` is the current
+      server; `HANDLERS` is its dispatch table, and its `station` has one offline sensor (E/co2) and one
+      reading that hits a bug in the server code (F/pressure).
+    pre_code: |
+      import json
+      import aikit
+      from kits.mcp_integrations import (BuggyStation, sensor_server, run_conformance, SUPPORTED, result, error,
+                                         RpcError, ToolError, validate_args, message_kind, INVALID_PARAMS)
+      station = BuggyStation()
+      GET_SENSOR = sensor_server().tool_definitions()[0]
+
+      def on_initialize(params):
+          asked = params["protocolVersion"]
+          return {"protocolVersion": asked if asked in SUPPORTED else SUPPORTED[0],
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "helios-sensors", "version": "0.9.0"}}
+
+      def call_tool_v1(params):
+          text = station.run_tool(params["name"], params["arguments"])
+          return {"content": [{"type": "text", "text": text}], "isError": False}
+
+      HANDLERS = {"initialize": on_initialize, "ping": lambda p: {},
+                  "tools/list": lambda p: {"tools": [GET_SENSOR]}, "tools/call": call_tool_v1}
+
+      def handle_v1(raw):
+          msg = json.loads(raw) if isinstance(raw, str) else raw
+          if "id" not in msg:
+              return None
+          return result(msg["id"], HANDLERS[msg["method"]](msg.get("params", {})))
+    steps:
+      - instructions:
+          - "**Measure.** Store `report = run_conformance(handle_v1)` and `baseline = report.passed`. Print `report` and read which steps fail and why."
+        hint: "`print(report)` lists every step with PASS or FAIL and the reason."
+        sample_code: |
+          report = ____
+          baseline = ____
+          print(report)
+        solution: |
+          report = run_conformance(handle_v1)
+          baseline = report.passed
+          print(report)
+        tests: |
+          check_equal("baseline", 5, msg="`baseline` should be `report.passed` for `run_conformance(handle_v1)`.")
+      - instructions:
+          - "**Fix the envelope.** Write `handle_v2(raw)`: parse strings with `json.loads`, returning `error(None, -32700, \"Parse error\")` if that fails. Then use `message_kind(msg)`: return `None` for notifications and responses; `error(id or None, -32600, \"Invalid Request\")` for invalid messages."
+          - "Route requests through `HANDLERS`: an unknown method gives -32601. Turn a raised `RpcError` into its error, and **any other exception** into `error(id, -32603, \"Internal error\")`, without exception details."
+          - "Store `report2 = run_conformance(handle_v2)` and print it."
+        hint: |
+          For an invalid message: `rid = msg.get("id") if isinstance(msg, dict) else None`. Wrap the handler call in
+          `try: ... except RpcError as e: return error(msg["id"], e.code, e.message) except Exception: return error(msg["id"], -32603, "Internal error")`.
+        sample_code: |
+          def handle_v2(raw):
+              if isinstance(raw, str):
+                  try:
+                      msg = json.loads(raw)
+                  except ValueError:
+                      return ____
+              else:
+                  msg = raw
+              kind = message_kind(msg)
+              if kind in ("notification", "response", "error"):
+                  return None
+              if kind == "invalid":
+                  rid = msg.get("id") if isinstance(msg, dict) else None
+                  return ____
+              handler = HANDLERS.get(msg["method"])
+              if handler is None:
+                  return ____
+              try:
+                  return result(msg["id"], handler(msg.get("params", {})))
+              except RpcError as e:
+                  return error(msg["id"], e.code, e.message)
+              ____
+
+          report2 = run_conformance(handle_v2)
+          print(report2)
+        solution: |
+          def handle_v2(raw):
+              if isinstance(raw, str):
+                  try:
+                      msg = json.loads(raw)
+                  except ValueError:
+                      return error(None, -32700, "Parse error")
+              else:
+                  msg = raw
+              kind = message_kind(msg)
+              if kind in ("notification", "response", "error"):
+                  return None
+              if kind == "invalid":
+                  rid = msg.get("id") if isinstance(msg, dict) else None
+                  return error(rid, -32600, "Invalid Request")
+              handler = HANDLERS.get(msg["method"])
+              if handler is None:
+                  return error(msg["id"], -32601, "Method not found")
+              try:
+                  return result(msg["id"], handler(msg.get("params", {})))
+              except RpcError as e:
+                  return error(msg["id"], e.code, e.message)
+              except Exception:
+                  return error(msg["id"], -32603, "Internal error")
+
+          report2 = run_conformance(handle_v2)
+          print(report2)
+        tests: |
+          check_object("report2")
+          r = user["run_conformance"](user["handle_v2"])
+          envelope = {8: "unknown method -> -32601", 9: "broken JSON -> -32700 with id null", 10: "wrong jsonrpc -> -32600", 12: "a bug -> -32603 without details"}
+          for step, what in envelope.items():
+              assert step not in r.failed_steps, f"Step {step} ({what}) still fails: {r.results[step - 1]['problem']}"
+          assert r.passed >= 9, f"Expected at least 9/12 after fixing the envelope, got {r.passed}. Print the report to see what fails."
+      - instructions:
+          - "**Fix the tool layer.** Write `call_tool_v2(params)`: a missing or unknown tool `name` raises `RpcError(INVALID_PARAMS, ...)`; arguments failing `validate_args` and any `ToolError` from the station become `isError: true` results with a helpful text; success returns the text with `isError` False."
+          - "Install it with `HANDLERS[\"tools/call\"] = call_tool_v2` (`handle_v2` looks handlers up at call time)."
+          - "**Verify:** store `final = run_conformance(handle_v2)` and print it. All 12 steps must pass."
+        hint: |
+          Let the F/pressure KeyError escape `call_tool_v2`: it's a bug in server code, and your dispatcher's catch-all
+          already turns it into -32603. Only `ToolError` is the tool reporting a normal failure. (Turning the bug into an
+          `isError` result also passes, as FastMCP does, as long as the text doesn't leak exception details.)
+        sample_code: |
+          def call_tool_v2(params):
+              name = params.get("name")
+              if name != "get_sensor":
+                  raise ____
+              args = params.get("arguments", {})
+              probs = validate_args(GET_SENSOR["inputSchema"], args)
+              if probs:
+                  return ____
+              try:
+                  text = station.run_tool(name, args)
+              except ToolError as e:
+                  return ____
+              return {"content": [{"type": "text", "text": text}], "isError": False}
+
+          HANDLERS["tools/call"] = call_tool_v2
+          final = run_conformance(handle_v2)
+          print(final)
+        solution: |
+          def call_tool_v2(params):
+              name = params.get("name")
+              if name != "get_sensor":
+                  raise RpcError(INVALID_PARAMS, f"Unknown tool: {name!r}")
+              args = params.get("arguments", {})
+              probs = validate_args(GET_SENSOR["inputSchema"], args)
+              if probs:
+                  return {"content": [{"type": "text", "text": "Invalid arguments: " + "; ".join(probs)}], "isError": True}
+              try:
+                  text = station.run_tool(name, args)
+              except ToolError as e:
+                  return {"content": [{"type": "text", "text": f"Error: {e}"}], "isError": True}
+              return {"content": [{"type": "text", "text": text}], "isError": False}
+
+          HANDLERS["tools/call"] = call_tool_v2
+          final = run_conformance(handle_v2)
+          print(final)
+        tests: |
+          check_object("final")
+          r = user["run_conformance"](user["handle_v2"])
+          assert r.passed == 12, f"{r.passed}/12 steps pass. First failure: step {r.failures[0]['step']} ({r.failures[0]['label']}): {r.failures[0]['problem']}"
+    success_msg: |
+      12/12. From 5 passing steps to 12 with two layers of fixes: the envelope (parse, validate, route,
+      catch everything) and the tool semantics (unknown tool is a protocol error, offline sensor is a
+      tool error). Keep the transcript in CI so no change breaks them again.

@@ -1,0 +1,276 @@
+title: Semantic search from scratch
+description: Build a working semantic search in a few lines of NumPy, return the top k efficiently, turn chunk hits into documents, and see why a score threshold can't spot unanswerable questions.
+exercises:
+  - id: search-from-scratch-slides
+    type: video
+    title: Search in five lines
+    slides: |
+      # Semantic search is a matrix product
+
+      **Index time** (once):
+      1. Split documents into chunks and keep metadata (`doc_id`, title) for each.
+      2. Embed every chunk; stack the vectors into a matrix `M` of shape $(N, d)$, unit rows.
+
+      **Query time** (every request):
+      3. Embed the query with the **same** model: `q`.
+      4. `scores = M @ q`: one cosine per chunk.
+      5. Take the top $k$ rows; map them back to chunks and documents.
+
+      ```python
+      M = aikit.embed(chunk_texts)                  # (N, d)
+      def search(query, k=5):
+          scores = M @ aikit.embed(query)
+          best = np.argsort(-scores)[:k]
+          return [(chunk_ids[i], float(scores[i])) for i in best]
+      ```
+
+      That is a complete, exact semantic search engine. Up to roughly a million chunks it is often all you need.
+
+      ---
+
+      ## Top k without sorting everything
+
+      `np.argsort` sorts all $N$ scores, $O(N \log N)$, to keep only $k$ of them.
+      `np.argpartition` moves the $k$ largest to the front in $O(N)$ without ordering them; then you sort just those $k$:
+
+      ```python
+      def top_k(scores, k):
+          part = np.argpartition(-scores, k)[:k]        # the k best, in no particular order
+          return part[np.argsort(-scores[part])]       # now sorted, best first
+      ```
+
+      At 200k scores this is several times faster than a full sort, and the gap grows with $N$. Vector libraries do the
+      same thing internally, with a small heap.
+
+      ---
+
+      ## Chunks in, documents out
+
+      | granularity | precise match | context for the LLM | vectors to store | risk |
+      | --- | --- | --- | --- | --- |
+      | whole document | low: one blurry average | everything | few | the right passage is drowned out |
+      | paragraph | good | enough | more | an answer split across two paragraphs |
+      | sentence | high | thin | most | the sentence makes no sense alone ("It must stay below 0.5%.") |
+
+      Small chunks find things precisely, but one document then fills several result slots. **Deduplicate**
+      by `doc_id`, keeping each document's best chunk, before you show results or count metrics.
+      (The *rag-systems* course goes deep on chunking strategies.)
+
+      ---
+
+      ## Search always returns something
+
+      `top_k` returns $k$ results even when nothing relevant exists. Similarity measures **topic overlap**, not
+      "contains the answer". *"What is the Wi-Fi password?"* matches the IT page's sentence about password rotation
+      very well, though the password isn't there.
+
+      - Scores are not probabilities, and their scale differs between models. A threshold tuned for one model doesn't transfer.
+      - A minimum-score threshold removes junk (off-topic queries), but it can't reliably detect "the answer isn't here".
+        That job belongs to the answering step: a grounded model that may refuse, or a reranker trained for it.
+
+  - id: first-search
+    type: coding
+    title: Your first semantic search
+    context: |
+      `chunk_texts` holds the 171 sentence chunks of the Helios handbook and `chunk_ids` their ids (like
+      `"radiation-storm-protocol#1"`). `aikit` and `np` are imported. Build the index and a search function.
+    instructions:
+      - "Embed all chunks with `aikit.embed` and store the matrix in `M`."
+      - "Write `search(query, k=5)`: embed the query, score every chunk with one matrix product, and return a list of `(chunk_id, score)` tuples for the `k` best chunks, best first. Make each score a `float`."
+      - "Store `search(\"Where do we shelter during a radiation storm?\")` in `results` and print it."
+    hint: |
+      `scores = M @ aikit.embed(query)`, `best = np.argsort(-scores)[:k]`, then
+      `[(chunk_ids[i], float(scores[i])) for i in best]`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_chunks
+      _chunks = handbook_chunks()
+      chunk_texts = [c["text"] for c in _chunks]
+      chunk_ids = [c["id"] for c in _chunks]
+    sample_code: |
+      M = ____
+
+      def search(query, k=5):
+          scores = ____
+          best = ____
+          return [(chunk_ids[i], float(scores[i])) for i in best]
+
+      results = ____
+      for chunk_id, score in results:
+          print(f"{score:.3f}  {chunk_id}")
+    solution: |
+      M = aikit.embed(chunk_texts)
+
+      def search(query, k=5):
+          scores = M @ aikit.embed(query)
+          best = np.argsort(-scores)[:k]
+          return [(chunk_ids[i], float(scores[i])) for i in best]
+
+      results = search("Where do we shelter during a radiation storm?")
+      for chunk_id, score in results:
+          print(f"{score:.3f}  {chunk_id}")
+    tests: |
+      import numpy as np
+      Mu = check_object("M")
+      assert np.shape(Mu) == (171, 64), f"`M` should be the embedded chunks, shape (171, 64); got {np.shape(Mu)}."
+      f = check_object("search")
+      for q, k in [("How often are scrubber beds swapped?", 3), ("Who leads a medical emergency?", 5), ("lettuce harvest", 1)]:
+          got = f(q, k)
+          want = sol["search"](q, k)
+          assert len(got) == k, f"`search(query, k={k})` should return exactly {k} results; got {len(got)}."
+          assert [c for c, _ in got] == [c for c, _ in want], f"For {q!r} the chunk ids are not the top {k} by score, best first. Use `np.argsort(-scores)[:k]`."
+          assert all(abs(a - b) < 1e-6 for (_, a), (_, b) in zip(got, want)), "The scores should be the cosine similarities `M @ aikit.embed(query)` of the returned chunks."
+      check_equal("results", msg="`results` should be `search(\"Where do we shelter during a radiation storm?\")` with the default k=5.")
+    success_msg: That is a complete semantic search engine, one matrix product over every chunk. The two best chunks both describe the radiation shelter in Module D, one from the module map and one from the storm protocol. Relevant information often lives in more than one document.
+
+  - id: topk-argpartition
+    type: coding
+    title: Top k without a full sort
+    context: |
+      `X` holds 200,000 unit vectors (float32) and `q` one query. `np` and `time` are imported. Pick the top 10 without
+      sorting all 200,000 scores.
+    instructions:
+      - "Write `top_k(scores, k)`: use `np.argpartition` to get the indices of the `k` largest scores, then sort only those `k`, best first."
+      - "Compute `scores = X @ q`. Store `top_k(scores, 10)` in `fast` and `np.argsort(-scores)[:10]` in `slow`."
+      - "Store whether they're the same list in `same`, and print how long each method takes (use `time.perf_counter()`)."
+    hint: |
+      `part = np.argpartition(-scores, k)[:k]` gives the k best, unordered. Then `part[np.argsort(-scores[part])]`.
+      Compare with `list(fast) == list(slow)`.
+    pre_code: |
+      import time
+      import numpy as np
+      from kits.embeddings_vector_search import make_vectors, make_queries
+      X = make_vectors(200_000)
+      q = make_queries(X, 1)[0]
+    sample_code: |
+      def top_k(scores, k):
+          part = ____
+          return ____
+
+      scores = X @ q
+
+      t0 = time.perf_counter()
+      fast = top_k(scores, 10)
+      t1 = time.perf_counter()
+      slow = ____
+      t2 = time.perf_counter()
+
+      same = ____
+      print(f"argpartition {1000 * (t1 - t0):.2f} ms, argsort {1000 * (t2 - t1):.2f} ms, same: {same}")
+    solution: |
+      def top_k(scores, k):
+          part = np.argpartition(-scores, k)[:k]
+          return part[np.argsort(-scores[part])]
+
+      scores = X @ q
+
+      t0 = time.perf_counter()
+      fast = top_k(scores, 10)
+      t1 = time.perf_counter()
+      slow = np.argsort(-scores)[:10]
+      t2 = time.perf_counter()
+
+      same = list(fast) == list(slow)
+      print(f"argpartition {1000 * (t1 - t0):.2f} ms, argsort {1000 * (t2 - t1):.2f} ms, same: {same}")
+    tests: |
+      import numpy as np
+      f = check_object("top_k")
+      rng = np.random.default_rng(11)
+      for n, k in [(1000, 5), (50, 7), (20000, 25)]:
+          s = rng.normal(size=n)
+          got = list(np.asarray(f(s, k)))
+          assert got == list(np.argsort(-s)[:k]), f"`top_k` on {n} scores with k={k} should return the {k} best indices, sorted best first."
+      check_called("argpartition", msg="Use `np.argpartition` inside `top_k`, so you never sort all the scores.")
+      check_equal("fast", msg="`fast` should be `top_k(scores, 10)`.")
+      check_equal("same", True, msg="`same` should be True: both methods find the same top 10.")
+    success_msg: Same answer, less work. The full sort orders 199,990 scores you then throw away.
+
+  - id: chunks-to-docs
+    type: coding
+    title: From chunk hits to documents
+    context: |
+      `M`, `chunk_ids` and `chunk_doc_ids` (the doc each chunk comes from) are loaded. Long docs like the airlock
+      procedure can fill several of the top-k slots with their own sentences. Return documents instead.
+    instructions:
+      - "Write `search_docs(query, k=3)`: rank **all** chunks by score, walk down the ranking, and collect each `doc_id` the first time you see it. Stop at `k` docs and return the list."
+      - "Store `search_docs(\"What do I check before depressurising the airlock?\")` in `docs` and print it."
+    hint: |
+      `order = np.argsort(-(M @ aikit.embed(query)))`. Loop over `order`, append `chunk_doc_ids[i]` if it's not already
+      in the list, and `break` when the list has `k` items.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_chunks
+      _chunks = handbook_chunks()
+      chunk_ids = [c["id"] for c in _chunks]
+      chunk_doc_ids = [c["doc_id"] for c in _chunks]
+      M = aikit.embed([c["text"] for c in _chunks])
+    sample_code: |
+      def search_docs(query, k=3):
+          order = ____
+          found = []
+          for i in order:
+              if ____:
+                  found.append(chunk_doc_ids[i])
+              if len(found) == k:
+                  break
+          return found
+
+      docs = search_docs("What do I check before depressurising the airlock?")
+      print(docs)
+    solution: |
+      def search_docs(query, k=3):
+          order = np.argsort(-(M @ aikit.embed(query)))
+          found = []
+          for i in order:
+              if chunk_doc_ids[i] not in found:
+                  found.append(chunk_doc_ids[i])
+              if len(found) == k:
+                  break
+          return found
+
+      docs = search_docs("What do I check before depressurising the airlock?")
+      print(docs)
+    tests: |
+      f = check_object("search_docs")
+      for q, k in [("What do I check before depressurising the airlock?", 3), ("Who owns the hydroponics schedule?", 4), ("fire", 2)]:
+          got = list(f(q, k))
+          want = sol["search_docs"](q, k)
+          assert len(set(got)) == len(got), "`search_docs` returned the same doc twice. Only add a doc id the first time you see it."
+          assert got == want, f"For {q!r} with k={k} expected {want}, got {got}. Walk the full chunk ranking best first and keep first occurrences."
+      check_equal("docs")
+    success_msg: Without deduplication, the airlock procedure takes several of the top slots with its own sentences. Deduplicating gives the next documents a chance, and makes doc-level metrics honest.
+
+  - id: unanswerable-scores
+    type: mc
+    title: Can a threshold spot an unanswerable question?
+    question: |
+      The handbook never states the Wi-Fi password. ORBIT runs `search("What is the Wi-Fi password?", k=1)`. What do you
+      expect the top score to be, compared with real questions such as *"What time is dinner?"*?
+    context: |
+      The console has `M`, `chunk_texts` and `search(query, k)` from the first exercise. Try both questions, plus
+      `"Who is the station dentist?"`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_chunks
+      _chunks = handbook_chunks()
+      chunk_texts = [c["text"] for c in _chunks]
+      chunk_ids = [c["id"] for c in _chunks]
+      M = aikit.embed(chunk_texts)
+      def search(query, k=5):
+          scores = M @ aikit.embed(query)
+          best = np.argsort(-scores)[:k]
+          return [(chunk_ids[i], float(scores[i])) for i in best]
+    options:
+      - text: Low (below 0.5), so a threshold like 0.6 cleanly removes it.
+        feedback: "Run it: the top score is about 0.96, matching the sentence about password rotation. Similarity measures topic overlap, and the IT page is very much about passwords."
+      - text: Very high (about 0.96), higher than for "What time is dinner?" (about 0.65), so no threshold separates them.
+        correct: true
+        feedback: "Right. Any threshold that drops the password question also drops real questions. Scores tell you whether a chunk is on topic, not whether it holds the answer. Spotting missing answers belongs to the answering step: a grounded model that can refuse, or a reranker."
+      - text: Exactly 0, because the password isn't in any chunk.
+        feedback: "A score of 0 would need no shared meaning at all. The question shares 'password' with the IT page, so the score is high."
+      - text: An error, because there is nothing to return.
+        feedback: "Top-k search always returns k results. There's no notion of 'nothing found' unless you add one."
+    hint: Compare `search("What is the Wi-Fi password?", 1)` with `search("What time is dinner?", 1)`.

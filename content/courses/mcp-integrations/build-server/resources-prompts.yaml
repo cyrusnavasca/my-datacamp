@@ -1,0 +1,327 @@
+title: Resources and prompts
+description: Serve the handbook as paginated resources and an incident-report prompt, and choose between listing, paginating and templates.
+exercises:
+  - id: resources-slides
+    type: video
+    title: Serving resources and prompts
+    slides: |
+      # Resources: list, then read
+
+      ```python
+      # resources/list  ->  what exists (no content: it may be large)
+      {"resources": [{"uri": "handbook://water-recycling", "name": "water-recycling",
+                      "title": "Water recycling", "mimeType": "text/markdown"}, ...],
+       "nextCursor": "10"}
+
+      # resources/read {"uri": "handbook://water-recycling"}  ->  the content
+      {"contents": [{"uri": "handbook://water-recycling", "mimeType": "text/markdown",
+                     "text": "The water recovery system reclaims about 93% ..."}]}
+      ```
+
+      - The **URI is the id**. Pick a scheme that says where data lives (`handbook://`, `logs://`, `file://`).
+      - `contents` is a list: one read can return several parts. Binary data goes in `blob` (base64), not `text`.
+      - An unknown URI is an error response with MCP's code **-32002** (resource not found).
+      - Servers that declare `subscribe` let clients call `resources/subscribe` and then send
+        `notifications/resources/updated` when that resource changes.
+
+      ---
+
+      ## Pagination with cursors
+
+      ```python
+      # client                                        # server
+      resources/list {}                     ->  {"resources": [10 items], "nextCursor": "c1"}
+      resources/list {"cursor": "c1"}       ->  {"resources": [10 items], "nextCursor": "c2"}
+      resources/list {"cursor": "c2"}       ->  {"resources": [4 items]}             # no cursor: done
+      ```
+
+      - The **server** picks the page size. The cursor is **opaque**: clients pass it back unchanged and
+        never compute one. A server may encode an offset, a database key or a signed token.
+      - Keep going until a response has no `nextCursor`. `tools/list` and `prompts/list` page the same way.
+      - An invalid cursor is **-32602** (invalid params).
+
+      ---
+
+      ## Prompts: templates the user picks
+
+      ```python
+      # prompts/list
+      {"prompts": [{"name": "incident-report", "description": "Draft an incident report",
+                    "arguments": [{"name": "module", "required": True},
+                                  {"name": "severity", "required": False}]}]}
+
+      # prompts/get {"name": "incident-report", "arguments": {"module": "C"}}
+      {"description": "Draft an incident report",
+       "messages": [{"role": "user", "content": {"type": "text", "text": "Write an incident report for Module C ..."}}]}
+      ```
+
+      In a prompt message, `content` is **one block**, not a list. A missing required argument is **-32602**.
+      The host shows prompts as slash commands or menu items; the user fills in the arguments.
+
+      ---
+
+      ## The same server in FastMCP
+
+      ```python
+      @mcp.resource("handbook://{doc_id}")         # a URI with a parameter becomes a resource *template*
+      def handbook_doc(doc_id: str) -> str:
+          return DOCS[doc_id]["text"]
+
+      @mcp.prompt()
+      def incident_report(module: str, severity: str = "normal") -> str:
+          """Draft an incident report for a station module."""
+          return f"Write an incident report for Module {module}. Severity: {severity}. ..."
+      ```
+
+      A **resource template** (`resources/templates/list` → `{"uriTemplate": "handbook://{doc_id}", ...}`)
+      tells clients how to build URIs themselves, without listing every resource.
+
+      ---
+
+      ## List everything, paginate, or use a template?
+
+      | approach | good for | cost | failure mode |
+      | --- | --- | --- | --- |
+      | one full list | tens of items | one big message | slow and huge as the set grows |
+      | paginated list | hundreds to thousands of items, browsable | more round trips (size ÷ page) | clients that ignore `nextCursor` see only page 1 |
+      | resource template | unbounded or computed sets (`logs://{date}`) | nothing until a read | clients must know valid parameter values |
+
+      Page size is its own trade-off: big pages mean fewer round trips but large messages; small pages
+      the reverse. Measure with your real list sizes.
+
+  - id: handbook-resources
+    type: coding
+    title: Serve the handbook as resources
+    context: |
+      `DOCS` holds the 34 current handbook documents (dicts with `id`, `title` and `text`). The
+      dispatcher `handle` and `on_initialize` are written; `handle` turns a raised
+      `RpcError(code, message, data)` into an error response. Add resources with pagination.
+    instructions:
+      - "Write `on_resources_list(params)`: read the offset from `params.get(\"cursor\")` (start at 0), return `PAGE_SIZE` items with `uri` `handbook://<id>`, `name` (the id), `title` and `mimeType` `text/markdown`. Add `nextCursor` (the next offset, as a string) only if more items remain."
+      - "Write `on_resources_read(params)`: find the doc whose URI equals `params[\"uri\"]` and return `{\"contents\": [{\"uri\", \"mimeType\", \"text\"}]}`. For an unknown URI, raise `RpcError(RESOURCE_NOT_FOUND, \"Resource not found\", {\"uri\": uri})`."
+      - "Add both to `HANDLERS` under `resources/list` and `resources/read`."
+    hint: |
+      `start = int(params.get("cursor") or 0)`, `page = DOCS[start:start + PAGE_SIZE]`, and
+      `if start + PAGE_SIZE < len(DOCS): out["nextCursor"] = str(start + PAGE_SIZE)`.
+    pre_code: |
+      import aikit
+      from kits.mcp_integrations import SUPPORTED, result, error, RpcError, MCPClient, MCPError, RESOURCE_NOT_FOUND
+      DOCS = aikit.helios.handbook(include_superseded=False)
+      PAGE_SIZE = 10
+
+      def on_initialize(params):
+          asked = params["protocolVersion"]
+          return {"protocolVersion": asked if asked in SUPPORTED else SUPPORTED[0],
+                  "capabilities": {"resources": {}},
+                  "serverInfo": {"name": "helios-handbook", "version": "0.2.0"}}
+
+      def handle(msg):
+          if "id" not in msg:
+              return None
+          handler = HANDLERS.get(msg["method"])
+          if handler is None:
+              return error(msg["id"], -32601, "Method not found")
+          try:
+              return result(msg["id"], handler(msg.get("params", {})))
+          except RpcError as e:
+              return error(msg["id"], e.code, e.message, e.data)
+    sample_code: |
+      def on_resources_list(params):
+          start = ____
+          page = DOCS[start:start + PAGE_SIZE]
+          out = {"resources": [{"uri": f"handbook://{d['id']}", "name": d["id"], "title": d["title"],
+                                "mimeType": "text/markdown"} for d in page]}
+          ____
+          return out
+
+      def on_resources_read(params):
+          uri = params["uri"]
+          for d in DOCS:
+              if f"handbook://{d['id']}" == uri:
+                  return ____
+          raise ____
+
+      HANDLERS = {"initialize": on_initialize, "ping": lambda p: {},
+                  "resources/list": on_resources_list, "resources/read": on_resources_read}
+
+      client = MCPClient(handle)
+      client.initialize()
+      print(len(client.list_resources()))
+      print(client.read_resource("handbook://water-recycling")["contents"][0]["text"][:80])
+    solution: |
+      def on_resources_list(params):
+          start = int(params.get("cursor") or 0)
+          page = DOCS[start:start + PAGE_SIZE]
+          out = {"resources": [{"uri": f"handbook://{d['id']}", "name": d["id"], "title": d["title"],
+                                "mimeType": "text/markdown"} for d in page]}
+          if start + PAGE_SIZE < len(DOCS):
+              out["nextCursor"] = str(start + PAGE_SIZE)
+          return out
+
+      def on_resources_read(params):
+          uri = params["uri"]
+          for d in DOCS:
+              if f"handbook://{d['id']}" == uri:
+                  return {"contents": [{"uri": uri, "mimeType": "text/markdown", "text": d["text"]}]}
+          raise RpcError(RESOURCE_NOT_FOUND, "Resource not found", {"uri": uri})
+
+      HANDLERS = {"initialize": on_initialize, "ping": lambda p: {},
+                  "resources/list": on_resources_list, "resources/read": on_resources_read}
+
+      client = MCPClient(handle)
+      client.initialize()
+      print(len(client.list_resources()))
+      print(client.read_resource("handbook://water-recycling")["contents"][0]["text"][:80])
+    tests: |
+      MCPClient, MCPError = user["MCPClient"], user["MCPError"]
+      c = MCPClient(user["handle"])
+      c.initialize()
+      first = user["handle"]({"jsonrpc": "2.0", "id": 900, "method": "resources/list", "params": {}})["result"]
+      assert len(first["resources"]) == 10, f"The first page should hold PAGE_SIZE (10) items, got {len(first['resources'])}."
+      assert "nextCursor" in first, "The first page needs a `nextCursor`, since more items remain."
+      allr = c.list_resources()
+      uris = [r["uri"] for r in allr]
+      assert len(uris) == 34 and len(set(uris)) == 34, f"Following `nextCursor` should yield all 34 documents exactly once; got {len(uris)} ({len(set(uris))} unique)."
+      pages = sum(1 for d, m in c.wire if d == "->" and m.get("method") == "resources/list")
+      assert pages == 4, f"34 items in pages of 10 should take 4 requests; the client made {pages}. Omit `nextCursor` on the last page."
+      assert all(r.get("mimeType") == "text/markdown" and r["uri"] == "handbook://" + r["name"] for r in allr), "Each item needs `uri` 'handbook://<id>', `name` (the id) and `mimeType` 'text/markdown'."
+      txt = c.read_resource("handbook://water-recycling")["contents"][0]
+      assert "2,400" in txt["text"] and txt["uri"] == "handbook://water-recycling", "`resources/read` should return the document's text in `contents[0]['text']`, with its `uri`."
+      try:
+          c.read_resource("handbook://does-not-exist")
+          raise AssertionError("Reading an unknown URI should return an error, not a result.")
+      except MCPError as e:
+          assert e.code == -32002, f"An unknown URI should give error -32002 (resource not found), got {e.code}."
+    success_msg: |
+      The scripted client followed the cursor through four pages without knowing how you encode it. You
+      could switch to a database key tomorrow and no client would notice; that's why cursors are opaque.
+
+  - id: incident-prompt
+    type: coding
+    title: An incident-report prompt
+    context: |
+      The commander wants a `/incident-report` command. The same `handle` dispatcher and `RpcError` are
+      available. `TEMPLATE` is the prompt text, with `{module}` and `{severity}` placeholders.
+    instructions:
+      - "Define `INCIDENT`: name `incident-report`, a description, and `arguments` `module` (required) and `severity` (not required)."
+      - "Write `on_prompts_list(params)` returning `{\"prompts\": [INCIDENT]}`."
+      - "Write `on_prompts_get(params)`: for an unknown name or a missing `module`, raise `RpcError(INVALID_PARAMS, ...)`. Otherwise fill `TEMPLATE` (severity defaults to `normal`) and return a `description` plus `messages`: one `user` message whose `content` is a single text block."
+    hint: |
+      `args = params.get("arguments") or {}`; `text = TEMPLATE.format(module=args["module"], severity=args.get("severity", "normal"))`;
+      `{"role": "user", "content": {"type": "text", "text": text}}`.
+    pre_code: |
+      from kits.mcp_integrations import SUPPORTED, result, error, RpcError, MCPClient, MCPError, INVALID_PARAMS
+      TEMPLATE = ("Write an incident report for Module {module}. Severity: {severity}. "
+                  "Read the module's current sensors first, then cover: what happened, readings, actions taken, follow-ups.")
+
+      def on_initialize(params):
+          asked = params["protocolVersion"]
+          return {"protocolVersion": asked if asked in SUPPORTED else SUPPORTED[0],
+                  "capabilities": {"prompts": {}},
+                  "serverInfo": {"name": "helios-reports", "version": "0.1.0"}}
+
+      def handle(msg):
+          if "id" not in msg:
+              return None
+          handler = HANDLERS.get(msg["method"])
+          if handler is None:
+              return error(msg["id"], -32601, "Method not found")
+          try:
+              return result(msg["id"], handler(msg.get("params", {})))
+          except RpcError as e:
+              return error(msg["id"], e.code, e.message, e.data)
+    sample_code: |
+      INCIDENT = {
+          "name": "incident-report",
+          "description": "Draft an incident report for a station module.",
+          "arguments": ____,
+      }
+
+      def on_prompts_list(params):
+          return {"prompts": [INCIDENT]}
+
+      def on_prompts_get(params):
+          if params.get("name") != "incident-report":
+              raise RpcError(INVALID_PARAMS, f"Unknown prompt: {params.get('name')}")
+          args = params.get("arguments") or {}
+          ____
+          text = ____
+          return {"description": INCIDENT["description"],
+                  "messages": [____]}
+
+      HANDLERS = {"initialize": on_initialize, "prompts/list": on_prompts_list, "prompts/get": on_prompts_get}
+
+      client = MCPClient(handle)
+      client.initialize()
+      print(client.get_prompt("incident-report", {"module": "C"}))
+    solution: |
+      INCIDENT = {
+          "name": "incident-report",
+          "description": "Draft an incident report for a station module.",
+          "arguments": [
+              {"name": "module", "description": "Module letter, A to F", "required": True},
+              {"name": "severity", "description": "low, normal or high (default normal)", "required": False},
+          ],
+      }
+
+      def on_prompts_list(params):
+          return {"prompts": [INCIDENT]}
+
+      def on_prompts_get(params):
+          if params.get("name") != "incident-report":
+              raise RpcError(INVALID_PARAMS, f"Unknown prompt: {params.get('name')}")
+          args = params.get("arguments") or {}
+          if "module" not in args:
+              raise RpcError(INVALID_PARAMS, "Missing required argument: module")
+          text = TEMPLATE.format(module=args["module"], severity=args.get("severity", "normal"))
+          return {"description": INCIDENT["description"],
+                  "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}
+
+      HANDLERS = {"initialize": on_initialize, "prompts/list": on_prompts_list, "prompts/get": on_prompts_get}
+
+      client = MCPClient(handle)
+      client.initialize()
+      print(client.get_prompt("incident-report", {"module": "C"}))
+    tests: |
+      MCPClient, MCPError = user["MCPClient"], user["MCPError"]
+      c = MCPClient(user["handle"])
+      c.initialize()
+      ps = c.list_prompts()
+      assert [p["name"] for p in ps] == ["incident-report"], "`prompts/list` should return the INCIDENT prompt."
+      args = {a["name"]: a.get("required", False) for a in ps[0].get("arguments", [])}
+      assert args == {"module": True, "severity": False}, "INCIDENT's arguments should be `module` (required) and `severity` (not required)."
+      g = c.get_prompt("incident-report", {"module": "C"})
+      msgs = g.get("messages")
+      assert isinstance(msgs, list) and len(msgs) == 1 and msgs[0].get("role") == "user", "`messages` should hold one message with role 'user'."
+      content = msgs[0].get("content")
+      assert isinstance(content, dict) and content.get("type") == "text", "In a prompt message, `content` is a single block `{'type': 'text', 'text': ...}`, not a list."
+      assert "Module C" in content["text"] and "Severity: normal" in content["text"], "Fill TEMPLATE with the module, and default severity to 'normal'."
+      assert "Severity: high" in c.get_prompt("incident-report", {"module": "E", "severity": "high"})["messages"][0]["content"]["text"], "Use the `severity` argument when it's given."
+      for bad, why in [({"name": "incident-report", "arguments": {}}, "a missing `module`"), ({"name": "shift-summary", "arguments": {"module": "A"}}, "an unknown prompt name")]:
+          try:
+              c.request("prompts/get", bad)
+              raise AssertionError(f"prompts/get with {why} should return error -32602, not a result.")
+          except MCPError as e:
+              assert e.code == -32602, f"prompts/get with {why} should return error -32602, got {e.code}."
+    success_msg: |
+      The host can now offer `/incident-report` in a menu. The prompt asks the model to read sensors
+      first, so prompts and tools work together: the user picks the workflow, the model does the calls.
+
+  - id: logs-template
+    type: mc
+    title: Sixteen hundred days of logs
+    question: |
+      Helios-7 keeps one sensor log per day since launch: about 1,600 days of roughly 40 KB each. On the
+      ground dashboard, a person picks a date and the app attaches that day's log to the conversation.
+      How should the server expose the logs?
+    options:
+      - text: A full resources/list of all 1,600 logs in one response
+        feedback: "One huge message on every listing, for a set that grows by one item a day. Nobody browses 1,600 entries anyway: the person already knows the date."
+      - text: A paginated resources/list, 50 logs per page
+        feedback: Better for browsing, but finding one date means up to 32 round trips, and the app already knows which date it wants. Pagination suits browsable sets, not lookups.
+      - text: A resource template logs://{date}, so the app builds the URI and reads that one log
+        correct: true
+        feedback: Right. The app controls which log is attached (so it's a resource), the set is large and keyed by date (so a template), and the cost is one read. List only a few recent days if you want them browsable.
+      - text: A read_log(date) tool for the model to call
+        feedback: That fits when the model decides which day it needs. Here a person picks the date and the app attaches it, which is application control, so a resource. A tool would add a model round trip and leave the choice to the model.
+    hint: Who picks the log, the model or the app? And how big is the set?

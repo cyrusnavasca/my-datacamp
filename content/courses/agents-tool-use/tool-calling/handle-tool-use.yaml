@@ -1,0 +1,193 @@
+title: The tool-use round trip
+description: Read tool_use blocks, run the tool, send back a tool_result with the matching id, and get the final answer.
+exercises:
+  - id: round-trip-slides
+    type: video
+    title: Two calls for one answer
+    slides: |
+      # One answer, two API calls
+
+      ```text
+      you    → model   user: "How humid is hydroponics?"            + tools
+      model  → you     tool_use get_sensor {module: C, metric: humidity}   stop_reason = "tool_use"
+      you              station.run_tool("get_sensor", {...})  →  '{"value": 68.0, "unit": "%"}'
+      you    → model   the whole conversation again + a tool_result
+      model  → you     "Humidity in hydroponics is 68%."          stop_reason = "end_turn"
+      ```
+
+      The model is stateless (you saw this in the prompting course), so the second call must resend the question **and** the
+      model's own tool call. The tool result only makes sense next to the request that produced it.
+
+      ---
+
+      ## The exact messages
+
+      ```python
+      messages = [
+          {"role": "user", "content": "How humid is hydroponics?"},
+          {"role": "assistant", "content": r1.content},     # unchanged: text + tool_use blocks
+          {"role": "user", "content": [
+              {"type": "tool_result",
+               "tool_use_id": "toolu_01A...",                 # = the tool_use block's .id
+               "content": '{"module": "C", "metric": "humidity", "value": 68.0, "unit": "%"}'},
+          ]},
+      ]
+      r2 = client.messages.create(model="claude-sonnet-5-5", max_tokens=1024, tools=TOOLS, messages=messages)
+      ```
+
+      The API checks the pairing. Every `tool_use` in an assistant turn needs a `tool_result` with the same id in the
+      **very next** user message, and every `tool_result` must point at a `tool_use` in the turn just before it.
+      Break either rule and you get a `400 invalid_request_error`, not a wrong answer.
+
+      ---
+
+      ## Dispatching safely
+
+      ```python
+      HANDLERS = {"get_sensor": read_sensor, "crew_roster": list_crew}
+
+      def run(block):
+          fn = HANDLERS.get(block.name)
+          if fn is None:
+              return tool_result(block.id, f"unknown tool {block.name!r}", is_error=True)
+          return tool_result(block.id, fn(**block.input))
+      ```
+
+      - Look tools up in an **explicit table**. Never `eval` a name, or `getattr` on a module, from model output.
+      - `block.input` is already a dict. Don't `json.loads` it.
+      - Results are strings (or text and image blocks). Serialise dicts with `json.dumps`.
+
+      ---
+
+      ## Steering the choice with `tool_choice`
+
+      | `tool_choice` | the model must... | use it when | cost |
+      | --- | --- | --- | --- |
+      | `{"type": "auto"}` (default) | decide: a tool or plain text | normal assistants | none |
+      | `{"type": "any"}` | call some tool | a pipeline step that always needs a tool | it can't say "I don't need one" |
+      | `{"type": "tool", "name": "get_sensor"}` | call exactly that tool | extraction, tool use as a schema | no judgement left to the model |
+      | `{"type": "none"}` | answer in text | summarising after tools ran | none |
+
+      Forcing a tool removes a failure mode (the model answers from memory) and adds another (it calls the tool even
+      when the request makes no sense for it).
+
+      ---
+
+      ## When the round trip breaks
+
+      | symptom | check first | usual cause |
+      | --- | --- | --- |
+      | `400 ... tool_use ids ... need a matching tool_result` | the message after the assistant turn | results not sent, sent in two messages, or an id typo |
+      | `400 ... tool_result for unknown tool_use_id` | is the assistant turn in `messages`? | you appended the results but not the model's turn |
+      | the model answers without calling the tool | the tool's description, `tool_choice` | the description doesn't match the request's words |
+      | the final answer ignores the result | the `content` you sent | an empty string, `None`, or a Python `repr` instead of JSON |
+
+  - id: dispatch-block
+    type: parsons
+    title: Answer every tool call
+    prompt: |
+      `response` asked for one or more tools. Arrange the lines so the model's turn is saved **first**, every `tool_use`
+      block is run, and all results go back in **one** user message.
+    hint: The assistant turn goes into `messages` before you build the results. The results list must exist before the loop fills it.
+    lines:
+      - "messages.append({\"role\": \"assistant\", \"content\": response.content})"
+      - "results = []"
+      - "for block in response.content:"
+      - "    if block.type == \"tool_use\":"
+      - "        output = station.run_tool(block.name, block.input)"
+      - "        results.append({\"type\": \"tool_result\", \"tool_use_id\": block.id, \"content\": output})"
+      - "messages.append({\"role\": \"user\", \"content\": results})"
+      - "final = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)"
+
+  - id: first-round-trip
+    type: coding
+    title: ORBIT's first tool call
+    context: |
+      `client` is a practice model that picks tools from their descriptions, and `station` is Helios-7. Kenji asks how
+      humid hydroponics is. Run the full round trip yourself.
+    instructions:
+      - "Call the model with `messages` and `tools=TOOLS`; store the reply in `r1`. Find its `tool_use` block and store it in `call`."
+      - "Append the assistant turn (`r1.content`). Run the tool with `station.run_tool(call.name, call.input)` and append a user message holding one `tool_result` block for `call.id`."
+      - "Call the model again with the same arguments; store the reply text in `answer` and print it."
+    hint: |
+      `call = next(b for b in r1.content if b.type == "tool_use")`. The result block is
+      `{"type": "tool_result", "tool_use_id": call.id, "content": output}`. The answer is `r2.content[0].text`.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      client = aikit.FakeClaude(aikit.tool_chooser("ORBIT: here is the reading: {result}"), clock=aikit.VirtualClock())
+      messages = [{"role": "user", "content": "How humid is hydroponics right now?"}]
+    sample_code: |
+      r1 = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+      print(r1.stop_reason)
+      call = ____
+
+      messages.append(____)
+      output = station.run_tool(call.name, call.input)
+      messages.append({"role": "user", "content": [____]})
+
+      r2 = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+      answer = ____
+      print(answer)
+    solution: |
+      r1 = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+      print(r1.stop_reason)
+      call = next(b for b in r1.content if b.type == "tool_use")
+
+      messages.append({"role": "assistant", "content": r1.content})
+      output = station.run_tool(call.name, call.input)
+      messages.append({"role": "user", "content": [{"type": "tool_result", "tool_use_id": call.id, "content": output}]})
+
+      r2 = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+      answer = r2.content[0].text
+      print(answer)
+    tests: |
+      check_object("answer")
+      m = user["messages"]
+      assert len(m) == 3, f"`messages` should hold 3 messages before the second call (user, assistant, user with the result); it holds {len(m)}."
+      assert m[1]["role"] == "assistant", "The second message must be the model's turn: `{'role': 'assistant', 'content': r1.content}`."
+      blocks = m[2]["content"]
+      assert isinstance(blocks, list) and len(blocks) == 1 and blocks[0].get("type") == "tool_result", "The third message should be a user message whose content is a list with one `tool_result` block."
+      assert blocks[0].get("tool_use_id") == user["call"].id, "`tool_use_id` must be `call.id`, the id of the tool_use block you are answering."
+      acts = user["station"].actions
+      assert [a["tool"] for a in acts] == ["get_sensor"], f"Run the tool exactly once; the station saw {[a['tool'] for a in acts]}."
+      assert "68.0" in user["answer"], "The final answer should contain the humidity the tool returned (68.0). Is `answer` the text of the second reply?"
+    success_msg: |
+      That's the whole mechanism: the model asked, your code acted, and the model answered from the result. Everything
+      in the rest of the course (loops, memory, guardrails) is built on this round trip.
+
+  - id: predict-400
+    type: mc
+    title: Predict the error
+    question: |
+      A teammate's code does this after the first call. What happens on the second `create`?
+
+      ```python
+      r1 = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+      call = next(b for b in r1.content if b.type == "tool_use")
+      output = station.run_tool(call.name, call.input)
+      messages.append({"role": "user", "content": [
+          {"type": "tool_result", "tool_use_id": call.id, "content": output}]})
+      r2 = client.messages.create(model=MODEL, max_tokens=500, tools=TOOLS, messages=messages)
+      ```
+    context: The console has `client`, `station`, `TOOLS`, `MODEL` and a fresh `messages` list. Run the snippet and see.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import HeliosStation, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      client = aikit.FakeClaude(aikit.tool_chooser("ORBIT: here is the reading: {result}"), clock=aikit.VirtualClock())
+      messages = [{"role": "user", "content": "How humid is hydroponics right now?"}]
+    options:
+      - text: "A `BadRequestError`: the `tool_result` points at a `tool_use` id that isn't in the previous turn."
+        correct: true
+        feedback: "Right. The model's turn, which holds the `tool_use` block, was never appended, so the API sees a result for a call it doesn't know about. Append `{'role': 'assistant', 'content': r1.content}` before the results."
+      - text: It works, because the result holds the reading the model needs.
+        feedback: "The API validates the structure before the model sees anything. A result with no matching call is rejected. Run it in the console."
+      - text: The model calls `get_sensor` again, because it can't see that it already did.
+        feedback: "That's what happens when results are sent as plain text without the assistant turn (chapter 2 covers it). Here the result is a real `tool_result` block, and the API rejects it first."
+      - text: A `KeyError` in your code, because `call.id` is missing.
+        feedback: "`call.id` exists; it's the id you copied into `tool_use_id`. The problem is in what `messages` contains."
+    hint: Which message holds the `tool_use` block with id `call.id`? Is it in `messages`?

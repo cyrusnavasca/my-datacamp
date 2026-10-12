@@ -1,0 +1,246 @@
+title: Stop system prompt leaks
+description: Trace a secret leak to where the secret enters the context, remove it, add an output scan as a backstop, and measure what scanning costs a streaming chat.
+exercises:
+  - id: leak-slides
+    type: video
+    title: The system prompt is not a vault
+    slides: |
+      # The system prompt is not a vault
+
+      **LLM07, system prompt leakage**: anything in the context can come back out. An injected log, a curious crew member,
+      a debugging transcript, a summary that quotes its instructions. "Never reveal the code" is one more line of text,
+      and it competes with every other line.
+
+      Two separate questions:
+
+      | question | if yes |
+      | --- | --- |
+      | Does the prompt contain something that's harmful **if read**? (codes, keys, internal hostnames, other users' data) | it will leak eventually, so move it out |
+      | Does security **depend on** the prompt staying secret? (e.g. "the rules are hidden, so nobody can bypass them") | redesign: enforce the rules in code |
+
+      A leaked persona or tone guide is embarrassing. A leaked airlock override code is an incident.
+
+      ---
+
+      ## Where secrets belong
+
+      ORBIT doesn't need the override code to answer questions, so the fix is **deletion**. When an action really needs a
+      credential, the **tool** holds it, server-side:
+
+      ```python
+      def _t_unlock_cabinet(self, crew):              # the model asks; the tool authorises
+          if crew not in AUTHORISED["medicines_cabinet"]:
+              raise ToolError("not authorised")
+          return hardware.unlock(code=VAULT["medicines_cabinet"])   # the code never enters the context
+      ```
+
+      The model passes **intent** ("unlock for Dr. Raman"). Your code checks who's asking and uses the credential. A
+      fooled model can ask, but can't make the check pass.
+
+      ---
+
+      ## Canaries and output scans: the backstop
+
+      - A **canary** is a unique string you plant (in a prompt, a document, a fake record) purely to detect leaks. If it
+        ever shows up in an output, a log or on the internet, you know exactly which source leaked.
+      - An **output scan** searches each reply for known secrets, canaries and identifier patterns before it leaves.
+
+      Scans catch **verbatim** leaks only. A fooled model can spell a secret out, translate it or split it across messages,
+      so a scan is a backstop and never the main control. With **streaming**, you can't scan text you've already shown,
+      so scanning means buffering the reply. Time to first token becomes total time.
+
+      ---
+
+      ## Playbook: "the override code appeared in a chat transcript"
+
+      1. **Symptom:** a secret or canary turns up in an output or a log.
+      2. **Measure:** leak rate on the harness, split by channel. Scan stored transcripts for the same string.
+      3. **Diagnose**, two separate questions:
+         - **Where does the secret enter the context?** Search every context source (system prompt, documents, tool results, memory) for it.
+         - **What triggers it?** Which cases leak: only those with untrusted text, or benign ones too?
+      4. **Fix**, strongest first: remove the secret from the context → move it behind a tool that authorises → add an output scan as a backstop.
+      5. **Verify:** leak rate 0, legitimate answers unchanged, and the scan's latency cost written down.
+
+      ---
+
+      ## Removal versus scanning
+
+      | control | stops verbatim leaks | stops transformed leaks | latency | usability | wins when |
+      | --- | --- | --- | --- | --- | --- |
+      | **remove the secret** | yes | yes | none | none, if the model never needed it | always try first |
+      | **secret behind a tool** | yes | yes | one tool call when used | needs an authorisation design | the action needs the credential |
+      | **output scan, buffered** | yes | no | time to first token becomes total time | slower-feeling chat | backstop for secrets you can't remove (canaries, identifiers) |
+      | **output scan, per chunk while streaming** | mostly; a secret split across chunks slips through | no | small | text already shown can't be taken back | low-stakes identifiers |
+
+  - id: find-the-source
+    type: coding
+    title: Where does the secret come from?
+    context: |
+      `transcripts` holds one row per harness case for ORBIT v1 (`leaked`, `channel`, `text`). `channel` is `None` for
+      cases with no untrusted text. `CONTEXT_SOURCES` maps each source of ORBIT's context (system prompt, handbook,
+      maintenance log, tool schemas) to its full text.
+    instructions:
+      - "**Measure:** store the leak rate per channel in the Series `leak_by_channel`. Fill missing channels with `'none'` first, or those rows are dropped from the groupby."
+      - "**Diagnose the source:** store the names of the `CONTEXT_SOURCES` whose text contains `SECRET` in the list `secret_sources`."
+      - "**Diagnose the trigger:** store the number of leaked cases that had **no** untrusted text (channel `None`) in `leaks_without_untrusted`."
+    hint: |
+      `transcripts.fillna({"channel": "none"}).groupby("channel")["leaked"].mean()`. For the trigger, filter on
+      `transcripts["channel"].isna() & transcripts["leaked"]`.
+    pre_code: |
+      import json
+      from kits.ai_security_guardrails import *
+      transcripts = evaluate(make_app())
+      CONTEXT_SOURCES = {
+          "system prompt": SYSTEM_WITH_SECRET,
+          "handbook": "\n".join(d["text"] for d in helios.handbook()),
+          "maintenance log": LOG_TEXT,
+          "tool schemas": json.dumps(ALL_TOOLS),
+      }
+    sample_code: |
+      leak_by_channel = ____
+      secret_sources = ____
+      leaks_without_untrusted = ____
+      print(leak_by_channel)
+      print(secret_sources, leaks_without_untrusted)
+    solution: |
+      leak_by_channel = transcripts.fillna({"channel": "none"}).groupby("channel")["leaked"].mean()
+      secret_sources = [name for name, text in CONTEXT_SOURCES.items() if SECRET in text]
+      leaks_without_untrusted = int((transcripts["channel"].isna() & transcripts["leaked"]).sum())
+      print(leak_by_channel)
+      print(secret_sources, leaks_without_untrusted)
+    tests: |
+      check_equal("leak_by_channel", msg="Fill `channel` with 'none', group by it, and take the mean of `leaked`. You should get four groups.")
+      check_equal("secret_sources", ["system prompt"], msg="Check each source's text for `SECRET` and keep the names that contain it.")
+      check_equal("leaks_without_untrusted", 0, msg="Count rows where `channel` is missing (`isna()`) and `leaked` is True.")
+    success_msg: |
+      The two diagnoses point to different fixes. The trigger is the untrusted log (every leak has it in context),
+      which you handled in chapter 2. The *source* is the system prompt, and only that source. Remove it there, and
+      no trigger can make ORBIT leak the code, through any channel.
+
+  - id: scan-or-remove
+    type: mc
+    title: Scan the stream, or remove the secret?
+    question: |
+      ORBIT streams its replies; crew like seeing the first words in about half a second. Two teams propose fixes for
+      the override code leak. Team A: buffer each full reply and scan it for the code before showing it. Team B: delete
+      the code from the system prompt (ORBIT never uses it). What do you ship?
+    options:
+      - text: Team B, and keep a scan only for canaries and identifiers you can't remove.
+        correct: true
+        feedback: |
+          Right. Deletion stops verbatim and transformed leaks at zero latency cost. A buffered scan makes every reply
+          wait for its last token and still misses a code that has been spelled out or split up. Keep scans as backstops.
+      - text: Team A, because scanning catches leaks from every source, not just the prompt.
+        feedback: |
+          Scanning finds only the strings it knows, and only verbatim. It makes every reply as slow as its last token
+          when the crew wants the first. Removing the secret is stronger and costs nothing.
+      - text: Both, scanning each streamed chunk as it goes out to avoid the latency hit.
+        feedback: |
+          Chunk scanning can miss a secret split across two chunks, and text already shown can't be taken back.
+          Once the code is deleted it adds little for this secret.
+      - text: Neither; add "never reveal the code" twice in the system prompt.
+        feedback: That is more text competing with injected text. You already measured that this fails.
+    hint: Which fix works for every way of leaking and costs no latency?
+
+  - id: seal-the-leaks
+    type: sequential
+    title: "Mission: seal the leaks"
+    context: |
+      Leaks of the override code have been confirmed. Measure the leak, remove the secret, add an output scan as a
+      backstop, and measure what scanning costs a streaming chat. `evaluate`, `rates` and `make_app` are loaded, along
+      with `SYSTEM` (no secret), `SYSTEM_WITH_SECRET` and `SECRET`.
+    pre_code: |
+      import re
+      from kits.ai_security_guardrails import *
+      MRN_RE = re.compile(r"\bMR[-\s]?\d{4}\b", re.I)
+      stream_client = FakeClaude(orbit_model(), clock=VirtualClock())
+      STREAM_CASE = [c for c in cases() if c["id"] == "risky-03"][0]
+    steps:
+      - instructions:
+          - "**Measure.** Evaluate ORBIT v1 (`make_app()`) into `base_df` and store the mean of its `leaked` column in `leak_before`."
+        hint: "`base_df = evaluate(make_app())`, then `leak_before = base_df['leaked'].mean()`."
+        sample_code: |
+          base_df = ____
+          leak_before = ____
+          print(leak_before)
+        solution: |
+          base_df = evaluate(make_app())
+          leak_before = base_df["leaked"].mean()
+          print(leak_before)
+        tests: |
+          check_equal("leak_before", tol=1e-6, msg="Evaluate `make_app()` and take the mean of `leaked`.")
+      - instructions:
+          - "**Fix by removal.** Evaluate `make_app(system=SYSTEM)` into `fixed_df` and store its leak rate in `leak_after`."
+          - "Store in `answers_kept` whether every `benign` and `risky` case has the same `completed` value in `fixed_df` as in `base_df` (a single bool)."
+        hint: |
+          `legit = base_df["kind"].isin(["benign", "risky"])`, then
+          `bool((fixed_df.loc[legit, "completed"].values == base_df.loc[legit, "completed"].values).all())`.
+        sample_code: |
+          fixed_df = ____
+          leak_after = ____
+          legit = base_df["kind"].isin(["benign", "risky"])
+          answers_kept = ____
+          print(leak_after, answers_kept)
+        solution: |
+          fixed_df = evaluate(make_app(system=SYSTEM))
+          leak_after = fixed_df["leaked"].mean()
+          legit = base_df["kind"].isin(["benign", "risky"])
+          answers_kept = bool((fixed_df.loc[legit, "completed"].values == base_df.loc[legit, "completed"].values).all())
+          print(leak_after, answers_kept)
+        tests: |
+          check_equal("leak_after", 0.0, msg="With `system=SYSTEM` the secret isn't in the context, so nothing can leak it.")
+          check_equal("answers_kept", True, msg="Compare the `completed` values of the legitimate rows. Removing the secret shouldn't change any answer.")
+      - instructions:
+          - "**Backstop.** Write `scan_output(text)` that replaces `SECRET` with `[REDACTED]` and replaces medical record numbers (`MRN_RE`) with `[MRN]`."
+          - "Evaluate `make_app(system=SYSTEM_WITH_SECRET, output_check=scan_output)` (secret deliberately put back) into `scan_df` and store its leak rate in `leak_with_scan`."
+        hint: "`text.replace(SECRET, '[REDACTED]')`, then `MRN_RE.sub('[MRN]', text)`."
+        sample_code: |
+          def scan_output(text):
+              text = ____
+              text = ____
+              return text
+
+          scan_df = ____
+          leak_with_scan = ____
+          print(leak_with_scan)
+        solution: |
+          def scan_output(text):
+              text = text.replace(SECRET, "[REDACTED]")
+              text = MRN_RE.sub("[MRN]", text)
+              return text
+
+          scan_df = evaluate(make_app(system=SYSTEM_WITH_SECRET, output_check=scan_output))
+          leak_with_scan = scan_df["leaked"].mean()
+          print(leak_with_scan)
+        tests: |
+          f = check_object("scan_output")
+          out = f("Code 7741-KESTREL for MR-1042 and mr 1077.")
+          assert "7741-KESTREL" not in out, "`scan_output` must replace the secret with [REDACTED]."
+          assert "1042" not in out and "1077" not in out, "`scan_output` must replace record numbers in any format matched by `MRN_RE`."
+          check_equal("leak_with_scan", 0.0, msg="Pass `output_check=scan_output` to `make_app` so every reply is scanned before it leaves.")
+      - instructions:
+          - "**Cost.** Stream `STREAM_CASE` with `stream_client.messages.stream(model=MODEL, max_tokens=600, system=SYSTEM, messages=[{'role': 'user', 'content': build_user_message(STREAM_CASE)}])`. Store `s.time_to_first_token_ms` in `ttft_streaming` and `s.total_ms` (when a buffered scan could first show anything) in `ttft_buffered`."
+          - "Store `ttft_buffered / ttft_streaming` in `slowdown`."
+        hint: "Inside `with ... as s:`, read the two properties of `s`."
+        sample_code: |
+          with stream_client.messages.stream(model=MODEL, max_tokens=600, system=SYSTEM,
+                                             messages=[{"role": "user", "content": build_user_message(STREAM_CASE)}]) as s:
+              ttft_streaming = ____
+              ttft_buffered = ____
+          slowdown = ____
+          print(ttft_streaming, ttft_buffered, round(slowdown, 2))
+        solution: |
+          with stream_client.messages.stream(model=MODEL, max_tokens=600, system=SYSTEM,
+                                             messages=[{"role": "user", "content": build_user_message(STREAM_CASE)}]) as s:
+              ttft_streaming = s.time_to_first_token_ms
+              ttft_buffered = s.total_ms
+          slowdown = ttft_buffered / ttft_streaming
+          print(ttft_streaming, ttft_buffered, round(slowdown, 2))
+        tests: |
+          check_equal("ttft_streaming", tol=1e-6, msg="Read `s.time_to_first_token_ms` inside the `with` block.")
+          check_equal("ttft_buffered", tol=1e-6, msg="A buffered scan shows nothing until the reply ends: read `s.total_ms`.")
+          check_equal("slowdown", tol=1e-6, msg="Divide `ttft_buffered` by `ttft_streaming`.")
+    success_msg: |
+      Removing the secret took the leak rate to zero and changed no legitimate answer. The scan also reached zero with
+      the secret put back, but only because these leaks are verbatim. It also makes the crew wait for the whole reply
+      before seeing anything. Ship the removal, and keep the scan as a backstop for identifiers.

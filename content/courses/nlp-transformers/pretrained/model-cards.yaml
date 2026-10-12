@@ -1,0 +1,334 @@
+title: Model cards, domain shift and adapting a model
+description: Read a model card for risks, measure how a pretrained model fails on crew messages, and fix it with a small head trained on frozen transformer features.
+exercises:
+  - id: intro
+    type: video
+    title: Read the card, then measure on your data
+    slides: |
+      # What a model card tells you
+
+      Every serious checkpoint ships with a card (`README.md` on the Hub). Read it **before** you deploy.
+
+      | section | question it answers | DistilBERT SST-2 |
+      | --- | --- | --- |
+      | intended use | what task, which inputs? | binary sentiment of English sentences |
+      | training data | what did it learn from? | SST-2: sentences from movie reviews |
+      | labels | what can it output? | `NEGATIVE`, `POSITIVE`, and nothing else |
+      | evaluation | how good, on what? | about 91% accuracy on the SST-2 dev set |
+      | limitations and bias | where does it fail? | can produce biased predictions for some groups, names and countries |
+      | licence | may you use it, and how? | Apache-2.0 |
+
+      The evaluation number is for **their** data. It says nothing about crew messages.
+
+      ---
+
+      ## Domain shift and the missing class
+
+      Crew messages are not movie reviews. Worse, many are **neutral** ("Cancel my lab booking for
+      Friday."), and the model has no neutral label, so it must pick a side:
+
+      ```
+      NEGATIVE 0.94  Please book bench 2 in Module B for Thursday.
+      POSITIVE 0.90  The comms window opens at 14:00.
+      ```
+
+      A softmax always sums to 1 over the labels it has. **High confidence is not correctness**, least of
+      all on inputs unlike the training data.
+
+      ---
+
+      ## Playbook: a pretrained model underperforms on your data
+
+      **Measure** on 50-200 labelled examples from your own traffic: accuracy, and the error that hurts
+      most (here, the **false-alarm rate**: neutral messages flagged as negative).
+
+      **Diagnose** with the card in hand: label set mismatch? different domain or language? inputs longer
+      than the training length? Read 20 errors by eye.
+
+      **Fix**, cheapest first:
+
+      | fix | what it costs | what it cannot do |
+      | --- | --- | --- |
+      | threshold / abstain band ("neutral if score < τ") | nothing; tune τ on labelled data | create a class the model never learned; confident mistakes stay |
+      | frozen features + small head | ~100 labels, seconds on a CPU | adapt the features themselves |
+      | full fine-tune | 1,000s of labels, a GPU, careful validation | stay cheap; risks overfitting and forgetting |
+      | a different model (or an LLM with a prompt) | evaluation time, maybe per-call cost | |
+
+      **Verify** on a held-out split, against every option you tried, including the TF-IDF baseline.
+
+      ---
+
+      ## Fine-tuning basics: frozen features vs full fine-tune
+
+      **Frozen features.** Run the encoder once, average the last hidden states over real tokens (mean
+      pooling, using the attention mask), and train logistic regression on those vectors:
+
+      ```python
+      with torch.no_grad():
+          h = model(**enc, output_hidden_states=True).hidden_states[-1]   # (B, n, 768)
+      m = enc["attention_mask"].unsqueeze(-1).float()
+      features = (h * m).sum(1) / m.sum(1)                                # padding excluded
+      ```
+
+      **Full fine-tune.** Replace the classification head with one for your labels
+      (`num_labels=3`), then train **all** weights with a small learning rate (about 2e-5) for 2-4 epochs,
+      watching validation loss. The `fine-tuning-llms` course covers this and LoRA, which trains a small
+      add-on instead of every weight.
+
+      Start frozen. Fine-tune only when the frozen head plateaus below your target and you have the labels.
+
+  - id: card-risks
+    type: classify
+    title: Which part of the card warns you?
+    prompt: Each risk below comes from deploying the DistilBERT SST-2 or DistilGPT2 model on Helios-7. Sort it by the model card section that warns you about it.
+    hint: Where it learned from points to training data. What it can output and is meant for points to labels and intended use. Known failure patterns point to limitations. Permission to use it points to the licence.
+    zones: [Training data, Labels and intended use, Limitations and bias, Licence]
+    items:
+      - { text: "It only ever saw English movie-review sentences", zone: Training data }
+      - { text: "Station jargon like 'scrubber' and 'EVA' was rare or absent when it was trained", zone: Training data }
+      - { text: "There is no neutral class, so every message is forced to POSITIVE or NEGATIVE", zone: Labels and intended use }
+      - { text: "It scores sentiment, not urgency, so a calm report of a fire scores as neutral-ish", zone: Labels and intended use }
+      - { text: "It can rate sentences mentioning certain names or countries more negatively", zone: Limitations and bias }
+      - { text: "DistilGPT2 can generate false or offensive statements and must not be used for facts", zone: Limitations and bias }
+      - { text: "Whether the weights may ship inside a commercial product", zone: Licence }
+      - { text: "Whether you must keep the copyright notice when you redistribute the model", zone: Licence }
+
+  - id: measure-shift
+    type: coding
+    title: Measure the domain shift
+    context: |
+      `mood` is a DataFrame of 108 crew messages with a `label` column: `positive`, `negative` or
+      `neutral` (36 each). `clf` is the sentiment pipeline and `np` is imported.
+    instructions:
+      - "Run `clf` on all messages and store the lowercased predicted labels in a NumPy array `preds` and the scores in `scores`."
+      - "Store the share of truly `neutral` messages predicted `negative` in `false_alarm`, and the mean score on neutral messages in `neutral_conf`."
+      - "Store the accuracy on the `positive` and `negative` messages only in `polar_acc`."
+    hint: "`y = mood[\"label\"].to_numpy()`; `neutral = y == \"neutral\"`; `false_alarm = np.mean(preds[neutral] == \"negative\")`; `polar_acc = np.mean(preds[~neutral] == y[~neutral])`."
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import sentiment_pipeline, mood_messages
+      clf = sentiment_pipeline()
+      mood = mood_messages()
+    sample_code: |
+      results = clf(list(mood["text"]))
+      preds = np.array([____ for r in results])
+      scores = np.array([____ for r in results])
+
+      y = mood["label"].to_numpy()
+      neutral = y == "neutral"
+      false_alarm = ____
+      neutral_conf = ____
+      polar_acc = ____
+      print(f"on pos/neg messages: {polar_acc:.0%} correct")
+      print(f"neutral flagged as negative: {false_alarm:.0%} (mean confidence {neutral_conf:.2f})")
+    solution: |
+      results = clf(list(mood["text"]))
+      preds = np.array([r["label"].lower() for r in results])
+      scores = np.array([r["score"] for r in results])
+
+      y = mood["label"].to_numpy()
+      neutral = y == "neutral"
+      false_alarm = np.mean(preds[neutral] == "negative")
+      neutral_conf = scores[neutral].mean()
+      polar_acc = np.mean(preds[~neutral] == y[~neutral])
+      print(f"on pos/neg messages: {polar_acc:.0%} correct")
+      print(f"neutral flagged as negative: {false_alarm:.0%} (mean confidence {neutral_conf:.2f})")
+    tests: |
+      import numpy as np
+      p = check_object("preds")
+      assert set(np.asarray(p).tolist()) <= {"positive", "negative"}, "`preds` should hold lowercased labels: 'positive' or 'negative'."
+      check_equal("preds")
+      check_equal("scores", tol=1e-4, msg="`scores` should hold each result's 'score'.")
+      check_equal("false_alarm", msg="`false_alarm` is the share of neutral messages whose prediction is 'negative'.")
+      check_equal("neutral_conf", tol=1e-4, msg="`neutral_conf` is the mean score over the neutral messages.")
+      check_equal("polar_acc", msg="`polar_acc` is the accuracy over the positive and negative messages only.")
+    success_msg: "On real sentiment it is excellent, about 95%. But almost every neutral request gets flagged as negative, at about 0.94 confidence. A dashboard built on this would show a crew in crisis."
+    timeout: 120
+
+  - id: choose-adaptation
+    type: mc
+    title: Choose how to adapt the model
+    question: |
+      The crew mood dashboard must separate positive, negative **and neutral** messages, with at most 15%
+      of neutral messages flagged negative. You have 64 labelled messages, a CPU only, and one afternoon.
+      Which approach do you try first?
+    options:
+      - text: Keep the pipeline and call anything with a score below some threshold neutral
+        feedback: Worth measuring, because it costs nothing, but neutral messages get scores of 0.9-0.99, so no threshold separates them cleanly. A threshold cannot create a class the model never learned.
+      - text: Fully fine-tune DistilBERT with a new 3-class head on the 64 messages
+        feedback: Possible, but 64 examples is very little for updating 66M weights; it overfits easily, and without a GPU it is slow to iterate on. Keep it for when you have more labels.
+      - text: Extract frozen DistilBERT features (mean-pooled hidden states) and train a 3-class logistic regression on the 64 messages
+        correct: true
+        feedback: Right. The pretrained features already encode tone and topic; a linear head learns the neutral class from a few dozen examples in seconds on a CPU. Measure it against the threshold and TF-IDF options on held-out messages.
+      - text: Train a TF-IDF + logistic regression model instead; it beat the transformer on tickets
+        feedback: Tickets were templated, so word overlap was enough. Mood messages are varied, and with 64 examples most test words are unseen. Measure it as a baseline, but do not expect much.
+    hint: Which option can learn a new class from a few dozen examples without updating millions of weights?
+
+  - id: mood-monitor-mission
+    type: sequential
+    title: "Mission: a crew mood monitor that knows neutral"
+    xp: 200
+    timeout: 180
+    context: |
+      **Mission.** The medical officer wants a daily crew mood dashboard. The off-the-shelf sentiment model
+      flags almost every routine request as negative. Measure the problem, try the cheap fix, build the
+      better one and prove it with numbers.
+
+      Loaded: `train` (64 messages) and `test` (44) DataFrames with `text` and `label`
+      (`positive`/`negative`/`neutral`); `clf` (the sentiment pipeline); `tok` and `model` (the same
+      DistilBERT, eval mode); `LogisticRegression`, `TfidfVectorizer`, `make_pipeline`, `torch` and `np`.
+      `y_train` and `y_test` hold the labels as arrays.
+    pre_code: |
+      import numpy as np
+      import torch
+      from sklearn.linear_model import LogisticRegression
+      from sklearn.feature_extraction.text import TfidfVectorizer
+      from sklearn.pipeline import make_pipeline
+      from kits.nlp_transformers import sentiment_pipeline, load_sentiment, mood_split
+      clf = sentiment_pipeline()
+      tok, model = load_sentiment()
+      train, test = mood_split()
+      y_train, y_test = train["label"].to_numpy(), test["label"].to_numpy()
+      def false_alarm_rate(preds, y):
+          neutral = y == "neutral"
+          return float(np.mean(np.asarray(preds)[neutral] == "negative"))
+    steps:
+      - instructions:
+          - "**Measure.** Run `clf` on the test texts. Store the lowercased labels in an array `base_preds` and the scores in `base_scores`."
+          - "Store the 3-class accuracy against `y_test` in `base_acc` and `false_alarm_rate(base_preds, y_test)` in `base_fa`."
+        hint: "`results = clf(list(test[\"text\"]))`, then `np.array([r[\"label\"].lower() for r in results])`."
+        sample_code: |
+          results = clf(list(test["text"]))
+          base_preds = ____
+          base_scores = ____
+          base_acc = ____
+          base_fa = ____
+          print(f"pipeline: accuracy {base_acc:.0%}, false alarms {base_fa:.0%}")
+        solution: |
+          results = clf(list(test["text"]))
+          base_preds = np.array([r["label"].lower() for r in results])
+          base_scores = np.array([r["score"] for r in results])
+          base_acc = np.mean(base_preds == y_test)
+          base_fa = false_alarm_rate(base_preds, y_test)
+          print(f"pipeline: accuracy {base_acc:.0%}, false alarms {base_fa:.0%}")
+        tests: |
+          check_equal("base_preds", msg="`base_preds` should be the lowercased pipeline labels for `test['text']`, in order.")
+          check_equal("base_acc", msg="`base_acc` is the share of `base_preds` equal to `y_test`.")
+          check_equal("base_fa", msg="`base_fa` is `false_alarm_rate(base_preds, y_test)`.")
+      - instructions:
+          - "**Cheap fix: an abstain band.** Write `band(preds, scores, tau)` that returns `\"neutral\"` where `scores < tau` and the original label elsewhere."
+          - "Run `clf` on the **train** texts, then pick `best_tau` from `[0.9, 0.95, 0.98, 0.99, 0.995, 0.999]` with the highest train accuracy (the first one if tied)."
+          - "Apply it to the test predictions: store the accuracy in `band_acc` and the false-alarm rate in `band_fa`."
+        hint: "`np.where(scores < tau, \"neutral\", preds)`. Collect train accuracies in a list and use `taus[int(np.argmax(accs))]`."
+        sample_code: |
+          def band(preds, scores, tau):
+              return ____
+
+          r_train = clf(list(train["text"]))
+          tr_preds = np.array([r["label"].lower() for r in r_train])
+          tr_scores = np.array([r["score"] for r in r_train])
+          taus = [0.9, 0.95, 0.98, 0.99, 0.995, 0.999]
+          accs = [np.mean(band(tr_preds, tr_scores, t) == y_train) for t in taus]
+          best_tau = ____
+
+          band_preds = band(base_preds, base_scores, best_tau)
+          band_acc = ____
+          band_fa = ____
+          print(f"tau={best_tau}: accuracy {band_acc:.0%}, false alarms {band_fa:.0%}")
+        solution: |
+          def band(preds, scores, tau):
+              return np.where(scores < tau, "neutral", preds)
+
+          r_train = clf(list(train["text"]))
+          tr_preds = np.array([r["label"].lower() for r in r_train])
+          tr_scores = np.array([r["score"] for r in r_train])
+          taus = [0.9, 0.95, 0.98, 0.99, 0.995, 0.999]
+          accs = [np.mean(band(tr_preds, tr_scores, t) == y_train) for t in taus]
+          best_tau = taus[int(np.argmax(accs))]
+
+          band_preds = band(base_preds, base_scores, best_tau)
+          band_acc = np.mean(band_preds == y_test)
+          band_fa = false_alarm_rate(band_preds, y_test)
+          print(f"tau={best_tau}: accuracy {band_acc:.0%}, false alarms {band_fa:.0%}")
+        tests: |
+          import numpy as np
+          b = check_object("band")
+          got = np.asarray(b(np.array(["positive", "negative"]), np.array([0.5, 0.99]), 0.9)).tolist()
+          assert got == ["neutral", "negative"], "`band` should return 'neutral' where the score is below tau and keep the label otherwise."
+          check_equal("best_tau", msg="`best_tau` is the tau with the highest **train** accuracy (first one on ties). Tune on train, never on test.")
+          check_equal("band_acc", msg="`band_acc` is the test accuracy of `band(base_preds, base_scores, best_tau)`.")
+          check_equal("band_fa", msg="`band_fa` is the false-alarm rate of the banded test predictions.")
+      - instructions:
+          - "**Better fix: frozen features + head.** Write `embed(texts)`: tokenise with padding and truncation, run `model(**enc, output_hidden_states=True)` under `torch.no_grad()`, and mean-pool `hidden_states[-1]` over real tokens using the attention mask. Return a NumPy array."
+          - "Fit `head = LogisticRegression(max_iter=2000)` on `embed(train[\"text\"])` and `y_train`. Store its test predictions in `head_preds`."
+          - "It must reach at least **85%** test accuracy with a false-alarm rate of at most **15%**."
+        hint: "`m = enc[\"attention_mask\"].unsqueeze(-1).float()` and `((h * m).sum(1) / m.sum(1)).numpy()`. Without the mask, padding vectors leak into short messages."
+        sample_code: |
+          def embed(texts):
+              enc = tok(list(texts), padding=True, truncation=True, return_tensors="pt")
+              with torch.no_grad():
+                  h = ____
+              m = enc["attention_mask"].unsqueeze(-1).float()
+              return ____
+
+          X_train, X_test = embed(train["text"]), embed(test["text"])
+          head = LogisticRegression(max_iter=2000).fit(____, ____)
+          head_preds = ____
+          print(f"head: accuracy {np.mean(head_preds == y_test):.0%}, false alarms {false_alarm_rate(head_preds, y_test):.0%}")
+        solution: |
+          def embed(texts):
+              enc = tok(list(texts), padding=True, truncation=True, return_tensors="pt")
+              with torch.no_grad():
+                  h = model(**enc, output_hidden_states=True).hidden_states[-1]
+              m = enc["attention_mask"].unsqueeze(-1).float()
+              return ((h * m).sum(1) / m.sum(1)).numpy()
+
+          X_train, X_test = embed(train["text"]), embed(test["text"])
+          head = LogisticRegression(max_iter=2000).fit(X_train, y_train)
+          head_preds = head.predict(X_test)
+          print(f"head: accuracy {np.mean(head_preds == y_test):.0%}, false alarms {false_alarm_rate(head_preds, y_test):.0%}")
+        tests: |
+          import numpy as np
+          e = check_object("embed")
+          x = np.asarray(e(["Cancel my lab booking.", "The heater broke again and my quarters are freezing tonight."]))
+          assert x.shape == (2, 768), f"`embed` should return one 768-d vector per text; got shape {x.shape}."
+          solo = np.asarray(e(["Cancel my lab booking."]))[0]
+          assert np.allclose(x[0], solo, atol=1e-4), "The vector for a short message changes when it is batched with a longer one: padding is leaking in. Weight the mean by the attention mask."
+          hp = np.asarray(check_object("head_preds"))
+          acc = float(np.mean(hp == user["y_test"]))
+          fa = user["false_alarm_rate"](hp, user["y_test"])
+          assert acc >= 0.85, f"Test accuracy is {acc:.0%}; it needs at least 85%. Check the mean pooling and that the head is fitted on the train features."
+          assert fa <= 0.15, f"False-alarm rate is {fa:.0%}; it must be at most 15%."
+      - instructions:
+          - "**Verify.** Fit a TF-IDF baseline, `make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=2000))`, on the train texts and labels."
+          - "Store a dict `report` mapping `\"pipeline\"`, `\"band\"`, `\"tfidf\"` and `\"head\"` to their test accuracies, and print it."
+        hint: "`tfidf = make_pipeline(...).fit(train[\"text\"], y_train)` and `tfidf.score(test[\"text\"], y_test)`."
+        sample_code: |
+          tfidf = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=2000)).fit(____, ____)
+          report = {
+              "pipeline": base_acc,
+              "band": band_acc,
+              "tfidf": ____,
+              "head": ____,
+          }
+          for name, acc in report.items():
+              print(f"{name:9} {acc:.0%}")
+        solution: |
+          tfidf = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=2000)).fit(train["text"], y_train)
+          report = {
+              "pipeline": base_acc,
+              "band": band_acc,
+              "tfidf": tfidf.score(test["text"], y_test),
+              "head": float(np.mean(head_preds == y_test)),
+          }
+          for name, acc in report.items():
+              print(f"{name:9} {acc:.0%}")
+        tests: |
+          import numpy as np
+          r = check_object("report")
+          assert isinstance(r, dict) and set(r) == {"pipeline", "band", "tfidf", "head"}, "`report` needs exactly the keys 'pipeline', 'band', 'tfidf' and 'head'."
+          assert abs(r["tfidf"] - sol["report"]["tfidf"]) < 1e-9, "report['tfidf'] should be the TF-IDF pipeline's accuracy on the test set."
+          assert abs(r["head"] - float(np.mean(np.asarray(user["head_preds"]) == user["y_test"]))) < 1e-9, "report['head'] should be the accuracy of `head_preds`."
+          assert abs(r["pipeline"] - sol["report"]["pipeline"]) < 1e-9 and abs(r["band"] - sol["report"]["band"]) < 1e-9, "Keep `base_acc` and `band_acc` from the earlier steps."
+          assert r["head"] > max(r["pipeline"], r["band"], r["tfidf"]), "The head should beat every other option; check step 3."
+    success_msg: "Mission complete. Pipeline 61%, abstain band 80%, TF-IDF 61%, frozen features + head about 98% with no false alarms. A threshold could not create the missing neutral class; 64 labels and a linear head on pretrained features did."

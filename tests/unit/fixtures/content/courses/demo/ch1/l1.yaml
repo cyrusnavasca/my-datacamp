@@ -1,0 +1,36 @@
+title: Lesson one
+exercises:
+  - { id: v, type: video, title: Slides, slides: "# One\n\n---\n\n# Two" }
+  - id: c
+    type: coding
+    title: Read a CSV
+    context: A file.
+    instructions: [Load `tiny.csv` into `df`.]
+    hint: pd.read_csv
+    pre_code: import pandas as pd
+    sample_code: df = ____
+    solution: df = pd.read_csv("tiny.csv")
+    tests: check_equal("df")
+  - id: m
+    type: mc
+    title: Pick
+    question: Which?
+    hint: B
+    options:
+      - { text: A, feedback: no }
+      - { text: B, correct: true, feedback: yes }
+  - { id: o, type: order, title: Order, prompt: Order, hint: h, items: [one, two, three] }
+  - id: k
+    type: classify
+    title: Classify
+    prompt: Sort
+    hint: h
+    zones: [x, y]
+    items: [{ text: a, zone: x }, { text: b, zone: y }]
+  - id: s
+    type: sequential
+    title: Seq
+    context: Steps
+    steps:
+      - { instructions: [a = 1], hint: h, sample_code: "a = ____", solution: "a = 1", tests: 'check_equal("a")' }
+      - { instructions: [b = a + 1], hint: h, sample_code: "b = ____", solution: "b = a + 1", tests: 'check_equal("b")' }

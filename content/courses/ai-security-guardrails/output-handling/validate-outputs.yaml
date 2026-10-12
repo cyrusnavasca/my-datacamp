@@ -1,0 +1,254 @@
+title: Treat model output as untrusted input
+description: Parse ORBIT's commands against an allow-list instead of a deny-list, render replies without letting links and images carry data out, and pick the right output check for the constraints.
+exercises:
+  - id: outputs-slides
+    type: video
+    title: Parse, don't sanitise
+    slides: |
+      # Model output is untrusted input
+
+      Whoever can influence the model's input (crew, log authors, email senders) partly controls its output. So when
+      output flows into another system, that system is exposed to the same people. That's **LLM05, improper output handling**.
+
+      | sink | what goes wrong if output goes in raw | do this instead |
+      | --- | --- | --- |
+      | `eval` / `exec` / shell | arbitrary code runs with your app's permissions | never; map to a fixed set of operations |
+      | SQL or a query language | unexpected tables, writes, multiple statements | parse into a structure, build a parameterised query |
+      | HTML / markdown rendering | page manipulation; links and images that send data out | escape, then allow-list hosts |
+      | file paths, URLs, API calls | path traversal, requests to internal hosts | resolve and check against an allow-list |
+
+      ---
+
+      ## Parse, don't sanitise
+
+      A **deny-list** removes known-bad things (`DELETE`, `DROP`) and lets everything else through. It **fails open**:
+      anything you didn't think of passes. An **allow-list** describes the *only* shapes that are valid and rejects the
+      rest. It **fails closed**: anything unexpected is refused.
+
+      ```python
+      CMD = re.compile(r"QUERY (\w+)(?: WHERE (\w+) = '([\w .:-]+)')?(?: LIMIT (\d+))?")
+
+      def parse_command(cmd):
+          m = CMD.fullmatch(cmd.strip())          # the whole string, not a substring
+          if not m:
+              return None
+          table, col, value, limit = m.groups()
+          if table not in TABLES or (col and col not in TABLES[table]):
+              return None
+          ...
+          return {"table": table, "where": {col: value} if col else {}, "limit": n}
+      ```
+
+      Then **your code** performs the operation from the dict (`run_query(parsed)`). The model's text never reaches an
+      interpreter. A rejected command goes back to the model with the error (the repair loop from the prompting
+      course), or to a human.
+
+      ---
+
+      ## Rendering is an egress channel
+
+      If the chat UI renders markdown, model output can make the **browser** do things:
+
+      - an **image** is fetched automatically when the reply is shown, with no click. Any data placed in its URL leaves the station.
+      - a **link** goes wherever its URL says, and the label can say something else.
+      - raw **HTML** in the reply changes the page.
+
+      This is the third leg of the lethal trifecta hiding in the UI. Defence, in this order:
+
+      1. `html.escape()` the reply, so markup shows as text.
+      2. Turn markdown images and links into HTML **only** when the URL's host is on `ALLOWED_HOSTS`. Drop images from
+         other hosts; show other links as plain text.
+      3. Allow only `https` URLs (a URL with any other scheme has no allowed host, so step 2 drops it).
+
+      ---
+
+      ## Which output check?
+
+      | check | catches | over-blocks | latency / cost | failure mode | wins when |
+      | --- | --- | --- | --- | --- | --- |
+      | **allow-list parser** | anything outside the grammar | odd-but-valid phrasing (repair loop fixes it) | microseconds | fails closed | output feeds code: queries, commands, tool args |
+      | **deny-list** | the patterns you listed | rarely | microseconds | **fails open** | never on its own; maybe as a logging signal |
+      | **LLM judge** | fuzzy policy issues (tone, unsafe advice) | some | +1 call, ~0.5-2 s | fooled by the same text that fooled the model | free text for humans, with no structure to parse |
+      | **sandbox** | damage from code you must run | nothing | process start-up | escape bugs; resource abuse | you really have to run generated code |
+
+      ---
+
+      ## Playbook: "a downstream system did something nobody asked for"
+
+      1. **Symptom:** an unexpected write, error or request in a downstream system.
+      2. **Measure:** run the checker over a labelled set of real model outputs; count **bad outputs accepted** and **good outputs rejected**.
+      3. **Diagnose:** list the accepted bad outputs. A deny-list usually misses whole classes (other verbs, other tables, limits, extra text).
+      4. **Fix:** replace the deny-list with an allow-list grammar plus checks on each field (table, column, value, limit). Build the operation yourself.
+      5. **Verify:** both counts are 0 on the labelled set, and on a few held-out outputs. Add every new failure to the set.
+
+  - id: command-allowlist
+    type: coding
+    title: The deny-list that let everything through
+    context: |
+      ORBIT turns crew requests into commands like `QUERY bookings WHERE module = 'B' LIMIT 5`. Today `deny_list_ok(cmd)`
+      blocks only `DELETE` and `DROP`. `MODEL_COMMANDS` holds 13 real ORBIT outputs labelled `True` (should run) or
+      `False`. `TABLES` maps each table to its allowed columns, and `run_query(parsed)` executes a parsed dict.
+    instructions:
+      - "**Measure:** store how many `False`-labelled commands `deny_list_ok` accepts in `bad_passed_v1`."
+      - "**Fix:** complete `parse_command(cmd)`. Return `None` unless the whole command matches the grammar, the table is in `TABLES`, the column is allowed for that table, and the limit is between 1 and 50. Otherwise return `{'table': ..., 'where': {col: value} or {}, 'limit': n or 50}`."
+      - "**Verify:** store how many `False` commands `parse_command` accepts (not `None`) in `bad_passed`, and how many `True` commands it rejects in `good_rejected`."
+      - "Store `run_query(parse_command(\"QUERY bookings WHERE module = 'B' LIMIT 5\"))` in `rows`."
+    hint: |
+      `m = CMD.fullmatch(cmd.strip())` rejects extra text before or after the command. Then check
+      `table in TABLES`, `col is None or col in TABLES[table]`, and `1 <= int(limit) <= 50` when a limit is given.
+    pre_code: |
+      import re
+      from kits.ai_security_guardrails import TABLES, MODEL_COMMANDS, run_query
+
+      def deny_list_ok(cmd):
+          return not re.search(r"\b(DELETE|DROP)\b", cmd, re.I)
+
+      CMD = re.compile(r"QUERY (\w+)(?: WHERE (\w+) = '([\w .:-]+)')?(?: LIMIT (\d+))?")
+    sample_code: |
+      bad_passed_v1 = ____
+
+      def parse_command(cmd):
+          m = CMD.fullmatch(cmd.strip())
+          if not m:
+              return None
+          table, col, value, limit = m.groups()
+          if ____:
+              return None
+          if col is not None and ____:
+              return None
+          n = int(limit) if limit else 50
+          if ____:
+              return None
+          return {"table": table, "where": {col: value} if col else {}, "limit": n}
+
+      bad_passed = ____
+      good_rejected = ____
+      rows = ____
+      print(bad_passed_v1, bad_passed, good_rejected)
+      print(rows)
+    solution: |
+      bad_passed_v1 = sum(1 for cmd, ok in MODEL_COMMANDS if not ok and deny_list_ok(cmd))
+
+      def parse_command(cmd):
+          m = CMD.fullmatch(cmd.strip())
+          if not m:
+              return None
+          table, col, value, limit = m.groups()
+          if table not in TABLES:
+              return None
+          if col is not None and col not in TABLES[table]:
+              return None
+          n = int(limit) if limit else 50
+          if not 1 <= n <= 50:
+              return None
+          return {"table": table, "where": {col: value} if col else {}, "limit": n}
+
+      bad_passed = sum(1 for cmd, ok in MODEL_COMMANDS if not ok and parse_command(cmd) is not None)
+      good_rejected = sum(1 for cmd, ok in MODEL_COMMANDS if ok and parse_command(cmd) is None)
+      rows = run_query(parse_command("QUERY bookings WHERE module = 'B' LIMIT 5"))
+      print(bad_passed_v1, bad_passed, good_rejected)
+      print(rows)
+    tests: |
+      check_equal("bad_passed_v1", 6, msg="Count commands labelled False that `deny_list_ok` still accepts. Only two of the seven bad ones mention DELETE or DROP.")
+      check_equal("bad_passed", 0, msg="Your parser still accepts a bad command. Check the table, the column for that table, and the limit range.")
+      check_equal("good_rejected", 0, msg="Your parser rejects a valid command. Only reject unknown tables or columns and limits outside 1-50.")
+      pc = user["parse_command"]
+      held = pc("QUERY sensors WHERE metric = 'co2' LIMIT 3")
+      assert held == {"table": "sensors", "where": {"metric": "co2"}, "limit": 3}, f"A held-out valid command parsed to {held!r}; expected the table, the where dict and the limit."
+      assert pc("QUERY roster LIMIT 0") is None and pc("QUERY bookings LIMIT 51") is None, "Limits must be between 1 and 50."
+      assert pc("QUERY sensors WHERE crew = 'Noor Haddad'") is None, "`crew` is not a column of `sensors`: check the column against `TABLES[table]`."
+      check_equal("rows", msg="Run `run_query` on the parsed dict for module B bookings.")
+    success_msg: |
+      The deny-list let 6 of 7 bad outputs through: other verbs, a medical table, a 5000-row dump, an unknown column,
+      two statements, and a command wrapped in chat. The allow-list rejects all of them and still runs every valid one,
+      and you can say exactly what it accepts.
+
+  - id: safe-render
+    type: coding
+    title: Render replies without opening a way out
+    context: |
+      The crew dashboard renders ORBIT's replies as HTML. `ORBIT_REPLIES` holds six replies, and `ALLOWED_HOSTS` holds
+      the one host that may appear in links and images. `IMG` and `LINK` match markdown images `![alt](url)` and links
+      `[label](url)`. Images are fetched as soon as a reply is shown, so a URL on an unknown host is a way out.
+    instructions:
+      - "Complete `allowed(url)`: True when `urlparse(url).hostname` is in `ALLOWED_HOSTS`."
+      - "In `safe_render`, escape the text with `html.escape` **first**. Then replace images with `<img src=\"URL\" alt=\"ALT\">` when allowed, else `[image removed]`."
+      - "Replace links with `<a href=\"URL\">LABEL</a>` when allowed, else `LABEL (external link removed)`."
+      - Store the rendered replies in the list `rendered`.
+    hint: |
+      In the replacement function, `m.group(1)` is the alt or label text and `m.group(2)` is the URL. Handle images before
+      links, because `![alt](url)` contains a link pattern.
+    pre_code: |
+      import html
+      import re
+      from urllib.parse import urlparse
+      from kits.ai_security_guardrails import ORBIT_REPLIES, ALLOWED_HOSTS
+      IMG = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
+      LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
+    sample_code: |
+      def allowed(url):
+          return ____
+
+      def safe_render(text):
+          out = ____
+          out = IMG.sub(lambda m: f'<img src="{m.group(2)}" alt="{m.group(1)}">' if allowed(m.group(2)) else ____, out)
+          out = LINK.sub(lambda m: ____, out)
+          return out
+
+      rendered = [safe_render(r) for r in ORBIT_REPLIES]
+      for r in rendered:
+          print(r)
+    solution: |
+      def allowed(url):
+          return urlparse(url).hostname in ALLOWED_HOSTS
+
+      def safe_render(text):
+          out = html.escape(text)
+          out = IMG.sub(lambda m: f'<img src="{m.group(2)}" alt="{m.group(1)}">' if allowed(m.group(2)) else "[image removed]", out)
+          out = LINK.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>' if allowed(m.group(2)) else f"{m.group(1)} (external link removed)", out)
+          return out
+
+      rendered = [safe_render(r) for r in ORBIT_REPLIES]
+      for r in rendered:
+          print(r)
+    tests: |
+      r = check_object("rendered")
+      assert len(r) == 6, "Render all six replies into `rendered`."
+      joined = " ".join(r)
+      assert "example.net" not in joined and "example.org" not in joined, "A URL on a host outside `ALLOWED_HOSTS` is still in the output. Drop those images and turn those links into plain text."
+      assert '<a href="https://handbook.helios7.internal/airlock-procedure">airlock procedure</a>' in r[0], "The handbook link should become an `<a href=...>` tag with its label."
+      assert '<img src="https://handbook.helios7.internal/charts/co2.png"' in r[1], "The handbook chart should stay as an `<img>`."
+      assert "[image removed]" in r[3], "The image from an unknown host should become `[image removed]`."
+      assert "this page (external link removed)" in r[2], "An external link should keep its label and add ` (external link removed)`."
+      assert "<b>" not in r[4] and "&lt;b&gt;" in r[4], "Escape the reply with `html.escape` before adding your own tags."
+      sr = user["safe_render"]
+      held = sr("Details: ![x](https://unknown.example.com/a.png) and [y](https://unknown.example.com/b)")
+      assert "unknown.example.com" not in held, "Held-out reply: URLs on unknown hosts must not survive rendering."
+    success_msg: |
+      Handbook links and charts still work, the two unknown hosts are gone, and markup shows as text. The check uses
+      the URL's *host*, not its wording, so it holds for URLs you have never seen.
+
+  - id: which-check
+    type: mc
+    title: Pick the output check
+    question: |
+      ORBIT is getting a new feature: it writes **tool arguments** for `book_module` (module letter, start time, hours,
+      crew name). Wrong bookings are annoying but reversible. The check must add **under 10 ms**, and must still work
+      if a maintenance log has fooled the model. Which check do you put between the model and the tool?
+    options:
+      - text: An allow-list validator on each argument (module in A-F, a parseable time, hours 1-4, a name on the roster).
+        correct: true
+        feedback: |
+          Right. The arguments have structure, so validate the structure. It takes microseconds, fails closed, and
+          doesn't care how the model was persuaded: an out-of-range value is rejected whatever text produced it.
+      - text: A deny-list that rejects arguments containing suspicious words.
+        feedback: It fails open. A wrong module or a 12-hour booking contains no suspicious word and goes straight through.
+      - text: An LLM judge that reads the arguments and the conversation and decides whether the booking looks legitimate.
+        feedback: |
+          It adds a model call (hundreds of milliseconds or more, over budget), and it reads the same context that fooled
+          the first model, so it can be fooled the same way.
+      - text: Run the booking in a sandbox first and inspect the result.
+        feedback: |
+          Sandboxes are for running code you can't avoid running. A booking is a structured call, and a validator
+          answers the question directly and faster.
+    hint: The output has a fixed structure, and the check must not depend on the model being honest.

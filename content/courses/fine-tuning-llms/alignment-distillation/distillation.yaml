@@ -1,0 +1,307 @@
+title: Distillation
+description: "A big model teaches a small one: hard labels and soft labels, the temperature loss written out, the cost trade-off, and a mission to distil ORBIT's triager at under 1% of the cost."
+exercises:
+  - id: intro
+    type: video
+    title: Teacher and student
+    slides: |
+      # Why distil?
+
+      The few-shot triager is accurate, but every ticket is an Opus call. At fleet scale that adds up, and
+      each call takes a second. **Distillation** trains a small, cheap *student* to imitate a large *teacher*:
+
+      1. Collect real, unlabelled inputs (last month's tickets).
+      2. Have the teacher label them.
+      3. Train the student on the teacher's outputs.
+      4. Check the student on a small set with gold labels, and on agreement with the teacher.
+
+      The student is usually **capped by the teacher**: it copies the teacher's mistakes along with its
+      skills. And check your provider's terms before training on its outputs.
+
+      ---
+
+      ## Hard labels or soft labels?
+
+      **Hard labels** (synthetic data): the student learns the teacher's final answer. Works through any
+      API, and the student can be anything: a small LLM, or even a classic classifier.
+
+      **Soft labels** (logit distillation): when you have the teacher's logits, match its whole
+      distribution. "70% IT, 25% maintenance" says more than "IT". This hidden information about which
+      wrong answers are *nearly* right is called **dark knowledge**.
+
+      $$\mathcal{L} = \alpha\,\text{CE}(z_s, y) + (1-\alpha)\,T^2\,\text{KL}\big(\text{softmax}(z_t/T)\,\|\,\text{softmax}(z_s/T)\big)$$
+
+      ```python
+      kd = F.kl_div(F.log_softmax(student_logits / T, -1), F.softmax(teacher_logits / T, -1),
+                    reduction="batchmean") * T * T
+      ```
+
+      The temperature $T > 1$ softens both distributions so small probabilities count. The $T^2$ keeps
+      gradient sizes comparable as $T$ changes.
+
+      ---
+
+      ## The trade-off
+
+      | | keep calling the big model | distil to a small LLM | distil to a classic classifier |
+      | --- | --- | --- | --- |
+      | Accuracy | the ceiling | close on narrow tasks | close on simple, stable tasks |
+      | Cost per 1k | highest | low | close to zero |
+      | Latency | ~1 s | ~100 ms | ~1 ms |
+      | Setup | none | training plus GPU serving | an afternoon |
+      | When the task changes | edit the prompt | relabel and retrain | relabel and retrain |
+      | Wins when | low volume, changing tasks, open-ended output | high volume, needs generated text | high volume, fixed label set |
+
+      Total cost of a student = labelling calls × teacher cost + volume × student cost (+ retraining when the task drifts).
+
+      ---
+
+      ## Playbook: the student lags the teacher
+
+      **Measure:** student accuracy on a gold set *and* agreement with the teacher on held-out unlabelled
+      inputs, per category. Then a **learning curve**: student accuracy against the number of teacher labels.
+
+      | what you see | likely cause | fix | cost |
+      | --- | --- | --- | --- |
+      | the curve is still rising | too few labels | label more inputs with the teacher | teacher calls (cheap next to serving) |
+      | one category is weak | that category is rare in your inputs | sample more of it | teacher calls |
+      | high agreement but low gold accuracy | the teacher is wrong there | improve the teacher prompt, or filter labels it is unsure of | prompt work |
+      | flat curve, low ceiling | the student is too weak | a bigger student, better features | serving cost |
+      | fine offline, worse live | the inputs weren't like production | distil on real traffic | none |
+
+  - id: kd-loss
+    type: coding
+    title: The soft-label loss
+    context: |
+      `teacher_logits` and `student_logits` are `(4, 5)` scores over the five categories for four tickets,
+      and `labels` their gold classes. `torch` and `F` (`torch.nn.functional`) are imported.
+    instructions:
+      - "Write `kd_loss(student_logits, teacher_logits, T)`: `F.kl_div` of the student's `log_softmax(z_s / T)` against the teacher's `softmax(z_t / T)`, with `reduction=\"batchmean\"`, times `T * T`."
+      - "Write `distill_loss(student_logits, teacher_logits, labels, T=4.0, alpha=0.5)` = `alpha * F.cross_entropy(student_logits, labels) + (1 - alpha) * kd_loss(...)`."
+      - "Store `kd_loss(student_logits, teacher_logits, 4.0).item()` in `kd4` and `distill_loss(student_logits, teacher_logits, labels).item()` in `total`."
+      - "Store the teacher's probabilities for ticket 0 at T = 1 and T = 4 (`softmax(teacher_logits[0] / T)`) in `p1` and `p4`."
+    hint: "`F.kl_div(input, target)` expects `input` as log-probabilities and `target` as probabilities."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      teacher_logits = torch.tensor([[1.0, 4.0, 0.5, 0.0, -1.0],
+                                     [3.0, 0.2, 0.1, 0.0, 0.0],
+                                     [0.0, 0.5, 3.5, 1.5, -0.5],
+                                     [-1.0, 0.0, 0.0, 0.5, 4.5]])
+      student_logits = torch.tensor([[0.5, 2.0, 0.5, 0.2, 0.0],
+                                     [1.0, 0.8, 0.4, 0.1, 0.0],
+                                     [0.2, 0.1, 1.5, 0.9, 0.1],
+                                     [0.0, 0.3, 0.1, 0.2, 1.0]])
+      labels = torch.tensor([1, 0, 2, 4])
+    sample_code: |
+      def kd_loss(student_logits, teacher_logits, T):
+          return ____
+
+      def distill_loss(student_logits, teacher_logits, labels, T=4.0, alpha=0.5):
+          return ____
+
+      kd4 = kd_loss(student_logits, teacher_logits, 4.0).item()
+      total = distill_loss(student_logits, teacher_logits, labels).item()
+      p1 = ____
+      p4 = ____
+      print(f"KD loss {kd4:.4f}, total {total:.4f}")
+      print("teacher, T=1:", p1.numpy().round(3))
+      print("teacher, T=4:", p4.numpy().round(3))
+    solution: |
+      def kd_loss(student_logits, teacher_logits, T):
+          return F.kl_div(F.log_softmax(student_logits / T, dim=-1), F.softmax(teacher_logits / T, dim=-1),
+                          reduction="batchmean") * T * T
+
+      def distill_loss(student_logits, teacher_logits, labels, T=4.0, alpha=0.5):
+          return alpha * F.cross_entropy(student_logits, labels) + (1 - alpha) * kd_loss(student_logits, teacher_logits, T)
+
+      kd4 = kd_loss(student_logits, teacher_logits, 4.0).item()
+      total = distill_loss(student_logits, teacher_logits, labels).item()
+      p1 = F.softmax(teacher_logits[0] / 1.0, dim=-1)
+      p4 = F.softmax(teacher_logits[0] / 4.0, dim=-1)
+      print(f"KD loss {kd4:.4f}, total {total:.4f}")
+      print("teacher, T=1:", p1.numpy().round(3))
+      print("teacher, T=4:", p4.numpy().round(3))
+    tests: |
+      import torch
+      import torch.nn.functional as F
+      from kits.fine_tuning_llms import check_tensor
+      kd = check_object("kd_loss")
+      torch.manual_seed(4)
+      s, t = torch.randn(6, 5), torch.randn(6, 5)
+      pt = F.softmax(t / 2.0, -1)
+      want = (pt * (pt.log() - F.log_softmax(s / 2.0, -1))).sum(-1).mean() * 4.0
+      assert abs(kd(s, t, 2.0).item() - want.item()) < 1e-5, "`kd_loss` is wrong. It should be KL(teacher || student) on temperature-softened distributions, averaged over the batch, times T * T."
+      assert abs(kd(t, t, 3.0).item()) < 1e-6, "When the student equals the teacher, `kd_loss` should be 0."
+      check_equal("kd4", tol=1e-5, msg="`kd4` is `kd_loss(student_logits, teacher_logits, 4.0).item()`.")
+      check_equal("total", tol=1e-5, msg="`total` = 0.5 * cross-entropy with the gold labels + 0.5 * kd_loss at T = 4.")
+      check_tensor(user, sol, "p1", msg="`p1` is `F.softmax(teacher_logits[0] / 1.0, dim=-1)`.")
+      check_tensor(user, sol, "p4", msg="`p4` is `F.softmax(teacher_logits[0] / 4.0, dim=-1)`.")
+    success_msg: "At T = 1 the teacher is 91% sure about ticket 0, which hides the rest. At T = 4 you can see its runner-up classes. That ranking is the dark knowledge a soft-label student learns from."
+
+  - id: distil-or-not
+    type: mc
+    title: Distil, or keep calling the big model?
+    question: |
+      Which situation is the **best** case for distilling a big model into a small one?
+    options:
+      - text: "A research assistant answering open-ended questions about new papers, 200 requests a day."
+        feedback: "Low volume and open-ended output: the big model's breadth is the product, and the bill is small. Distillation would cost quality to save almost nothing."
+      - text: "Fleet-wide ticket triage: 2 million tickets a month, the same five categories for two years, a teacher prompt at 97%, and a 50 ms latency budget."
+        correct: true
+        feedback: "Right: high volume, a stable label set, a strong teacher and a latency budget a big model can't meet. A distilled student, even a classic classifier, can serve it for a tiny fraction of the cost. Re-check it against the teacher every quarter."
+      - text: "A triage system whose categories are redefined every crew rotation (every 6 weeks)."
+        feedback: "Every redefinition means relabelling and retraining the student, whereas a prompt is edited in minutes. Distil once the task has settled down."
+      - text: "A new product with no evaluation set yet, where the team wants to cut costs early."
+        feedback: "Without an eval set you can't tell whether the student is within tolerance of the teacher. Build the eval first, then decide."
+    hint: Distillation pays off with high volume, a stable task and a strong teacher.
+
+  - id: boss-distil
+    type: sequential
+    title: "Mission: distil ORBIT's triager"
+    context: |
+      The fleet expects `VOLUME` = 100,000 tickets next year. The teacher is the course-3 triager with the
+      few-shot prompt from chapter 1 (`SYSTEM`) on `TEACHER` (Opus). The target: a scikit-learn student
+      within **5 points** of the teacher, at under **1%** of the teacher's cost for the year. Loaded:
+      `client` (the teacher), `parse_label`, `unlabeled` (140 past ticket texts, no labels), `test`
+      (60 tickets with gold `category`), `triage_pipeline()` (TF-IDF + logistic regression),
+      `STUDENT_PER_1K` (USD per 1,000 student predictions) and `pd`.
+    pre_code: |
+      import aikit
+      import pandas as pd
+      from kits.llm_apis_prompting import ticket_triager, parse_label
+      from kits.fine_tuning_llms import teacher_system, triage_pipeline
+      client = aikit.FakeClaude(ticket_triager(), clock=aikit.VirtualClock())
+      TEACHER = "claude-opus-5-5"
+      SYSTEM = teacher_system()
+      _t = aikit.helios.tickets()
+      unlabeled = _t.text.iloc[:140].tolist()
+      test = _t.iloc[140:].reset_index(drop=True)
+      STUDENT_PER_1K = 0.002     # CPU inference, illustrative
+      VOLUME = 100_000
+    steps:
+      - instructions:
+          - "**Teacher baseline.** Write `teach(text)`: call `client.messages.create(model=TEACHER, max_tokens=20, system=SYSTEM, messages=[...])` with `f\"<ticket>{text}</ticket>\"`, and return `(parse_label(reply_text), client.calls[-1][\"cost\"])`."
+          - "Run it on every `test` ticket. Store the teacher's accuracy in `teacher_acc` and its mean cost per ticket in `teacher_cost`."
+        hint: "`results = [teach(t) for t in test.text]`; accuracy compares `label` with `test.category`."
+        sample_code: |
+          def teach(text):
+              msg = client.messages.create(model=TEACHER, max_tokens=20, system=SYSTEM,
+                                           messages=[{"role": "user", "content": ____}])
+              return ____, client.calls[-1]["cost"]
+
+          results = [teach(t) for t in test.text]
+          teacher_acc = ____
+          teacher_cost = ____
+          print(f"teacher accuracy {teacher_acc:.2f}, ${teacher_cost:.5f} per ticket")
+        solution: |
+          def teach(text):
+              msg = client.messages.create(model=TEACHER, max_tokens=20, system=SYSTEM,
+                                           messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}])
+              return parse_label(msg.content[0].text), client.calls[-1]["cost"]
+
+          results = [teach(t) for t in test.text]
+          teacher_acc = sum(lab == gold for (lab, _), gold in zip(results, test.category)) / len(test)
+          teacher_cost = sum(c for _, c in results) / len(results)
+          print(f"teacher accuracy {teacher_acc:.2f}, ${teacher_cost:.5f} per ticket")
+        tests: |
+          check_equal("teacher_acc", msg="`teacher_acc` is the share of test tickets where the teacher's label equals `category`.")
+          check_equal("teacher_cost", tol=1e-9, msg="`teacher_cost` is the mean of the per-call costs from `client.calls[-1][\"cost\"]`.")
+      - instructions:
+          - "**First attempt (the symptom).** Label the first 20 `unlabeled` tickets with `teach`, keeping labels in `labels` and costs in `costs`. Fit `student20 = triage_pipeline().fit(unlabeled[:20], labels)`."
+          - "Store its test accuracy in `acc20` and `teacher_acc - acc20` in `gap20`."
+        hint: "`pairs = [teach(t) for t in unlabeled[:20]]`, then split into two lists."
+        sample_code: |
+          pairs = [teach(t) for t in unlabeled[:20]]
+          labels = [lab for lab, _ in pairs]
+          costs = [c for _, c in pairs]
+
+          student20 = triage_pipeline().fit(unlabeled[:20], labels)
+          acc20 = ____
+          gap20 = ____
+          print(f"student on 20 teacher labels: {acc20:.2f} (gap {gap20:.2f})")
+        solution: |
+          pairs = [teach(t) for t in unlabeled[:20]]
+          labels = [lab for lab, _ in pairs]
+          costs = [c for _, c in pairs]
+
+          student20 = triage_pipeline().fit(unlabeled[:20], labels)
+          acc20 = (student20.predict(test.text) == test.category).mean()
+          gap20 = teacher_acc - acc20
+          print(f"student on 20 teacher labels: {acc20:.2f} (gap {gap20:.2f})")
+        tests: |
+          check_equal("acc20", msg="`acc20` is the 20-label student's accuracy on `test`.")
+          check_equal("gap20", tol=1e-9, msg="`gap20` = `teacher_acc - acc20`.")
+      - instructions:
+          - "**Diagnose with a learning curve.** Extend `labels` and `costs` by teaching the remaining 120 `unlabeled` tickets, so both have 140 entries."
+          - "For `n` in `[20, 40, 80, 140]`, fit a student on the first `n` texts and labels. Store a DataFrame `curve` with columns `n` and `acc`."
+          - "Store `n_needed`: the smallest `n` whose student is within 0.05 of `teacher_acc`."
+        hint: "`for t in unlabeled[20:]: lab, c = teach(t); labels.append(lab); costs.append(c)`. Then `curve[curve.acc >= teacher_acc - 0.05].n.min()`."
+        sample_code: |
+          for t in unlabeled[20:]:
+              lab, c = teach(t)
+              labels.append(lab)
+              costs.append(c)
+
+          rows = []
+          for n in [20, 40, 80, 140]:
+              s = triage_pipeline().fit(____, ____)
+              rows.append({"n": n, "acc": (s.predict(test.text) == test.category).mean()})
+          curve = pd.DataFrame(rows)
+          n_needed = ____
+          print(curve)
+          print("labels needed:", n_needed)
+        solution: |
+          for t in unlabeled[20:]:
+              lab, c = teach(t)
+              labels.append(lab)
+              costs.append(c)
+
+          rows = []
+          for n in [20, 40, 80, 140]:
+              s = triage_pipeline().fit(unlabeled[:n], labels[:n])
+              rows.append({"n": n, "acc": (s.predict(test.text) == test.category).mean()})
+          curve = pd.DataFrame(rows)
+          n_needed = int(curve[curve.acc >= teacher_acc - 0.05].n.min())
+          print(curve)
+          print("labels needed:", n_needed)
+        tests: |
+          import numpy as np
+          assert len(check_object("labels")) == 140 and len(check_object("costs")) == 140, "`labels` and `costs` should each have 140 entries after teaching the remaining 120 tickets."
+          c = check_object("curve")
+          assert list(c.n) == [20, 40, 80, 140] and np.allclose(c.acc, sol["curve"].acc), "`curve` should have one row per n with the accuracy of a student fitted on `unlabeled[:n]` and `labels[:n]`."
+          check_equal("n_needed", msg="`n_needed` is the smallest n whose accuracy is >= `teacher_acc - 0.05`.")
+      - instructions:
+          - "**Fix and verify the cost.** Fit the final `student` on the first `n_needed` tickets and store its test accuracy in `student_acc`."
+          - "Store `teacher_year = VOLUME * teacher_cost`, `student_year = sum(costs[:n_needed]) + VOLUME / 1000 * STUDENT_PER_1K` and `cost_ratio = student_year / teacher_year`."
+          - "Set `ship = (teacher_acc - student_acc <= 0.05) and (cost_ratio <= 0.01)` and print the summary."
+        hint: "Only the labelling calls you actually use count towards the student's cost: `sum(costs[:n_needed])`."
+        sample_code: |
+          student = triage_pipeline().fit(unlabeled[:n_needed], labels[:n_needed])
+          student_acc = ____
+          teacher_year = ____
+          student_year = ____
+          cost_ratio = ____
+          ship = ____
+          print(f"teacher {teacher_acc:.2f} for ${teacher_year:,.2f}/yr; student {student_acc:.2f} for ${student_year:,.2f}/yr "
+                f"({cost_ratio:.2%} of the cost) -> ship: {ship}")
+        solution: |
+          student = triage_pipeline().fit(unlabeled[:n_needed], labels[:n_needed])
+          student_acc = (student.predict(test.text) == test.category).mean()
+          teacher_year = VOLUME * teacher_cost
+          student_year = sum(costs[:n_needed]) + VOLUME / 1000 * STUDENT_PER_1K
+          cost_ratio = student_year / teacher_year
+          ship = (teacher_acc - student_acc <= 0.05) and (cost_ratio <= 0.01)
+          print(f"teacher {teacher_acc:.2f} for ${teacher_year:,.2f}/yr; student {student_acc:.2f} for ${student_year:,.2f}/yr "
+                f"({cost_ratio:.2%} of the cost) -> ship: {ship}")
+        tests: |
+          sa = float(check_object("student_acc"))
+          assert abs(sa - float(sol["student_acc"])) < 1e-9, "`student_acc` is the accuracy on `test` of a student fitted on the first `n_needed` tickets and labels."
+          assert user["teacher_acc"] - sa <= 0.05, f"The student is {user['teacher_acc'] - sa:.2f} below the teacher; the target is within 0.05."
+          check_equal("teacher_year", tol=1e-9, msg="`teacher_year` = `VOLUME * teacher_cost`.")
+          check_equal("student_year", tol=1e-9, msg="`student_year` = labelling cost of the first `n_needed` calls + `VOLUME / 1000 * STUDENT_PER_1K`.")
+          r = float(check_object("cost_ratio"))
+          assert r <= 0.01, f"The student costs {r:.2%} of the teacher; the target is under 1%."
+          assert bool(check_object("ship")) is True, "With the gap within 5 points and the cost under 1%, `ship` should be True."
+    timeout: 60
+    success_msg: "Twenty labels left the student 38 points behind. The learning curve showed the gap closing, and 80 teacher labels (20 cents) close it completely. The student matches the teacher for about 0.2% of a year's Opus bill. Keep a slice of live traffic going to the teacher to watch for drift."

@@ -1,0 +1,30 @@
+title: MLOps and Model Serving
+description: 'Take models to production: experiment tracking, packaging, serving behind an API, monitoring
+  and retraining.'
+level: advanced
+est_hours: 4
+prerequisites:
+- supervised-learning
+objectives:
+- Track experiments and version models
+- Serve a model behind an HTTP API
+- Monitor for drift and errors
+- Plan retraining and rollbacks
+requires: []
+chapters:
+- id: lifecycle
+  title: The ML lifecycle
+  description: From notebook to production system.
+  lessons: []
+- id: packaging
+  title: Packaging and serving
+  description: Saving models, APIs and containers.
+  lessons: []
+- id: monitoring
+  title: Monitoring
+  description: Data drift, performance decay and alerts.
+  lessons: []
+- id: ops
+  title: Operating ML systems
+  description: CI/CD, retraining and rollbacks.
+  lessons: []

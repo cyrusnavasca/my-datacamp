@@ -1,0 +1,50 @@
+title: LLM Agents and Tool Use
+description: 'Give models tools: function calling, agent loops, context and memory, agent patterns and
+  when not to use an agent, and keeping agents safe with permissions, approvals and budgets.'
+level: advanced
+est_hours: 5
+prerequisites:
+- llm-apis-prompting
+objectives:
+- Define tools and handle tool calls and tool errors
+- Write an agent loop from scratch with sound stopping conditions
+- Manage agent context and memory, and plan multi-step tasks
+- Choose between workflows and agents, and put guardrails on agents
+requires: []
+chapters:
+- id: tool-calling
+  title: Tool calling
+  description: Tool schemas, tool calls, tool results and tool errors.
+  lessons:
+  - tool-schemas
+  - handle-tool-use
+  - tool-errors
+  - wrong-tool
+- id: agent-loop
+  title: The agent loop
+  description: Looping until done, stopping conditions and parallel tool calls.
+  lessons:
+  - loop-from-scratch
+  - parallel-tools
+  - stopping
+- id: context-memory
+  title: Context and memory
+  description: Managing tool output in context, memory across sessions and planning.
+  lessons:
+  - managing-context
+  - memory
+  - planning
+- id: agent-patterns
+  title: Agent patterns
+  description: Workflows vs agents, orchestrator-workers and how coding agents work.
+  lessons:
+  - workflows-vs-agents
+  - orchestrator-workers
+  - coding-agent-anatomy
+- id: guardrails
+  title: Guardrails
+  description: Permissions, human-in-the-loop, budgets and kill switches.
+  lessons:
+  - permissions
+  - human-in-the-loop
+  - budgets-killswitch

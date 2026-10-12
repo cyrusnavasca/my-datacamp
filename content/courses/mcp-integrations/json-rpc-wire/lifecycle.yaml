@@ -1,0 +1,219 @@
+title: The session lifecycle
+description: Initialize, negotiate a protocol version and capabilities, operate, shut down, and what breaks when client and server disagree.
+exercises:
+  - id: lifecycle-slides
+    type: video
+    title: Handshake, negotiation, operation
+    slides: |
+      # A session has three phases
+
+      ```
+      client                                   server
+        │── initialize (request, id 1) ─────────▶│   1. initialization
+        │◀───────────────── result (id 1) ───────│
+        │── notifications/initialized ──────────▶│
+        │                                         │
+        │── tools/list, tools/call, ... ────────▶│   2. operation
+        │◀──────────────────────── results ──────│
+        │                                         │
+        │── close the transport ────────────────▶│   3. shutdown
+      ```
+
+      Until the server has answered `initialize`, the client sends nothing but pings. After a successful
+      answer, the client **must** send `notifications/initialized`; only then is the session in normal
+      operation. Some servers reject other requests until it arrives.
+
+      ---
+
+      ## The handshake, field by field
+
+      ```python
+      # client -> server
+      {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+          "protocolVersion": "<newest version the client speaks>",
+          "capabilities": {"roots": {"listChanged": True}, "sampling": {}},
+          "clientInfo": {"name": "orbit-host", "version": "1.4.0"}}}
+
+      # server -> client
+      {"jsonrpc": "2.0", "id": 1, "result": {
+          "protocolVersion": "<the version the server picked>",
+          "capabilities": {"tools": {"listChanged": True}, "resources": {"subscribe": False}},
+          "serverInfo": {"name": "helios-sensors", "version": "2.1.0"},
+          "instructions": "Readings are live; prefer them to the handbook."}}
+
+      # client -> server
+      {"jsonrpc": "2.0", "method": "notifications/initialized"}
+      ```
+
+      ---
+
+      ## Version negotiation
+
+      Protocol versions are date strings (`YYYY-MM-DD`). The rule:
+
+      1. The client sends the **newest** version it supports.
+      2. If the server supports it, it **echoes it back**. If not, it answers with another version it
+         supports, normally its newest.
+      3. If the client can't speak the version the server chose, it **disconnects**. It must not carry on
+         and hope.
+
+      The version strings in this course's exercises are made up for the simulation. Check
+      **modelcontextprotocol.io** for the current spec version, and for what changed between versions.
+      Over HTTP, newer revisions also send the negotiated version in an `MCP-Protocol-Version` header on
+      every later request.
+
+      ---
+
+      ## Capability negotiation
+
+      | side | capability | means |
+      | --- | --- | --- |
+      | server | `tools`, `resources`, `prompts` | "I offer this primitive" |
+      | server | `listChanged` (sub-flag) | "I'll notify you when the list changes" |
+      | server | `resources.subscribe` | "you can subscribe to updates of one resource" |
+      | server | `logging`, `completions` | log messages; argument autocompletion |
+      | client | `roots`, `sampling`, `elicitation` | "you may ask me for these" |
+
+      **The rule:** use only what the other side declared. Call `prompts/list` on a server that didn't
+      declare `prompts` and you'll usually get **-32601 Method not found**. A server that sends
+      `sampling/createMessage` to a client that didn't declare `sampling` is breaking the contract too.
+
+      ---
+
+      ## Playbook: client and server disagree
+
+      **Measure first:** log every message of one session and read the errors, the message text as
+      well as the code.
+
+      | symptom | check | fix |
+      | --- | --- | --- |
+      | -32601 on `resources/list` or `prompts/list` | the server's `capabilities` | only call what was declared |
+      | requests rejected right after connecting | was `notifications/initialized` sent? | send it after the initialize result |
+      | "id already used" | the client's id source | one counter per session |
+      | odd failures after connecting to an old server | the `protocolVersion` in the result | check it; downgrade or disconnect |
+      | new tools never appear | `listChanged` flag, and whether the host handles the notification | re-list on `notifications/tools/list_changed` |
+
+      **Shutdown** has no special message: over stdio, close the server's stdin, wait, then terminate
+      it. Over HTTP, send `DELETE` with the session id.
+
+  - id: session-order
+    type: order
+    title: Put the session in order
+    prompt: Order the messages of one complete MCP session in which ORBIT reads a single sensor.
+    hint: The handshake has three messages, and the client speaks last. Discovery comes before the first call.
+    items:
+      - "Client → initialize request (protocolVersion, capabilities, clientInfo)"
+      - "Server → initialize result (chosen protocolVersion, capabilities, serverInfo)"
+      - "Client → notifications/initialized (no id, no reply)"
+      - "Client → tools/list request"
+      - "Server → tools/list result with the tool definitions"
+      - "Client → tools/call request for get_sensor"
+      - "Server → tools/call result with content and isError false"
+      - "Client closes the transport (shutdown)"
+
+  - id: negotiate
+    type: coding
+    title: Negotiate like a careful client
+    context: |
+      ORBIT's client speaks the protocol versions in `CLIENT_VERSIONS` (newest first). Three servers are
+      waiting: `modern` speaks the newest version, `legacy` only an older one, and `future` only a version
+      ORBIT has never heard of. `request(id, method, params)` and `notification(method)` build messages;
+      `server.handle(msg)` sends one and returns the response (or `None`).
+    instructions:
+      - "Write `connect(server)`: send an `initialize` request with id `next(ids)`, `protocolVersion` `CLIENT_VERSIONS[0]`, `capabilities` `{}` and a `clientInfo` with a name and version."
+      - "If the result's `protocolVersion` isn't in `CLIENT_VERSIONS`, return `None` **without** sending anything else (disconnect). Otherwise send `notifications/initialized` and return the result dict."
+      - "Write `allowed_methods(capabilities)`: the sorted list of methods the client may call, built from `METHODS`, which maps each capability to its methods. Always include `\"ping\"`."
+      - "Store `negotiated = {name: (r[\"protocolVersion\"] if r else None) for name, r in results.items()}`, where `results` maps each server name to `connect(server)`."
+    hint: |
+      `res = server.handle(request(next(ids), "initialize", {...}))["result"]`. For `allowed_methods`:
+      start with `["ping"]`, then `methods += METHODS[cap]` for each `cap` in `capabilities` that is in `METHODS`.
+    pre_code: |
+      import itertools
+      from kits.mcp_integrations import (MCPServer, sensor_server, handbook_resources, request, notification, NEW, OLD)
+      CLIENT_VERSIONS = [NEW, OLD]
+      METHODS = {"tools": ["tools/list", "tools/call"], "resources": ["resources/list", "resources/read"],
+                 "prompts": ["prompts/list", "prompts/get"]}
+
+      def make_servers():
+          return {"modern": sensor_server(),
+                  "legacy": MCPServer("helios-handbook-v1", resources=handbook_resources()[:5], versions=[OLD]),
+                  "future": MCPServer("helios-next", tools=sensor_server().tool_definitions(), versions=["2027-05-01"])}
+
+      servers = make_servers()
+      ids = itertools.count(1)
+    sample_code: |
+      def connect(server):
+          init = request(next(ids), "initialize", {"protocolVersion": ____, "capabilities": {},
+                                                    "clientInfo": {"name": "orbit-host", "version": "1.0"}})
+          res = server.handle(init)["result"]
+          if ____:
+              return None
+          server.handle(____)
+          return res
+
+      def allowed_methods(capabilities):
+          methods = ["ping"]
+          ____
+          return sorted(methods)
+
+      results = {name: connect(server) for name, server in servers.items()}
+      negotiated = {name: (r["protocolVersion"] if r else None) for name, r in results.items()}
+      print(negotiated)
+      print(allowed_methods(results["legacy"]["capabilities"]))
+    solution: |
+      def connect(server):
+          init = request(next(ids), "initialize", {"protocolVersion": CLIENT_VERSIONS[0], "capabilities": {},
+                                                    "clientInfo": {"name": "orbit-host", "version": "1.0"}})
+          res = server.handle(init)["result"]
+          if res["protocolVersion"] not in CLIENT_VERSIONS:
+              return None
+          server.handle(notification("notifications/initialized"))
+          return res
+
+      def allowed_methods(capabilities):
+          methods = ["ping"]
+          for cap in capabilities:
+              if cap in METHODS:
+                  methods += METHODS[cap]
+          return sorted(methods)
+
+      results = {name: connect(server) for name, server in servers.items()}
+      negotiated = {name: (r["protocolVersion"] if r else None) for name, r in results.items()}
+      print(negotiated)
+      print(allowed_methods(results["legacy"]["capabilities"]))
+    tests: |
+      check_equal("negotiated", msg="`negotiated` should be {'modern': NEW, 'legacy': OLD, 'future': None}: send your newest version, accept what the server picks only if you speak it.")
+      fresh = user["make_servers"]()
+      for name in ("modern", "legacy"):
+          r = user["connect"](fresh[name])
+          assert r is not None and fresh[name].ready, f"After `connect`, the {name} server should be ready: send `notifications/initialized` once the version is accepted."
+      r = user["connect"](fresh["future"])
+      assert r is None, "`connect` should return None when the server picks a version the client doesn't speak."
+      assert not fresh["future"].ready, "Disconnect means no `notifications/initialized` to a server whose version you can't speak."
+      am = user["allowed_methods"]
+      assert am({"resources": {}}) == ["ping", "resources/list", "resources/read"], "`allowed_methods({'resources': {}})` should be ['ping', 'resources/list', 'resources/read']."
+      assert am({"tools": {"listChanged": True}, "prompts": {}, "logging": {}}) == sorted(["ping", "tools/list", "tools/call", "prompts/list", "prompts/get"]), "Include methods only for capabilities listed in `METHODS`, and ignore others like `logging`."
+    success_msg: |
+      ORBIT now talks to the old server in the old version and refuses the one it can't understand,
+      instead of failing in odd ways later. `allowed_methods` is what keeps the host from calling
+      `tools/list` on a resources-only server.
+
+  - id: list-changed
+    type: mc
+    title: The tool that never appeared
+    question: |
+      `helios-ops` declared `{"tools": {"listChanged": true}}`. Mid-session the ops team deploys a new
+      `schedule_eva` tool, and the server sends `notifications/tools/list_changed`. ORBIT's host has no
+      handler for that notification. A crew member asks ORBIT to schedule an EVA. What happens, and
+      what's the fix?
+    options:
+      - text: The model sees schedule_eva straight away, because the server pushed the new list
+        feedback: The notification carries no tool list. It only says "the list changed, ask again". Nothing reaches the model until the host calls tools/list again.
+      - text: The model still sees the old tool list; the host should call tools/list on that notification and refresh the tools it passes to the model
+        correct: true
+        feedback: Right. listChanged is a promise to notify, not to push. The host re-lists, rebuilds the model's tool definitions and its routing table, and, for third-party servers, re-checks what changed before exposing it.
+      - text: The server returns -32601 for every call until the client re-initializes
+        feedback: Nothing is wrong with the session; old tools keep working. A list change doesn't invalidate the handshake.
+      - text: Nothing can be done until ORBIT restarts, because tool lists are fixed at initialization
+        feedback: That's what declaring listChanged avoids. Discovery can happen at any time in the session, not only right after the handshake.
+    hint: Does a notification carry the new tool list, or just the news that it changed?

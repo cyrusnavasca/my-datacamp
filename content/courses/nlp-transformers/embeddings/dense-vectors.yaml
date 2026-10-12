@@ -1,0 +1,194 @@
+title: From one-hot to dense vectors
+description: Why one-hot vectors cannot express similarity, how an embedding layer is just a lookup table, and how to compare vectors.
+exercises:
+  - id: intro
+    type: video
+    title: Words as points in space
+    slides: |
+      # One-hot vectors know nothing
+
+      A one-hot vector for word $i$ has a 1 in position $i$ and zeros everywhere else.
+      With a 30,000-word vocabulary, each word is a 30,000-dimensional vector, and
+
+      $$\text{onehot}(\text{pump}) \cdot \text{onehot}(\text{valve}) = 0 = \text{onehot}(\text{pump}) \cdot \text{onehot}(\text{birthday})$$
+
+      Every pair of words is equally unrelated. A model that sees "the pump is leaking" learns
+      nothing about valves. We want vectors where **similar words are close**, so what is learned
+      about one word transfers to its neighbours.
+
+      ---
+
+      ## An embedding is a lookup table
+
+      Give every token a dense row in a table $E$ of shape $V \times d$ ($d$ = 50 to 4,096).
+
+      ```python
+      emb = nn.Embedding(num_embeddings=V, embedding_dim=d)
+      vectors = emb(torch.tensor([412, 7, 33]))     # shape (3, d)
+      ```
+
+      Under the hood this is a one-hot vector times the table, $\text{onehot}(i)\,E = E_i$, done as an
+      indexing operation because multiplying by zeros is wasteful. Consequences:
+
+      - parameters: $V \times d$. DistilBERT's table is $30{,}522 \times 768 \approx 23$M of its 66M parameters;
+      - in a training step only the rows of tokens in the batch get gradients, so rare tokens learn slowly.
+
+      ---
+
+      ## Cosine similarity
+
+      $$\cos(a, b) = \frac{a \cdot b}{\lVert a \rVert \, \lVert b \rVert} \in [-1, 1]$$
+
+      It compares **direction** and ignores length. For a whole table at once, normalise each row
+      once, then one matrix product gives every pair:
+
+      ```python
+      U = E / np.linalg.norm(E, axis=1, keepdims=True)
+      sims = U @ U.T                   # sims[i, j] = cos(word i, word j)
+      order = np.argsort(-sims[i])     # most similar first; order[0] is word i itself
+      ```
+
+      ---
+
+      ## Dot product, cosine or Euclidean distance?
+
+      | measure | sensitive to length | use when | watch out for |
+      | --- | --- | --- | --- |
+      | dot product $a \cdot b$ | yes | the model was trained for it (some retrieval models); length means something, like popularity | long vectors win every query ("hubs") |
+      | cosine | no | default for word and sentence embeddings | meaningless for near-zero vectors |
+      | Euclidean $\lVert a - b \rVert$ | yes | clustering, k-means | dominated by length differences |
+
+      On **unit** vectors all three give the same ranking, because $\lVert a - b \rVert^2 = 2 - 2\cos(a, b)$.
+      That is why vector databases ask you to normalise once at index time and then use the fastest one,
+      the dot product.
+
+  - id: lookup-table
+    type: coding
+    title: An embedding layer is a matrix product
+    context: |
+      `emb` is an `nn.Embedding(10, 4)` (10 tokens, 4 dimensions) and `ids` is a tensor of 5 token ids.
+      `torch`, `nn` and `F` (`torch.nn.functional`) are imported. Show that the lookup equals a one-hot matrix product.
+    instructions:
+      - "Store the one-hot encoding of `ids` as floats in `one_hot` (shape `(5, 10)`)."
+      - "Store `one_hot @ emb.weight` in `via_matmul` and `emb(ids)` in `via_lookup`."
+      - "Store whether they match (`torch.allclose`) in `same`, and the number of parameters in `emb` in `n_params`."
+    hint: "`F.one_hot(ids, num_classes=10).float()`. Count parameters with `emb.weight.numel()`."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      emb = nn.Embedding(10, 4)
+      ids = torch.tensor([3, 7, 7, 0, 9])
+    sample_code: |
+      one_hot = ____
+      via_matmul = ____
+      via_lookup = ____
+      same = ____
+      n_params = ____
+      print(via_matmul.shape, same, n_params)
+    solution: |
+      one_hot = F.one_hot(ids, num_classes=10).float()
+      via_matmul = one_hot @ emb.weight
+      via_lookup = emb(ids)
+      same = torch.allclose(via_matmul, via_lookup)
+      n_params = emb.weight.numel()
+      print(via_matmul.shape, same, n_params)
+    tests: |
+      import torch
+      oh = check_object("one_hot")
+      assert tuple(oh.shape) == (5, 10) and torch.equal(oh, sol["one_hot"]), "`one_hot` should be `F.one_hot(ids, num_classes=10).float()`, shape (5, 10)."
+      vm = check_object("via_matmul")
+      assert torch.allclose(vm, sol["via_matmul"]), "`via_matmul` should be `one_hot @ emb.weight`."
+      vl = check_object("via_lookup")
+      assert torch.allclose(vl, sol["via_lookup"]), "`via_lookup` should be `emb(ids)`."
+      check_equal("same", True, msg="`same` should be the result of `torch.allclose(via_matmul, via_lookup)`, which is True.")
+      check_equal("n_params", 40, msg="`n_params` should be the number of weights in the table: 10 rows x 4 columns.")
+    success_msg: Identical. An embedding layer is a one-hot matrix product that skips the zeros, and its size is vocabulary times width.
+
+  - id: cosine-neighbours
+    type: coding
+    title: Nearest neighbours by cosine
+    context: |
+      `words` (29 words) and `E` (a 29 x 12 embedding table, one row per word) are loaded, with `np`.
+      Find which words the table considers similar.
+    instructions:
+      - "Write `cosine_matrix(M)` that returns the matrix of cosine similarities between all rows of `M`."
+      - "Store `cosine_matrix(E)` in `sims`."
+      - "Write `nearest(word, k=3)` that returns the `k` most similar **other** words to `word`, most similar first."
+      - "Print `nearest(\"queen\")` and `nearest(\"pump\")`."
+    hint: |
+      Normalise rows with `M / np.linalg.norm(M, axis=1, keepdims=True)`, then `U @ U.T`.
+      In `nearest`, `np.argsort(-sims[i])` sorts most-similar first; skip index `i` itself.
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import toy_table
+      words, E = toy_table()
+    sample_code: |
+      def cosine_matrix(M):
+          U = ____
+          return ____
+
+      sims = cosine_matrix(E)
+
+      def nearest(word, k=3):
+          i = words.index(word)
+          order = np.argsort(-sims[i])
+          return [words[j] for j in order if ____][:k]
+
+      print(nearest("queen"))
+      print(nearest("pump"))
+    solution: |
+      def cosine_matrix(M):
+          U = M / np.linalg.norm(M, axis=1, keepdims=True)
+          return U @ U.T
+
+      sims = cosine_matrix(E)
+
+      def nearest(word, k=3):
+          i = words.index(word)
+          order = np.argsort(-sims[i])
+          return [words[j] for j in order if j != i][:k]
+
+      print(nearest("queen"))
+      print(nearest("pump"))
+    tests: |
+      import numpy as np
+      check_object("cosine_matrix")
+      M = np.array([[3.0, 4.0], [6.0, 8.0], [0.0, 2.0]])
+      got = np.asarray(user["cosine_matrix"](M))
+      assert got.shape == (3, 3) and np.allclose(got, [[1, 1, 0.8], [1, 1, 0.8], [0.8, 0.8, 1]]), \
+          "`cosine_matrix` should ignore vector length: rows [3, 4] and [6, 8] must have cosine 1.0. Divide each row by its norm before the matrix product."
+      check_equal("sims")
+      check_object("nearest")
+      for w in ["queen", "pump", "nurse"]:
+          assert list(user["nearest"](w)) == list(sol["nearest"](w)), f"`nearest('{w}')` should return the 3 most similar other words, most similar first (expected {sol['nearest'](w)})."
+      assert len(user["nearest"]("he", k=5)) == 5, "`nearest` should honour `k`."
+    success_msg: "Machines sit near machines and `queen` near other adult women. Print `nearest('queen', k=4)`: `nurse` shows up, because this table leaked a gender lean into job words. The analogies lesson measures that."
+
+  - id: dot-vs-cosine
+    type: mc
+    title: Predict, then run - dot product vs cosine
+    question: |
+      A search uses the query vector `q = [1.0, 0.2]`. The candidates are `valve = [0.9, 0.3]` and
+      `bridge = [3.0, 9.0]`. Which candidate does each measure rank first?
+    context: "The console has `q`, `valve` and `bridge` as NumPy arrays. Compute `q @ valve`, `q @ bridge`, and the cosines."
+    pre_code: |
+      import numpy as np
+      q = np.array([1.0, 0.2])
+      valve = np.array([0.9, 0.3])
+      bridge = np.array([3.0, 9.0])
+    options:
+      - text: Both rank `valve` first
+        feedback: "Cosine does, but check the dot product: `q @ bridge` is 4.8, five times `q @ valve`."
+      - text: Dot product ranks `bridge` first; cosine ranks `valve` first
+        correct: true
+        feedback: |
+          Right. `bridge` points about 60 degrees away from the query but is ten times longer, so it wins
+          the dot product. Cosine only looks at direction, where `valve` is almost identical to `q`.
+          If raw dot-product search keeps returning the same few long vectors, normalise.
+      - text: Both rank `bridge` first
+        feedback: "Cosine divides by both lengths: cos(q, bridge) is about 0.5 while cos(q, valve) is about 0.99."
+      - text: Dot product ranks `valve` first; cosine ranks `bridge` first
+        feedback: It is the other way round. Length inflates the dot product, and cosine removes length.
+    hint: Dot product grows with vector length; cosine does not.

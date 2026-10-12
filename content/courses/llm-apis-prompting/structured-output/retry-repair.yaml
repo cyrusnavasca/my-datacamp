@@ -1,0 +1,355 @@
+title: Validate, then repair
+description: Feed validation errors back so the model fixes the exact field, budget the retries, and build an extractor that survives a chaotic API.
+exercises:
+  - id: repair-slides
+    type: video
+    title: Errors are information
+    slides: |
+      # Blind retry versus repair
+
+      Two kinds of failure need different treatment:
+
+      | failure | example | blind retry (same request again) | repair (send the error back) |
+      | --- | --- | --- | --- |
+      | **random** | cut off, a stray fence, a trailing comma | often works: the next sample differs | works too |
+      | **systematic** | always writes `"Module E"` and `"urgent"` | fails every time: same input, same mistake | works: the error says what to change |
+
+      A blind retry sends the same input, so for a systematic mistake you get the same output. A **repair** turn adds new
+      information: the validator's message, field by field.
+
+      ---
+
+      ## The repair loop
+
+      ```python
+      def extract(ticket, max_attempts=3):
+          messages = [{"role": "user", "content": ticket}]
+          for attempt in range(max_attempts):
+              text = client.messages.create(model=MODEL, max_tokens=300,
+                                            system=SYSTEM, messages=messages).content[0].text
+              try:
+                  return IncidentReport.model_validate(parse_json(text))   # success
+              except ValueError as e:              # JSONDecodeError and ValidationError are both ValueErrors
+                  messages += [
+                      {"role": "assistant", "content": text},
+                      {"role": "user", "content": f"That reply was invalid:\n{e}\nReply with only the corrected JSON object."},
+                  ]
+          return None                              # give up: log it, send it to a human queue
+      ```
+
+      Always **cap** the attempts, and always have a path for the item that never validates (a dead-letter queue, a human).
+
+      ---
+
+      ## What retries cost
+
+      If each call fails independently with probability $p$ and you allow $k$ attempts:
+
+      $$P(\text{all fail}) = p^k \qquad E[\text{calls per item}] = 1 + p + p^2 + \dots + p^{k-1}$$
+
+      | $p$ | calls per item ($k=3$) | items lost ($k=3$) |
+      | --- | --- | --- |
+      | 0.05 | 1.05 | 1 in 8,000 |
+      | 0.2 | 1.24 | 1 in 125 |
+      | 0.4 | 1.56 | 1 in 16 |
+
+      Repair turns also **grow the input** (the bad reply and the error are resent), and every attempt adds latency.
+      Retries are a safety net for random failures. They're a bad fix for a high systematic failure rate: fix the prompt first.
+
+      ---
+
+      ## Playbook: invalid structured output
+
+      1. **Measure:** the valid rate (parses **and** validates) over 20-50 inputs, plus calls per item.
+      2. **Diagnose:** bucket the failures. Wrappers? Syntax? Truncation? Which fields fail validation?
+      3. **Fix, cheapest first:**
+         - systematic field errors: a clearer spec (allowed values, formats, field descriptions)
+         - wrappers: prefill or a robust parser
+         - truncation: more `max_tokens`
+         - whatever random failures remain: a capped repair loop
+      4. **Verify:** the valid rate is at your target and calls per item are within budget. Keep the run as a regression test.
+
+  - id: repair-loop
+    type: coding
+    title: Repair beats blind retry
+    context: |
+      The extractor makes **systematic** mistakes with the current prompt: it writes `"Module E"` instead of `"E"` and
+      `"urgent"` instead of `"high"`. `extract_blind(ticket)` retries the identical request up to 3 times. `parse_report(text)`
+      parses and validates one reply (it raises `ValueError` on failure). `TICKETS` holds 6 tickets.
+    instructions:
+      - "Store how many of `TICKETS` `extract_blind` turns into a report (not `None`) in `blind_valid`, then call `client.reset()`."
+      - "Write `extract_repair(ticket, max_attempts=3)`: on failure, append the bad reply as an `assistant` message and the error text (`str(e)`) in a `user` message, then try again. Return the report, or `None` after `max_attempts`."
+      - "Store how many tickets `extract_repair` turns into a report in `repair_valid`, and the number of API calls it used in `repair_calls`."
+    hint: |
+      Keep one `messages` list per ticket. In the `except ValueError as e:` branch:
+      `messages += [{"role": "assistant", "content": text}, {"role": "user", "content": f"Invalid: {e}. Reply with only the corrected JSON."}]`.
+      Count calls with `len(client.calls)` after `client.reset()`.
+    pre_code: |
+      import json
+      import re
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field
+      import aikit
+      from kits.llm_apis_prompting import incident_extractor, incident_records, MODEL
+      client = aikit.FakeClaude(incident_extractor(noise=False), clock=aikit.VirtualClock())
+      SYSTEM = "Extract an incident report from the crew ticket as JSON with keys crew, module, severity, summary."
+      TICKETS = [f"Ticket from {r['crew']}: {r['text']}" for r in incident_records(6)]
+
+      class IncidentReport(BaseModel):
+          crew: str
+          module: Optional[Literal["A", "B", "C", "D", "E", "F"]]
+          severity: Literal["low", "normal", "high"]
+          summary: str = Field(max_length=120)
+
+      def parse_report(text):
+          text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+          start, end = text.find("{"), text.rfind("}")
+          if start == -1 or end == -1:
+              raise ValueError("no JSON object in reply")
+          return IncidentReport.model_validate(json.loads(text[start:end + 1]))
+
+      def extract_blind(ticket, max_attempts=3):
+          for _ in range(max_attempts):
+              text = client.messages.create(model=MODEL, max_tokens=300, system=SYSTEM,
+                                            messages=[{"role": "user", "content": ticket}]).content[0].text
+              try:
+                  return parse_report(text)
+              except ValueError:
+                  pass
+          return None
+    sample_code: |
+      blind_valid = ____
+      client.reset()
+
+      def extract_repair(ticket, max_attempts=3):
+          messages = [{"role": "user", "content": ticket}]
+          for _ in range(max_attempts):
+              text = client.messages.create(model=MODEL, max_tokens=300, system=SYSTEM,
+                                            messages=messages).content[0].text
+              try:
+                  return parse_report(text)
+              except ValueError as e:
+                  messages += ____
+          return None
+
+      reports = [extract_repair(t) for t in TICKETS]
+      repair_valid = ____
+      repair_calls = ____
+      print(blind_valid, repair_valid, repair_calls)
+    solution: |
+      blind_valid = sum(extract_blind(t) is not None for t in TICKETS)
+      client.reset()
+
+      def extract_repair(ticket, max_attempts=3):
+          messages = [{"role": "user", "content": ticket}]
+          for _ in range(max_attempts):
+              text = client.messages.create(model=MODEL, max_tokens=300, system=SYSTEM,
+                                            messages=messages).content[0].text
+              try:
+                  return parse_report(text)
+              except ValueError as e:
+                  messages += [
+                      {"role": "assistant", "content": text},
+                      {"role": "user", "content": f"That reply was invalid:\n{e}\nReply with only the corrected JSON object."},
+                  ]
+          return None
+
+      reports = [extract_repair(t) for t in TICKETS]
+      repair_valid = sum(r is not None for r in reports)
+      repair_calls = len(client.calls)
+      print(blind_valid, repair_valid, repair_calls)
+    tests: |
+      check_equal("blind_valid", 0, msg="`blind_valid` counts tickets where `extract_blind` returned a report. Systematic mistakes repeat, so it should be 0.")
+      check_equal("repair_valid", 6, msg="Every ticket should validate after repair. Append the bad reply as `assistant` and the error text (`str(e)`) as `user`, then call again with the grown `messages`.")
+      assert user.get("repair_calls", 99) <= 12, f"`repair_calls` should be the calls used by the repair run only (call `client.reset()` first), at most 2 per ticket; got {user.get('repair_calls')}."
+    success_msg: |
+      Blind retries burned 18 calls and got nothing, because the same input gives the same mistake. Repair got all six
+      in 12 calls, since the error message named the field to fix. A clearer prompt would get there in 6.
+
+  - id: retry-cost
+    type: mc
+    title: Price the safety net
+    question: |
+      After fixing the prompt, the remaining failures are random: each call independently returns broken JSON with probability
+      **0.2**. You allow up to **3** attempts per ticket. Roughly what share of tickets still fail, and how many calls does a ticket cost on average?
+    options:
+      - text: "About 0.8% fail; about 1.24 calls per ticket."
+        correct: true
+        feedback: "Right: $0.2^3 = 0.008$, and $1 + 0.2 + 0.04 = 1.24$. A 24% call overhead to cut failures from 20% to under 1%. Only a few tickets go to the human queue."
+      - text: "About 6.7% fail; about 3 calls per ticket."
+        feedback: "Attempts stop at the first success, so most tickets need only one call. All three are used only when the first two fail ($0.2^2 = 4\\%$ of tickets)."
+      - text: "0% fail, because three attempts always suffice; 1.2 calls per ticket."
+        feedback: "Retries reduce failures geometrically, but never to zero: $0.2^3$ of tickets fail every attempt. You still need a dead-letter path."
+      - text: "About 20% fail; 1 call per ticket."
+        feedback: That's the rate without retries. Each extra attempt multiplies the failure share by 0.2.
+    hint: All attempts fail with probability $p^k$. The second call happens with probability $p$, the third with $p^2$.
+
+  - id: incident-pipeline
+    type: sequential
+    title: "Mission: 20 incident reports through a chaotic API"
+    context: |
+      Tonight's batch has 20 crew tickets for the maintenance system, and the API is misbehaving: `make_client()` returns an
+      extractor where **40% of JSON replies come back broken** (fences, preambles, cut-offs, trailing commas, single quotes),
+      on top of the model's own field habits. Target: **all 20 reports valid, in at most 30 calls**.
+    pre_code: |
+      import json
+      import re
+      from typing import Literal, Optional
+      from pydantic import BaseModel, Field
+      import aikit
+      from kits.llm_apis_prompting import incident_extractor, incident_records, MODEL
+
+      def make_client():
+          return aikit.FakeClaude(incident_extractor(noise=False), malformed_json_rate=0.4, clock=aikit.VirtualClock())
+
+      TICKETS = [f"Ticket from {r['crew']}: {r['text']}" for r in incident_records(20)]
+      LOOSE = "Extract an incident report from the crew ticket as JSON with keys crew, module, severity, summary."
+
+      class IncidentReport(BaseModel):
+          crew: str
+          module: Optional[Literal["A", "B", "C", "D", "E", "F"]]
+          severity: Literal["low", "normal", "high"]
+          summary: str = Field(max_length=120)
+    steps:
+      - instructions:
+          - "**Measure the baseline:** with `client = make_client()`, make one call per ticket with `system=LOOSE`. Store how many replies `json.loads` accepts in `baseline_parsed`, and how many of those also pass `IncidentReport.model_validate` in `baseline_valid`."
+        hint: Wrap `json.loads` and `model_validate` in `try`/`except ValueError` (pydantic's ValidationError is a ValueError too).
+        sample_code: |
+          client = make_client()
+          baseline_parsed = baseline_valid = 0
+          for t in TICKETS:
+              text = client.messages.create(model=MODEL, max_tokens=300, system=LOOSE,
+                                            messages=[{"role": "user", "content": t}]).content[0].text
+              try:
+                  data = ____
+              except ValueError:
+                  continue
+              baseline_parsed += 1
+              try:
+                  ____
+                  baseline_valid += 1
+              except ValueError:
+                  pass
+          print(baseline_parsed, baseline_valid)
+        solution: |
+          client = make_client()
+          baseline_parsed = baseline_valid = 0
+          for t in TICKETS:
+              text = client.messages.create(model=MODEL, max_tokens=300, system=LOOSE,
+                                            messages=[{"role": "user", "content": t}]).content[0].text
+              try:
+                  data = json.loads(text)
+              except ValueError:
+                  continue
+              baseline_parsed += 1
+              try:
+                  IncidentReport.model_validate(data)
+                  baseline_valid += 1
+              except ValueError:
+                  pass
+          print(baseline_parsed, baseline_valid)
+        tests: |
+          check_equal("baseline_parsed", msg="`baseline_parsed` counts replies that `json.loads` accepts unchanged.")
+          check_equal("baseline_valid", msg="`baseline_valid` counts parsed replies that also validate.")
+      - instructions:
+          - "Write `parse_report(text)`: strip fences, slice from the first `{` to the last `}`, `json.loads` it and return `IncidentReport.model_validate(...)`. Raise `ValueError` if there's no object."
+        hint: Reuse the parser from the JSON lesson, then validate its result.
+        sample_code: |
+          def parse_report(text):
+              text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+              start, end = text.find("{"), text.rfind("}")
+              if ____:
+                  raise ValueError("no JSON object in reply")
+              return ____
+        solution: |
+          def parse_report(text):
+              text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())
+              start, end = text.find("{"), text.rfind("}")
+              if start == -1 or end == -1:
+                  raise ValueError("no JSON object in reply")
+              return IncidentReport.model_validate(json.loads(text[start:end + 1]))
+        tests: |
+          check_object("parse_report")
+          f = user["parse_report"]
+          ok = '{"crew": "Noor Haddad", "module": null, "severity": "high", "summary": "Odd message"}'
+          assert f("Here you go:\n```json\n" + ok + "\n```").crew == "Noor Haddad", "`parse_report` should strip fences and preambles and return a validated IncidentReport."
+          for bad in ['{"crew": "x", "module": "Module E", "severity": "high", "summary": "s"}', '{"crew": "x", "mod', "no json"]:
+              try:
+                  f(bad)
+                  raise AssertionError(f"`parse_report` should raise ValueError for {bad!r}.")
+              except ValueError:
+                  pass
+      - instructions:
+          - "Write `STRICT`: a system prompt that asks for only a JSON object (no prose, no markdown) and spells out the fields: module as a single letter A-F or null, severity one of low, normal or high."
+          - "Write `extract(ticket, max_attempts=4)`: call with `system=STRICT` and the global `client`, return `parse_report(text)` on success, and on `ValueError` add the bad reply and the error as a repair turn. Return `None` after `max_attempts`."
+        hint: |
+          The repair loop is the one from `repair-loop`. Fixing the systematic field errors in `STRICT` means most tickets need
+          one call, so retries only pay for the API's random breakage.
+        sample_code: |
+          STRICT = ____
+
+          def extract(ticket, max_attempts=4):
+              messages = [{"role": "user", "content": ticket}]
+              for _ in range(max_attempts):
+                  text = client.messages.create(model=MODEL, max_tokens=300, system=STRICT,
+                                                messages=messages).content[0].text
+                  try:
+                      return ____
+                  except ValueError as e:
+                      messages += ____
+              return None
+        solution: |
+          STRICT = ("Extract an incident report from the crew ticket. Reply with only a JSON object, no prose and no markdown, "
+                    "with keys: crew (string), module (a single letter A-F, or null), severity (one of low, normal, high), "
+                    "summary (under 120 characters).")
+
+          def extract(ticket, max_attempts=4):
+              messages = [{"role": "user", "content": ticket}]
+              for _ in range(max_attempts):
+                  text = client.messages.create(model=MODEL, max_tokens=300, system=STRICT,
+                                                messages=messages).content[0].text
+                  try:
+                      return parse_report(text)
+                  except ValueError as e:
+                      messages += [
+                          {"role": "assistant", "content": text},
+                          {"role": "user", "content": f"That reply was invalid:\n{e}\nReply with only the corrected JSON object."},
+                      ]
+              return None
+        tests: |
+          check_object("extract")
+          import aikit
+          from kits.llm_apis_prompting import incident_extractor
+          user["client"] = aikit.FakeClaude(incident_extractor(noise=False), clock=aikit.VirtualClock())
+          outs = [user["extract"](t) for t in user["TICKETS"][:6]]
+          assert all(o is not None for o in outs), "On a well-behaved API every ticket should validate. Check `STRICT` and the repair turn."
+          calls = len(user["client"].calls)
+          assert calls <= 6, f"With no API breakage, `STRICT` alone should make every ticket valid on the first call; it took {calls} calls for 6. Spell out the allowed module and severity values."
+      - instructions:
+          - "**Run the batch:** set `client = make_client()` (fresh, chaotic), then store `[extract(t) for t in TICKETS]` in `reports`."
+          - "Store the number of valid reports in `valid_count` and calls used in `calls_used`. Targets: 20 valid, at most 30 calls."
+        hint: "`valid_count = sum(r is not None for r in reports)` and `calls_used = len(client.calls)`."
+        sample_code: |
+          client = ____
+          reports = ____
+          valid_count = ____
+          calls_used = ____
+          print(f"{valid_count}/20 valid in {calls_used} calls, cost {client.total_cost():.4f} USD")
+        solution: |
+          client = make_client()
+          reports = [extract(t) for t in TICKETS]
+          valid_count = sum(r is not None for r in reports)
+          calls_used = len(client.calls)
+          print(f"{valid_count}/20 valid in {calls_used} calls, cost {client.total_cost():.4f} USD")
+        tests: |
+          check_object("reports")
+          rs = user["reports"]
+          assert len(rs) == 20, "`reports` should have one entry per ticket."
+          n_valid = sum(r is not None for r in rs)
+          calls = len(user["client"].calls)
+          assert n_valid == 20, f"Only {n_valid}/20 reports are valid. Raise `max_attempts`, or make sure every failure becomes a repair turn."
+          assert calls <= 30, f"The batch used {calls} calls; the budget is 30. Did you start from a fresh `make_client()`? Fewer systematic errors (a stricter prompt) means fewer retries."
+          assert user.get("valid_count") == 20 and user.get("calls_used") == calls, "Store `valid_count` and `calls_used`."
+    success_msg: |
+      All 20 reports are valid within the call budget, against an API that broke 40% of its JSON. The order mattered: the
+      strict prompt removed the systematic errors, the parser absorbed wrappers for free, and repairs paid only for the truly random breakage.

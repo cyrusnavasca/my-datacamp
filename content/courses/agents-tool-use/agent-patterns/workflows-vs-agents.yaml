@@ -1,0 +1,199 @@
+title: Workflows or agents?
+description: The common patterns between a single call and a full agent, when each one wins, and how to fix an agent that is too expensive for simple work.
+exercises:
+  - id: patterns-slides
+    type: video
+    title: Who decides the next step?
+    slides: |
+      # Who decides the next step?
+
+      | | the steps are decided by | example |
+      | --- | --- | --- |
+      | **workflow** | your code: fixed paths, with LLM calls at some steps | classify a ticket, then fill in a template |
+      | **agent** | the model, at run time, from the results so far | "figure out why hydroponics is humid and fix it" |
+
+      Most useful systems sit in between. Use the least autonomy that solves the problem: every decision you hand
+      to the model is a decision you can't predict, test as easily, or cap in advance.
+
+      ---
+
+      ## The common patterns
+
+      | pattern | shape | Helios example |
+      | --- | --- | --- |
+      | **prompt chaining** | step 1 output → step 2 input, with checks between steps | draft an incident report → check it against the schema → translate it for Meridian Control |
+      | **routing** | classify first, then a specialised path | lookup vs booking vs emergency, each with its own prompt and tools |
+      | **parallelisation** | independent calls at once; or several votes on one question | check six modules at once; three judges vote on "is this message safe to send?" |
+      | **orchestrator-workers** | a lead splits the task at run time and merges the results | "status report for every module" → one worker per module (next lesson) |
+      | **evaluator-optimiser** | generate → critique → revise, until it passes | ORBIT drafts a crew announcement; a checker flags jargon; it revises |
+      | **agent** | a loop with tools, the model picks each step | open-ended diagnosis and repair |
+
+      ---
+
+      ## Trade-off: workflow vs agent
+
+      | | fixed workflow | agent |
+      | --- | --- | --- |
+      | predictability | high: same path every time | low: the path varies by run |
+      | cost per task | low and bounded | higher, and with a long tail |
+      | latency | few, known calls | grows with the steps taken |
+      | flexibility | only the paths you built | handles cases you didn't foresee |
+      | debugging and testing | test each step on its own | needs traces and end-to-end evals |
+      | failure modes | wrong route, brittle on odd input | loops, wandering, surprising actions |
+
+      **Agents win** when the steps can't be known in advance and a wrong step is cheap to recover from. **Workflows win**
+      when most requests follow a few known paths. Often the best design is a router that sends known paths to workflows
+      and the rest to an agent.
+
+      ---
+
+      ## Playbook: "the agent costs too much"
+
+      **Symptom:** cost per request is several times the estimate, and simple questions are slow.
+
+      **Measure:** model calls and cost per request, **grouped by request type**.
+
+      **Diagnose:** look at traces of the cheapest kind of request. Typical findings: the agent explores ("let me check the
+      roster and the handbook first") before making the one call a lookup needs; a large model does a small model's job;
+      the system prompt and tool list are paid on every step.
+
+      **Fix, cheapest first:**
+
+      1. Route known simple requests to a **workflow**: one small-model call picks the tool, code formats the answer.
+      2. Use a smaller model where quality allows; measure it on your set first.
+      3. Tighter descriptions and system prompt ("if one tool call answers the question, answer after it").
+      4. Cache stable prompt prefixes.
+
+      **Verify:** cost per request **and** success rate on the same requests. Savings that break answers are not savings.
+
+  - id: which-pattern
+    type: classify
+    title: How much autonomy does it need?
+    prompt: For each ORBIT feature, pick the simplest design that does the job well.
+    hint: If code can do it reliably, use code. If it's one transformation of text, one call. If the steps are known, a workflow. Only open-ended, multi-step problems need an agent.
+    zones: [Plain code, Single LLM call, Fixed workflow, Agent]
+    items:
+      - { text: "Alert the crew when CO2 goes above 0.4%", zone: Plain code }
+      - { text: "Convert a booking request's date to 'YYYY-MM-DD HH:MM'", zone: Plain code }
+      - { text: "Rewrite a terse engineering note in plain words for the crew", zone: Single LLM call }
+      - { text: "Tag a crew ticket as hardware, software or medical", zone: Single LLM call }
+      - { text: "Every morning: read 18 sensors, flag out-of-range values, message the commander", zone: Fixed workflow }
+      - { text: "Ticket comes in: classify it, look up the right handbook page, draft a reply", zone: Fixed workflow }
+      - { text: "Hydroponics yield dropped 20% this month: find out why", zone: Agent }
+      - { text: "Make the failing tests in the climate library pass", zone: Agent }
+
+  - id: name-the-workflow
+    type: classify
+    title: Name the workflow pattern
+    prompt: Each of these is a workflow, not an agent. Which pattern is it?
+    hint: Chaining passes output along a fixed line. Routing picks one path. Parallelisation runs pieces (or votes) at once. Evaluator-optimiser loops on a critique.
+    zones: [Prompt chaining, Routing, Parallelisation, Evaluator-optimiser]
+    items:
+      - { text: "Extract an incident report, validate it, then translate it", zone: Prompt chaining }
+      - { text: "Summarise a log, then write the shift handover from the summary", zone: Prompt chaining }
+      - { text: "Send medical questions to a careful prompt with the med-bay handbook, everything else to the general prompt", zone: Routing }
+      - { text: "Use a small model for lookups and a large one for diagnoses", zone: Routing }
+      - { text: "Check six modules at the same time and combine the readings", zone: Parallelisation }
+      - { text: "Ask three model calls whether a message is safe to send; send only if at least two say yes", zone: Parallelisation }
+      - { text: "Draft an announcement, have a checker flag jargon, revise until it's clean", zone: Evaluator-optimiser }
+      - { text: "Write a booking summary, check it against the booking record, redo it if anything disagrees", zone: Evaluator-optimiser }
+
+  - id: route-the-lookups
+    type: coding
+    title: "Troubleshooting: the agent is too expensive"
+    context: |
+      ORBIT runs every request in `CREW_REQUESTS` through a general agent (`agent`), and the bill is high. Each entry is
+      `(request, kind, expected)`; `request_ok(request, answer)` checks an answer. `triage` (a small model) answers
+      `"lookup"` or `"task"`, `router` picks one tool from `LOOKUP_TOOLS`, and `format_answer(request, tool, output)`
+      formats a lookup answer in plain code. Measure, fix with routing, verify.
+    instructions:
+      - "Measure: run every request through `run_agent(agent, ...)`. Store `agent_success` (share of `request_ok` answers), `agent_cost` (`agent.total_cost()`) and `lookup_steps` (mean `steps` over the requests whose kind is `\"lookup\"`)."
+      - "Write `lookup_workflow(request)`: one `router.messages.create` call on `SMALL_MODEL` with `tools=LOOKUP_TOOLS`, run the tool it picks with `station.run_tool`, and return `format_answer(...)`."
+      - "Write `answer(request)`: if `classify(request) == \"lookup\"` use the workflow, otherwise `run_agent(agent2, request, TOOLS, station.run_tool)[\"answer\"]`."
+      - "Verify: store `hybrid_success` over all requests and `hybrid_cost` (the `total_cost()` of `triage`, `router` and `agent2` added up)."
+    hint: |
+      In the workflow: `r = router.messages.create(model=SMALL_MODEL, max_tokens=300, tools=LOOKUP_TOOLS, messages=[{"role": "user", "content": request}])`,
+      then `call = next(b for b in r.content if b.type == "tool_use")`. Averages: `sum(xs) / len(xs)`.
+    pre_code: |
+      import aikit
+      from kits.agents_tool_use import (HeliosStation, FakeClaude, VirtualClock, wandering_agent, triage_model, run_agent,
+                                        CREW_REQUESTS, LOOKUP_TOOLS, format_answer, request_ok, MODEL, SMALL_MODEL)
+      station = HeliosStation()
+      TOOLS = station.tools
+      agent = FakeClaude(wandering_agent(), clock=VirtualClock())
+      agent2 = FakeClaude(wandering_agent(), clock=VirtualClock())
+      triage = FakeClaude(triage_model(), clock=VirtualClock())
+      router = FakeClaude(aikit.tool_chooser(), clock=VirtualClock())
+
+      def classify(request):
+          r = triage.messages.create(model=SMALL_MODEL, max_tokens=5, messages=[
+              {"role": "user", "content": "Reply with one word, lookup or task. Request: " + request}])
+          return r.content[0].text.strip()
+    sample_code: |
+      oks, lookup_step_counts = [], []
+      for request, kind, _ in CREW_REQUESTS:
+          run = run_agent(agent, request, TOOLS, station.run_tool)
+          oks.append(request_ok(request, run["answer"]))
+          if kind == "lookup":
+              lookup_step_counts.append(run["steps"])
+      agent_success = sum(oks) / len(oks)
+      agent_cost = ____
+      lookup_steps = ____
+      print(agent_success, round(agent_cost, 4), lookup_steps)
+
+      def lookup_workflow(request):
+          r = ____
+          call = next(b for b in r.content if b.type == "tool_use")
+          output = ____
+          return format_answer(request, call.name, output)
+
+      def answer(request):
+          if ____:
+              return lookup_workflow(request)
+          return run_agent(agent2, request, TOOLS, station.run_tool)["answer"]
+
+      hybrid_success = sum(request_ok(r, answer(r)) for r, _, _ in CREW_REQUESTS) / len(CREW_REQUESTS)
+      hybrid_cost = ____
+      print(hybrid_success, round(hybrid_cost, 4), f"{1 - hybrid_cost / agent_cost:.0%} cheaper")
+    solution: |
+      oks, lookup_step_counts = [], []
+      for request, kind, _ in CREW_REQUESTS:
+          run = run_agent(agent, request, TOOLS, station.run_tool)
+          oks.append(request_ok(request, run["answer"]))
+          if kind == "lookup":
+              lookup_step_counts.append(run["steps"])
+      agent_success = sum(oks) / len(oks)
+      agent_cost = agent.total_cost()
+      lookup_steps = sum(lookup_step_counts) / len(lookup_step_counts)
+      print(agent_success, round(agent_cost, 4), lookup_steps)
+
+      def lookup_workflow(request):
+          r = router.messages.create(model=SMALL_MODEL, max_tokens=300, tools=LOOKUP_TOOLS,
+                                     messages=[{"role": "user", "content": request}])
+          call = next(b for b in r.content if b.type == "tool_use")
+          output = station.run_tool(call.name, call.input)
+          return format_answer(request, call.name, output)
+
+      def answer(request):
+          if classify(request) == "lookup":
+              return lookup_workflow(request)
+          return run_agent(agent2, request, TOOLS, station.run_tool)["answer"]
+
+      hybrid_success = sum(request_ok(r, answer(r)) for r, _, _ in CREW_REQUESTS) / len(CREW_REQUESTS)
+      hybrid_cost = triage.total_cost() + router.total_cost() + agent2.total_cost()
+      print(hybrid_success, round(hybrid_cost, 4), f"{1 - hybrid_cost / agent_cost:.0%} cheaper")
+    tests: |
+      check_equal("agent_success", msg="`agent_success` is the share of requests the agent answered correctly.")
+      check_equal("agent_cost", msg="`agent_cost` is `agent.total_cost()` after the measurement run.")
+      check_equal("lookup_steps", msg="`lookup_steps` is the mean `steps` over the lookup requests only.")
+      hs = check_object("hybrid_success")
+      assert hs == 1, f"The routed version should answer all 12 requests correctly; it got {hs:.0%}. Check that lookups go to the workflow and tasks to agent2."
+      hc = check_object("hybrid_cost")
+      real = user["triage"].total_cost() + user["router"].total_cost() + user["agent2"].total_cost()
+      assert abs(hc - real) < 1e-12, "`hybrid_cost` should add the total_cost() of triage, router and agent2."
+      assert real <= 0.5 * user["agent_cost"], f"Routing should at least halve the cost; it went from {user['agent_cost']:.4f} to {real:.4f}. Are lookups answered with one small-model call?"
+      assert len(user["router"].calls) == 9, f"The workflow should make exactly one router call per lookup (9); it made {len(user['router'].calls)}."
+    success_msg: |
+      Same answers at a fraction of the cost. The agent spent 3-4 medium-model calls on each lookup, exploring before
+      making the one call it needed; the workflow makes one small-model call and formats the answer in code. The agent
+      still handles the requests that need it.

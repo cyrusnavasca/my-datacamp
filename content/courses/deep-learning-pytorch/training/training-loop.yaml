@@ -1,0 +1,208 @@
+title: The training loop
+description: The five steps of every PyTorch training loop, what an optimiser step really does, and how to choose an optimiser.
+exercises:
+  - id: intro
+    type: video
+    title: Five steps, repeated
+    slides: |
+      # Every training loop is the same five steps
+
+      ```python
+      model = nn.Linear(1, 1)
+      loss_fn = nn.MSELoss()
+      optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+      for epoch in range(200):
+          optimizer.zero_grad()          # 1. clear last step's gradients
+          pred = model(X)                # 2. forward pass
+          loss = loss_fn(pred, y)        # 3. measure the error
+          loss.backward()                # 4. gradients for every parameter
+          optimizer.step()               # 5. move the parameters downhill
+      ```
+
+      This is the gradient descent you wrote by hand in chapter 1. `nn.Linear` replaced your `w`
+      and `b`, `loss_fn` your formula, and `optimizer` your `with torch.no_grad(): w -= lr * w.grad`.
+
+      ---
+
+      ## Underneath: what `optimizer.step()` does
+
+      The optimiser holds references to the parameters. For plain SGD, `step()` is:
+
+      ```python
+      with torch.no_grad():
+          for p in model.parameters():
+              p -= lr * p.grad
+      ```
+
+      and `zero_grad()` resets every `p.grad` (to `None` by default). Other optimisers only change
+      the update rule:
+
+      - **Momentum:** keep a running velocity $v \leftarrow \mu v + g$, step with $v$. It speeds up along consistent directions and damps zig-zags.
+      - **Adam:** keep running means of $g$ and $g^2$ per parameter and step by $\frac{\text{mean}(g)}{\sqrt{\text{mean}(g^2)}}$: every parameter gets its own step size.
+
+      ---
+
+      ## Trade-off: which optimiser?
+
+      | optimiser | extra memory per parameter | tuning effort | typical `lr` | wins when |
+      | --- | --- | --- | --- | --- |
+      | SGD | none | high: lr and schedule matter a lot | 0.01-0.1 | teaching, tiny models, memory-starved setups |
+      | SGD + momentum (0.9) | 1x | medium-high | 0.01-0.1 | well-understood CNN recipes where you can tune a schedule; often generalises slightly better |
+      | Adam | 2x | low: 1e-3 often just works | 1e-4-1e-3 | new architectures, fast iteration |
+      | AdamW | 2x | low | 1e-4-1e-3 | the default for transformers and most new work; weight decay done properly |
+
+      The extra memory matters at scale: for a 7B model, Adam's two moment buffers are 56 GB in float32.
+
+      ---
+
+      ## The learning rate is the knob that matters most
+
+      | lr | what the loss does |
+      | --- | --- |
+      | far too high | jumps up, becomes `inf`/`nan` |
+      | a bit too high | noisy, bounces, stalls at a poor value |
+      | about right | falls fast, then flattens |
+      | too low | falls slowly in a near-straight line; still falling when you stop |
+
+      Two more words you will see: an **epoch** is one pass over the training data; a **step**
+      is one parameter update. With full-batch training (this lesson) they are the same thing.
+      Next lesson: what to do when the loss does not fall at all.
+
+  - id: five-steps
+    type: order
+    title: Put the loop in order
+    prompt: Order the five lines inside the body of a training loop.
+    hint: Gradients must be cleared before they are computed, and computed before they are used.
+    items:
+      - "optimizer.zero_grad()"
+      - "pred = model(X)"
+      - "loss = loss_fn(pred, y)"
+      - "loss.backward()"
+      - "optimizer.step()"
+
+  - id: sgd-by-hand
+    type: coding
+    title: What optimizer.step() really does
+    context: |
+      `model` is an `nn.Linear(3, 1)`, `X` and `y` are a batch of 32 examples, and `lr` is `0.1`.
+      Predict what one SGD step will do to every parameter, then let the optimiser take the step
+      and compare.
+    instructions:
+      - The code computes the gradients for you. Inside `torch.no_grad()`, build `manual`, a dict from each parameter's name to `p - lr * p.grad`.
+      - "After `optimizer.step()`, store in `matches` whether every parameter now equals its entry in `manual` (use `torch.allclose`)."
+      - Print `matches`.
+    hint: "`{name: p - lr * p.grad for name, p in model.named_parameters()}`. This creates new tensors, so they keep the values from before the step."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      X = torch.randn(32, 3)
+      y = torch.randn(32, 1)
+      model = nn.Linear(3, 1)
+      lr = 0.1
+    sample_code: |
+      optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+      optimizer.zero_grad()
+      loss = F.mse_loss(model(X), y)
+      loss.backward()
+
+      with torch.no_grad():
+          manual = {name: ____ for name, p in model.named_parameters()}
+
+      optimizer.step()
+      matches = ____
+      print(matches)
+    solution: |
+      optimizer = torch.optim.SGD(model.parameters(), lr=lr)
+      optimizer.zero_grad()
+      loss = F.mse_loss(model(X), y)
+      loss.backward()
+
+      with torch.no_grad():
+          manual = {name: p - lr * p.grad for name, p in model.named_parameters()}
+
+      optimizer.step()
+      matches = all(torch.allclose(manual[name], p) for name, p in model.named_parameters())
+      print(matches)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_object("manual")
+      assert set(user["manual"]) == {"weight", "bias"}, "`manual` should have one entry per parameter name: 'weight' and 'bias'."
+      check_tensor(user["manual"], sol["manual"], "weight", msg="`manual['weight']` should be the weight minus `lr` times its gradient, computed before the step.")
+      check_tensor(user["manual"], sol["manual"], "bias", msg="`manual['bias']` should be the bias minus `lr` times its gradient.")
+      assert user.get("matches") is True, "`matches` should be True: compare each parameter after `optimizer.step()` with `manual[name]`."
+    success_msg: "`optimizer.step()` for SGD is one line of arithmetic per parameter. Every fancier optimiser just changes that line."
+
+  - id: fit-a-line
+    type: coding
+    title: Fit a line with the full loop
+    context: |
+      `x` holds 100 inputs (shape `(100, 1)`) and `y` the matching targets, generated from
+      $y = 3x + 2$ plus noise with standard deviation 0.3. Recover the slope and intercept with
+      the five-step loop.
+    instructions:
+      - "Create `model = nn.Linear(1, 1)`, `loss_fn = nn.MSELoss()` and an SGD `optimizer` with `lr=0.1`."
+      - "Train for 200 epochs with the five steps, appending `loss.item()` to `losses` every epoch."
+      - Print the final loss, `model.weight` and `model.bias`.
+    hint: "Inside the loop: `optimizer.zero_grad()`, `loss = loss_fn(model(x), y)`, `loss.backward()`, `optimizer.step()`, `losses.append(loss.item())`."
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      torch.manual_seed(0)
+      x = torch.rand(100, 1) * 4 - 2
+      y = 3 * x + 2 + 0.3 * torch.randn(100, 1)
+    sample_code: |
+      model = nn.Linear(1, 1)
+      loss_fn = ____
+      optimizer = ____
+
+      losses = []
+      for epoch in range(200):
+          ____
+
+      print(losses[-1], model.weight.item(), model.bias.item())
+    solution: |
+      model = nn.Linear(1, 1)
+      loss_fn = nn.MSELoss()
+      optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+      losses = []
+      for epoch in range(200):
+          optimizer.zero_grad()
+          loss = loss_fn(model(x), y)
+          loss.backward()
+          optimizer.step()
+          losses.append(loss.item())
+
+      print(losses[-1], model.weight.item(), model.bias.item())
+    tests: |
+      check_object("losses")
+      assert len(user["losses"]) == 200, f"`losses` should have one value per epoch (200), it has {len(user['losses'])}."
+      assert user["losses"][-1] < user["losses"][0], "The loss should go down. Check the order of the five steps."
+      m = user["model"]
+      w, b = m.weight.item(), m.bias.item()
+      assert abs(w - 3) < 0.15, f"The slope ended at {w:.2f}; it should be close to 3. Did every epoch call `optimizer.step()`?"
+      assert abs(b - 2) < 0.15, f"The intercept ended at {b:.2f}; it should be close to 2."
+      assert user["losses"][-1] < 0.12, "The final loss should be near the noise level (about 0.09)."
+    success_msg: Slope about 3, intercept about 2, and a final loss at the noise floor of 0.09. Nothing left to learn.
+
+  - id: choose-optimizer
+    type: mc
+    title: Pick an optimiser under constraints
+    question: |
+      You are training a new attention-based model for a prototype. You have one afternoon, no
+      time for a learning-rate schedule search, and you want weight decay for regularisation.
+      Memory is not a problem. Which optimiser do you start with?
+    options:
+      - text: Plain SGD
+        feedback: "It has no extra memory cost, but it is the most sensitive to the learning rate and usually needs a tuned schedule. That is exactly the time you do not have."
+      - text: SGD with momentum 0.9
+        feedback: "Strong when you can tune a schedule (it is still common in some CNN recipes), but it needs more tuning than you can afford this afternoon."
+      - text: "Adam with `weight_decay=0.01`"
+        feedback: "Close. But Adam's `weight_decay` adds an L2 term to the gradient, which then gets rescaled per parameter, so the decay is uneven and weaker than intended. AdamW fixes exactly that."
+      - text: AdamW
+        correct: true
+        feedback: "Right. Adaptive per-parameter steps make a default lr like 1e-3 work out of the box, and the decoupled weight decay regularises as intended. Its 2x memory overhead does not matter here."
+    hint: Which option needs the least tuning and applies weight decay as a separate step?

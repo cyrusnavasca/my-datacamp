@@ -1,0 +1,243 @@
+title: Bag-of-words and TF-IDF
+description: Turn messages into count and TF-IDF vectors, build TF-IDF by hand, and train a ticket triage classifier.
+exercises:
+  - id: intro
+    type: video
+    title: Counting words, then weighting them
+    slides: |
+      # Bag-of-words: a message as a count vector
+
+      Fix a vocabulary of $V$ words. A message becomes a length-$V$ vector of word counts:
+
+      | | pump | valve | broke | the | leak |
+      | --- | --- | --- | --- | --- | --- |
+      | "the pump broke" | 1 | 0 | 1 | 1 | 0 |
+      | "leak near the valve" | 0 | 1 | 0 | 1 | 1 |
+
+      ```python
+      from sklearn.feature_extraction.text import CountVectorizer
+      cv = CountVectorizer()
+      X = cv.fit_transform(texts)        # sparse matrix, shape (n_texts, V)
+      ```
+
+      Order is thrown away: "pump broke the valve" and "valve broke the pump" get the **same** vector.
+      Bigrams (`ngram_range=(1, 2)`) bring back a little order at the cost of a much larger vocabulary.
+
+      ---
+
+      ## TF-IDF: down-weight words that are everywhere
+
+      "the" and "please" appear in most tickets, so they say little about the category.
+      **Inverse document frequency** shrinks them. scikit-learn's default (`smooth_idf=True`):
+
+      $$\text{idf}(w) = \ln\frac{1 + n}{1 + \text{df}(w)} + 1$$
+
+      where $n$ is the number of documents and $\text{df}(w)$ the number containing $w$. Then
+
+      $$\text{tfidf}(d, w) = \text{count}(d, w) \cdot \text{idf}(w)$$
+
+      and each row is divided by its L2 norm, so long and short messages are comparable.
+
+      ---
+
+      ## The same thing in NumPy
+
+      ```python
+      counts = cv.fit_transform(docs).toarray()
+      n = counts.shape[0]
+      df = (counts > 0).sum(axis=0)
+      idf = np.log((1 + n) / (1 + df)) + 1
+      tfidf = counts * idf
+      tfidf = tfidf / np.linalg.norm(tfidf, axis=1, keepdims=True)
+      ```
+
+      `TfidfVectorizer` returns exactly this. Building it once means you know what the knobs do:
+      `min_df` drops rare words, `max_df` drops near-universal ones, `sublinear_tf` uses $1 + \ln(\text{count})$.
+
+      ---
+
+      ## A complete text classifier
+
+      ```python
+      from sklearn.pipeline import make_pipeline
+      from sklearn.linear_model import LogisticRegression
+
+      model = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=1000))
+      model.fit(train_texts, train_labels)      # vocabulary learned from train only
+      model.score(test_texts, test_labels)
+      ```
+
+      - Fit the vectoriser on **training** text only, or test words leak into the vocabulary.
+      - It is explainable: `coef_` gives one weight per word per class, so you can show why a ticket went to IT.
+      - It trains in milliseconds and predicts in microseconds on a CPU.
+
+      ---
+
+      ## Trade-offs: which text model?
+
+      | | TF-IDF + linear | pretrained embeddings + small classifier | fine-tuned transformer |
+      | --- | --- | --- | --- |
+      | labels needed | 100s | 100s | 1,000s+ (or fewer, with care) |
+      | handles paraphrase/synonyms | no | yes | yes |
+      | handles negation, word order | barely | partly | yes |
+      | CPU latency per message | ~0.1 ms | ~10-50 ms | ~10-100 ms |
+      | explainable | yes (word weights) | hard | hard |
+      | cost to build | minutes | an hour | hours plus a GPU |
+
+      Start with TF-IDF as the **baseline**. Move right only when it measurably fails on your data,
+      for example on paraphrases it never saw. The next lesson shows one such failure.
+
+  - id: tfidf-by-hand
+    type: coding
+    title: TF-IDF by hand
+    context: |
+      `docs` holds four short crew messages. `counts` is their bag-of-words matrix as a NumPy
+      array (one row per message) and `vocab_words` lists the column words. `np` is imported.
+      Build TF-IDF yourself and check it against scikit-learn.
+    instructions:
+      - "Store the document frequency of each word (the number of rows where its count is above 0) in `df`."
+      - "Store the smoothed idf, $\\ln\\frac{1+n}{1+\\text{df}} + 1$ with $n$ the number of documents, in `idf`."
+      - "Store `counts * idf`, with every row divided by its L2 norm, in `tfidf`."
+      - "Print the word with the **lowest** idf."
+    hint: |
+      `df = (counts > 0).sum(axis=0)`, `n = counts.shape[0]`. Normalise with
+      `tfidf / np.linalg.norm(tfidf, axis=1, keepdims=True)`. `vocab_words[idf.argmin()]` is the least informative word.
+    pre_code: |
+      import numpy as np
+      from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+      docs = [
+          "the pump in the lab is leaking",
+          "the valve is stuck",
+          "please book the lab for monday",
+          "leak near the valve in the galley",
+      ]
+      _cv = CountVectorizer()
+      counts = _cv.fit_transform(docs).toarray()
+      vocab_words = list(_cv.get_feature_names_out())
+    sample_code: |
+      n = counts.shape[0]
+      df = ____
+      idf = ____
+
+      tfidf = counts * idf
+      tfidf = ____
+
+      print(vocab_words[____])
+
+      # Compare with scikit-learn
+      reference = TfidfVectorizer().fit_transform(docs).toarray()
+      print(np.allclose(tfidf, reference))
+    solution: |
+      n = counts.shape[0]
+      df = (counts > 0).sum(axis=0)
+      idf = np.log((1 + n) / (1 + df)) + 1
+
+      tfidf = counts * idf
+      tfidf = tfidf / np.linalg.norm(tfidf, axis=1, keepdims=True)
+
+      print(vocab_words[idf.argmin()])
+
+      # Compare with scikit-learn
+      reference = TfidfVectorizer().fit_transform(docs).toarray()
+      print(np.allclose(tfidf, reference))
+    tests: |
+      check_equal("df", msg="`df` should count, for each column, the documents where that word appears: `(counts > 0).sum(axis=0)`.")
+      check_equal("idf", msg="`idf` should be `np.log((1 + n) / (1 + df)) + 1`.")
+      check_equal("tfidf", msg="`tfidf` should be `counts * idf` with each row divided by its L2 norm (`axis=1, keepdims=True`).")
+      check_output_contains("the\n", msg="Print the word with the lowest idf: `vocab_words[idf.argmin()]`.")
+    success_msg: "Your matrix matches `TfidfVectorizer` exactly. `the` is in every message, so it has the lowest idf, 1.0."
+
+  - id: triage-classifier
+    type: coding
+    title: Train a ticket triage classifier
+    context: |
+      `train_texts`/`train_labels` hold 140 crew tickets and their categories (`it`, `maintenance`,
+      `medical`, `scheduling`, `supplies`); `test_texts`/`test_labels` hold 60 more.
+      `TfidfVectorizer`, `LogisticRegression` and `make_pipeline` are imported.
+    instructions:
+      - "Build `model` as a pipeline of `TfidfVectorizer()` and `LogisticRegression(max_iter=1000)`, and fit it on the training data."
+      - "Store its accuracy on the **test** set in `acc`."
+      - "Store the model's predictions for `inbox` in `routed` and print them."
+    hint: "`model = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=1000)).fit(train_texts, train_labels)`, then `model.score(test_texts, test_labels)` and `model.predict(inbox)`."
+    pre_code: |
+      from sklearn.feature_extraction.text import TfidfVectorizer
+      from sklearn.linear_model import LogisticRegression
+      from sklearn.pipeline import make_pipeline
+      from kits.nlp_transformers import ticket_split
+      _train, _test = ticket_split()
+      train_texts, train_labels = list(_train["text"]), list(_train["category"])
+      test_texts, test_labels = list(_test["text"]), list(_test["category"])
+      inbox = [
+          "The heater in Module C is making a clicking noise.",
+          "Out of batteries in the galley.",
+          "Can I see Priya about a rash?",
+      ]
+    sample_code: |
+      model = make_pipeline(____, ____)
+      model.fit(____, ____)
+
+      acc = ____
+      print(f"Test accuracy: {acc:.1%}")
+
+      routed = ____
+      print(routed)
+    solution: |
+      model = make_pipeline(TfidfVectorizer(), LogisticRegression(max_iter=1000))
+      model.fit(train_texts, train_labels)
+
+      acc = model.score(test_texts, test_labels)
+      print(f"Test accuracy: {acc:.1%}")
+
+      routed = model.predict(inbox)
+      print(routed)
+    tests: |
+      m = check_object("model")
+      assert hasattr(m, "predict"), "`model` should be a fitted pipeline with a `.predict` method."
+      real = sum(p == y for p, y in zip(m.predict(user["test_texts"]), user["test_labels"])) / len(user["test_labels"])
+      assert real >= 0.95, f"Your model scores {real:.1%} on the test set; a TF-IDF + logistic regression pipeline should reach at least 95%. Did you fit on the training data?"
+      check_equal("acc", real, tol=1e-9, msg="`acc` should be your model's accuracy on `test_texts`/`test_labels` (use `model.score`).")
+      r = check_object("routed")
+      assert list(r) == ["maintenance", "supplies", "medical"], f"`routed` should be `model.predict(inbox)`; expected maintenance, supplies, medical but got {list(r)}."
+    success_msg: Near-perfect on held-out tickets, and it trains in milliseconds. Keep this baseline; the next lesson shows where it breaks.
+
+  - id: word-order
+    type: mc
+    title: Predict, then run - word order
+    question: |
+      With a `CountVectorizer` fitted on these messages, what is the cosine similarity between the
+      vectors for `"the pump flooded the lab"` and `"the lab flooded the pump"`?
+    context: "`cv` is fitted and `cosine_similarity` is imported in the console. Try `cosine_similarity(cv.transform([a, b]))`."
+    pre_code: |
+      from sklearn.feature_extraction.text import CountVectorizer
+      from sklearn.metrics.pairwise import cosine_similarity
+      a, b = "the pump flooded the lab", "the lab flooded the pump"
+      cv = CountVectorizer().fit([a, b, "the valve is stuck"])
+    options:
+      - text: Exactly 1.0
+        correct: true
+        feedback: |
+          Right. Both messages contain the same words with the same counts, so their bag-of-words
+          vectors are identical. Who flooded what is lost. Bigrams (`ngram_range=(1, 2)`) or a
+          sequence model can tell them apart.
+      - text: About 0.5, because half the words are in a different position
+        feedback: Bag-of-words has no notion of position at all. Only which words occur and how often.
+      - text: 0.0, because the meanings are opposite
+        feedback: Count vectors know nothing about meaning. Compare the two vectors in the console.
+      - text: It depends on the idf weights
+        feedback: There are no idf weights in a `CountVectorizer`, and even with TF-IDF two identical count vectors stay identical after weighting.
+    hint: List the words and their counts for each message.
+
+  - id: approach-choice
+    type: classify
+    title: Which text model fits the constraints?
+    prompt: Sort each situation into the approach you would start with.
+    hint: Start from the cheapest option that can work. Paraphrases with few labels point to pretrained embeddings; lots of labels and subtle meaning point to fine-tuning; speed, exact keywords and explainability point to TF-IDF.
+    zones: [TF-IDF + linear model, Pretrained embeddings + small classifier, Fine-tuned transformer]
+    items:
+      - { text: "200 labelled tickets with templated wording; the safety officer wants to see why each one was routed", zone: TF-IDF + linear model }
+      - { text: "Filter a million log lines a day on one CPU with a 1 ms budget per line", zone: TF-IDF + linear model }
+      - { text: "Routing depends on exact part codes such as B-6 and E-3", zone: TF-IDF + linear model }
+      - { text: "Only 150 labels, and the crew describe the same fault in many different words", zone: Pretrained embeddings + small classifier }
+      - { text: "Find past tickets that mean the same as a new one; no labels at all", zone: Pretrained embeddings + small classifier }
+      - { text: "40,000 labelled incident reports where negation and sarcasm change the label; a GPU is available", zone: Fine-tuned transformer }
+      - { text: "Best possible accuracy on long, nuanced reports; 100 ms per report is acceptable", zone: Fine-tuned transformer }

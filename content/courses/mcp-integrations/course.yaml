@@ -1,0 +1,41 @@
+title: Model Context Protocol (MCP)
+description: 'Connect models to tools and data with MCP: hosts, clients and servers, the JSON-RPC
+  messages underneath, building a server by hand, bridging it into an agent, and securing it.'
+level: advanced
+est_hours: 3
+prerequisites:
+- agents-tool-use
+objectives:
+- Explain MCP's architecture and its three primitives
+- Read and write MCP's JSON-RPC messages and session lifecycle
+- Build an MCP server from scratch and handle errors correctly
+- Bridge MCP tools into an agent and defend against tool poisoning
+requires: []
+chapters:
+- id: mcp-basics
+  title: MCP basics
+  description: Why MCP exists, hosts, clients and servers, and tools, resources and prompts.
+  lessons:
+  - why-mcp
+  - primitives
+- id: json-rpc-wire
+  title: On the wire
+  description: JSON-RPC messages, the session lifecycle and transports.
+  lessons:
+  - json-rpc
+  - lifecycle
+  - transports
+- id: build-server
+  title: Building a server
+  description: Dispatching requests, resources and prompts, and errors.
+  lessons:
+  - server-from-scratch
+  - resources-prompts
+  - errors
+- id: connect-and-secure
+  title: Connecting and securing
+  description: Bridging MCP tools into an agent, tool poisoning and least privilege.
+  lessons:
+  - client-to-llm
+  - tool-poisoning
+  - least-privilege

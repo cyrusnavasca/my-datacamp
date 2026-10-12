@@ -1,0 +1,223 @@
+title: Writing judge rubrics
+description: Use a model to grade what code can't. Build a judge prompt, parse its verdict, and see why specific pass/fail criteria with a reference beat a 1-10 quality scale.
+exercises:
+  - id: rubrics-slides
+    type: video
+    title: An LLM as a grader
+    slides: |
+      # When you need a judge
+
+      Code checks and reference metrics can't tell whether every claim is **supported by the documents**, whether the
+      steps are in a **safe order**, or whether "it's 16 minutes, per standard procedure" is made up. Those need
+      understanding, so you ask a model to grade:
+
+      ```python
+      import anthropic, re
+      client = anthropic.Anthropic()
+
+      r = client.messages.create(
+          model="claude-sonnet-5-5", max_tokens=300, temperature=0,
+          system=RUBRIC,
+          messages=[{"role": "user", "content":
+              f"<question>{q}</question>\n<reference>{ref}</reference>\n<response>{answer}</response>"}],
+      )
+      verdict = re.search(r"<verdict>(PASS|FAIL)</verdict>", r.content[0].text).group(1)
+      ```
+
+      In the exercises, `judge` is an `aikit.FakeClaude` playing the judge model: it applies criteria it can check, and
+      guesses when the rubric is vague, the way real judges do.
+
+      ---
+
+      ## Anatomy of a judge prompt
+
+      1. **Role and task**: "You are grading answers from ORBIT, a station assistant."
+      2. **Criteria**: what makes an answer pass, written as checks.
+      3. **Inputs in tags**: `<question>`, `<reference>`, `<response>`, so the judge can't confuse them.
+      4. **Output format**: a sentence of reasoning *first*, then the verdict in a tag your code can parse.
+      5. **Temperature 0**: the same input should get the same grade.
+
+      ---
+
+      ## Why 1-10 scales fail
+
+      "Rate the quality from 1 to 10" looks rigorous. In practice:
+
+      - Nobody defined what a 6 is, so scores bunch at 7-8 and drift between runs and judge models.
+      - A mean of 6.8 tells you nothing about *what* to fix.
+      - With no criteria, the judge grades how **plausible** the answer sounds, and confident hallucinations sound great.
+
+      Write **specific, binary criteria**, one failure mode each, taken from your error-analysis taxonomy:
+
+      | vague | specific and binary |
+      | --- | --- |
+      | The answer is accurate. | The response contains the key facts of the reference answer. |
+      | Rate correctness 1-10. | The response does not state a different number for the same thing. |
+      | Is it helpful? | If the reference says UNANSWERABLE, the response says it doesn't know. |
+
+      ---
+
+      ## Give the judge a reference
+
+      **Reference-free** judging ("is this answer correct?") asks the judge to know the Helios-7 handbook. It doesn't, so
+      it judges plausibility. **Reference-guided** judging ("does it contain the facts of this reference?") turns a
+      knowledge problem into a comparison, which models do well.
+
+      Always include the reference when you have one. Spell out the cases a careful human handles without thinking: an
+      unanswerable question **should** get a refusal, and a refusal to an answerable question is a failure.
+
+      ---
+
+      ## Design trade-offs
+
+      | choice | option A | option B |
+      | --- | --- | --- |
+      | criteria per call | one combined rubric: 1 call per output | one judge per criterion: k calls, cleaner signal per failure mode |
+      | judge model | small: cheap and fast, noisier | large: up to ~5× the cost, more consistent |
+      | output | verdict only: fewer tokens | reasoning then verdict: more tokens, more accurate, debuggable |
+      | references | reference-free: works without gold | reference-guided: needs gold answers, far more reliable |
+
+      Whichever you pick, **measure the judge against human labels** (the last lesson of this chapter) before you trust it.
+
+  - id: rubric-items
+    type: classify
+    title: Specific or vague?
+    prompt: |
+      Sort these rubric items. **Specific** items can be checked with a yes or no from the inputs the judge sees. **Vague**
+      ones leave the judge to decide what "good" means.
+    hint: Could two careful graders disagree about the item for the same answer? If so, it's vague.
+    zones: [Specific and binary, Vague]
+    items:
+      - { text: "The response states the same number and unit as the reference answer.", zone: Specific and binary }
+      - { text: "If the reference says UNANSWERABLE, the response says it doesn't know.", zone: Specific and binary }
+      - { text: "The response names every crew member listed in the reference.", zone: Specific and binary }
+      - { text: "The response does not give two different values for the same limit.", zone: Specific and binary }
+      - { text: "Every safety step in the reference appears in the response, in the same order.", zone: Specific and binary }
+      - { text: "The answer is helpful and accurate.", zone: Vague }
+      - { text: "Rate the overall quality from 1 to 10.", zone: Vague }
+      - { text: "The response sounds professional.", zone: Vague }
+      - { text: "Score how close the answer is to the reference.", zone: Vague }
+      - { text: "The answer is complete enough.", zone: Vague }
+
+  - id: judge-prompt
+    type: coding
+    title: Build and run a judge
+    context: |
+      `sample` has 10 ORBIT outputs with `question`, `reference` (the gold answer, or a line starting `UNANSWERABLE`),
+      `answer` and the crew's verdict `human`. `judge` is a FakeClaude acting as the judge model, and `VAGUE` is a
+      first-draft rubric.
+    instructions:
+      - "Write `judge_prompt(rubric, question, reference, response)`: the rubric, a blank line, then the three inputs in `<question>`, `<reference>` and `<response>` tags."
+      - "Write `grade(rubric)`: for every row of `sample`, call `judge.messages.create(model=JUDGE_MODEL, max_tokens=300, messages=[...])` with the prompt as the user message, and return a list of 1 (PASS) / 0 (FAIL) parsed from the `<verdict>` tag."
+      - "Store the share of `grade(VAGUE)` that matches `sample['human']` in `vague_agree`."
+      - "Write `RUBRIC` with specific pass/fail criteria (key facts of the reference, no contradictions, the rule for UNANSWERABLE references and for refusals), asking for the verdict in `<verdict>` tags. Store its agreement in `agree`: it must be at least 0.9."
+    hint: |
+      Parse with `re.search(r"<verdict>(PASS|FAIL)</verdict>", r.content[0].text).group(1) == "PASS"`.
+      For the rubric, mirror the slide: "Answer PASS only if every criterion holds, otherwise FAIL", then numbered checks.
+    pre_code: |
+      import re
+      import aikit
+      from kits.llm_evaluation import judge_model, judge_set, JUDGE_MODEL
+      judge = aikit.FakeClaude(judge_model(), clock=aikit.VirtualClock())
+      sample = judge_set().set_index("id").loc[["j04", "j11", "j36", "j35", "j55", "j58", "j66", "j75", "j42", "j32"]].reset_index()
+      VAGUE = ("You are grading answers from ORBIT, a station assistant. Is the response a good answer to the question? "
+               "End with PASS or FAIL in <verdict></verdict> tags.")
+    sample_code: |
+      def judge_prompt(rubric, question, reference, response):
+          return f"{rubric}\n\n<question>{question}</question>\n____"
+
+      def grade(rubric):
+          verdicts = []
+          for _, row in sample.iterrows():
+              r = judge.messages.create(model=JUDGE_MODEL, max_tokens=300, messages=[
+                  {"role": "user", "content": judge_prompt(rubric, row["question"], row["reference"], row["answer"])}])
+              verdicts.append(____)
+          return verdicts
+
+      vague_agree = ____
+      print(grade(VAGUE), list(sample["human"]), vague_agree)
+
+      RUBRIC = """____"""
+      agree = ____
+      print(grade(RUBRIC), agree)
+    solution: |
+      def judge_prompt(rubric, question, reference, response):
+          return (f"{rubric}\n\n<question>{question}</question>\n<reference>{reference}</reference>\n"
+                  f"<response>{response}</response>")
+
+      def grade(rubric):
+          verdicts = []
+          for _, row in sample.iterrows():
+              r = judge.messages.create(model=JUDGE_MODEL, max_tokens=300, messages=[
+                  {"role": "user", "content": judge_prompt(rubric, row["question"], row["reference"], row["answer"])}])
+              verdicts.append(int(re.search(r"<verdict>(PASS|FAIL)</verdict>", r.content[0].text).group(1) == "PASS"))
+          return verdicts
+
+      vague_agree = sum(v == h for v, h in zip(grade(VAGUE), sample["human"])) / len(sample)
+      print(grade(VAGUE), list(sample["human"]), vague_agree)
+
+      RUBRIC = """You are grading answers from ORBIT, a station assistant.
+      Answer PASS only if every criterion holds, otherwise FAIL:
+      1. The response contains the key facts of the reference answer.
+      2. The response does not contradict the reference (no different number for the same thing).
+      3. If the reference says UNANSWERABLE, the response must refuse (say it doesn't know).
+         If the reference has an answer, a refusal fails.
+      Give one sentence of reasoning, then your verdict in <verdict></verdict> tags."""
+      agree = sum(v == h for v, h in zip(grade(RUBRIC), sample["human"])) / len(sample)
+      print(grade(RUBRIC), agree)
+    tests: |
+      check_object("judge_prompt")
+      p = user["judge_prompt"]("RUB", "Q?", "REF", "RESP")
+      for tag, val in (("question", "Q?"), ("reference", "REF"), ("response", "RESP")):
+          assert f"<{tag}>{val}</{tag}>" in p, f"`judge_prompt` should wrap the {tag} in <{tag}></{tag}> tags."
+      assert p.startswith("RUB"), "`judge_prompt` should start with the rubric."
+      check_object("grade")
+      check_equal("vague_agree", msg="`vague_agree` is the share of `grade(VAGUE)` verdicts that equal `sample['human']`.")
+      check_object("RUBRIC")
+      check_object("agree")
+      verdicts = user["grade"](user["RUBRIC"])
+      human = list(user["sample"]["human"])
+      real = sum(v == h for v, h in zip(verdicts, human)) / len(human)
+      assert abs(real - user["agree"]) < 1e-9, "`agree` should be the share of `grade(RUBRIC)` verdicts that match `human`."
+      assert real >= 0.9, (f"Your rubric agrees with the crew on {real:.0%} of the sample; it needs 90%. Print the rows it gets wrong. "
+                           "Does it ask whether the response contains the reference's key facts? Does it say what to do with UNANSWERABLE references and with refusals?")
+    success_msg: |
+      The vague rubric passed a wrong watering time (08:00 instead of 06:00) and failed a correct refusal to a question
+      the handbook can't answer. It had a reference in front of it but no instruction to use it, and no rule for
+      unanswerable questions. Same judge model, same inputs: the criteria made the difference.
+
+  - id: judge-model-choice
+    type: mc
+    title: Pick a judge under a budget
+    question: |
+      ORBIT's nightly eval grades **5,000 outputs**. The judge must reach **κ ≥ 0.6** against held-out crew labels, and
+      the budget is **$3 per night**. Measured on 40 held-out labels (illustrative prices):
+
+      | judge | κ | cost per 1,000 outputs |
+      | --- | --- | --- |
+      | haiku + specific rubric | 0.70 | $0.37 |
+      | sonnet + specific rubric | 0.95 | $1.12 |
+      | opus + specific rubric | 1.00 | $1.87 |
+      | opus + vague 1-10 rubric | 0.15 | $0.94 |
+
+      Which setup do you run?
+    options:
+      - text: Opus with the vague rubric. The strongest model compensates for the rubric.
+        feedback: |
+          κ 0.15: the strongest model with a vague rubric is the worst judge in the table. A bigger model can't apply
+          criteria nobody wrote down, and at $4.70 a night it's over budget too.
+      - text: Sonnet with the specific rubric on all 5,000 outputs.
+        feedback: |
+          The best κ you can afford per output, but 5,000 × $1.12 / 1,000 = $5.60 a night, almost twice the budget. You could
+          run it on a 2,500-output sample instead, if a smaller nightly sample is acceptable.
+      - text: Haiku with the specific rubric on all 5,000, and spend the savings on more held-out labels to confirm κ.
+        correct: true
+        feedback: |
+          Yes: $1.85 a night, and κ 0.70 clears the bar. The rubric did most of the work, so the cheap model is enough. But
+          0.70 measured on 40 labels is uncertain (±0.2), so labelling more outputs to confirm it is the best use of the
+          money you saved. If κ dips, add examples to the rubric before you upgrade the model.
+      - text: Skip the judge and report token F1, which is free.
+        feedback: |
+          Free, but you measured F1's agreement with the crew in the last chapter: about 52%, worse than always saying
+          pass. A cheap metric you can't trust costs more than a cheap judge you can.
+    hint: Multiply each cost by 5 for 5,000 outputs, then drop anything below κ 0.6 or above $3.

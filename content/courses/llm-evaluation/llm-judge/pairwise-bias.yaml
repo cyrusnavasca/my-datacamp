@@ -1,0 +1,242 @@
+title: Pairwise judging and its biases
+description: Compare two versions head to head with a judge, detect position and verbosity bias from the judge's own logs, and remove position bias by swapping the order.
+exercises:
+  - id: pairwise-slides
+    type: video
+    title: "A or B?"
+    slides: |
+      # Pairwise comparison
+
+      Instead of grading each answer alone, show the judge **two answers to the same question** and ask which is
+      better. Relative judgements are easier than absolute ones, for people and for models, and they fit the question
+      you usually have: *is v2 better than v1?*
+
+      ```python
+      content = (f"{RUBRIC}\n\n<question>{q}</question>\n<reference>{ref}</reference>\n"
+                 f"<response_a>{answer_v1}</response_a>\n<response_b>{answer_v2}</response_b>")
+      # ... -> "Winner: B"
+      ```
+
+      Summarise with a **win rate**: wins plus half the ties, divided by the number of pairs.
+
+      ---
+
+      ## The biases
+
+      - **Position bias**: when the two answers are close, judges tend to pick a fixed slot, often the first.
+      - **Verbosity bias**: longer answers look more thorough, even when the extra words add nothing.
+      - **Self-preference**: a judge may favour text in its own style or from its own model family.
+
+      None of these show up when you read one verdict. They show up in **aggregate**: if the order of the answers didn't
+      matter, slot A would win about half the time.
+
+      ---
+
+      ## Detect it: the swap test
+
+      Judge every pair twice, once as (x, y) and once as (y, x):
+
+      | measure | unbiased judge | what bias looks like |
+      | --- | --- | --- |
+      | first-slot win rate | about 0.5 | far from 0.5 |
+      | consistency (same winner both ways) | high | low: the verdict follows the slot |
+
+      Low consistency doesn't always mean the judge is broken. When two answers really are equally good, a forced choice
+      has to pick something. A tie is the honest answer, so let the swap produce it.
+
+      ---
+
+      ## Fix it, and what each fix costs
+
+      | approach | calls per pair | position bias | per-item noise |
+      | --- | --- | --- | --- |
+      | one order, always (x, y) | 1 | **built into every result** | low |
+      | one order, randomised | 1 | cancels out on average | high: individual verdicts are coin flips on near-ties |
+      | both orders, win only if consistent, else tie | 2 | removed | low |
+      | grade each answer alone, then compare | 2 | none | depends on rubric calibration |
+
+      Swapping fixes **position** bias only. For **verbosity**, add "do not prefer a response for being longer" to the
+      rubric, and check that padded answers don't win.
+
+  - id: position-rate
+    type: coding
+    title: Read the judge's log
+    context: |
+      Last night's pairwise run judged 25 pairs of ORBIT answers, each **twice**: once with `x` in slot A (`order == "xy"`)
+      and once with `y` in slot A (`order == "yx"`). `log` has one row per verdict: `pair_id`, `kind`, `order` and
+      `slot_won` (`"A"` or `"B"`).
+    instructions:
+      - Store the share of verdicts won by slot A in `first_rate`.
+      - "Add a column `winner` to `log` saying which answer won, `\"x\"` or `\"y\"`: with order `xy`, slot A is x; with order `yx`, slot A is y."
+      - Store the share of pairs whose two verdicts name the same `winner` in `consistency`.
+    hint: |
+      `log["winner"] = [...]` with a comprehension over `zip(log["order"], log["slot_won"])`. For consistency:
+      `log.groupby("pair_id")["winner"].nunique().eq(1).mean()`.
+    pre_code: |
+      import re
+      import aikit
+      import pandas as pd
+      from kits.llm_evaluation import judge_model, pairwise_pairs, JUDGE_MODEL
+      _judge = aikit.FakeClaude(judge_model(), clock=aikit.VirtualClock())
+      _RUBRIC = ("You compare two answers from ORBIT to the same crew question.\n"
+                 "The better response contains the key facts of the reference answer. "
+                 "Do not prefer a response for being longer.\nReply with 'Winner: A' or 'Winner: B'.")
+
+      def _ask(p, first, second):
+          content = (f"{_RUBRIC}\n\n<question>{p.question}</question>\n<reference>{p.reference}</reference>\n"
+                     f"<response_a>{first}</response_a>\n<response_b>{second}</response_b>")
+          r = _judge.messages.create(model=JUDGE_MODEL, max_tokens=200, messages=[{"role": "user", "content": content}])
+          return re.search(r"Winner: (A|B)", r.content[0].text).group(1)
+
+      _rows = []
+      for _, _p in pairwise_pairs().iterrows():
+          _rows.append({"pair_id": _p.pair_id, "kind": _p.kind, "order": "xy", "slot_won": _ask(_p, _p.x, _p.y)})
+          _rows.append({"pair_id": _p.pair_id, "kind": _p.kind, "order": "yx", "slot_won": _ask(_p, _p.y, _p.x)})
+      log = pd.DataFrame(_rows)
+    sample_code: |
+      first_rate = ____
+
+      log["winner"] = [
+          ("x" if slot == "A" else "y") if order == "xy" else ____
+          for order, slot in zip(log["order"], log["slot_won"])
+      ]
+      consistency = ____
+      print(round(first_rate, 2), round(consistency, 2))
+    solution: |
+      first_rate = (log["slot_won"] == "A").mean()
+
+      log["winner"] = [
+          ("x" if slot == "A" else "y") if order == "xy" else ("y" if slot == "A" else "x")
+          for order, slot in zip(log["order"], log["slot_won"])
+      ]
+      consistency = log.groupby("pair_id")["winner"].nunique().eq(1).mean()
+      print(round(first_rate, 2), round(consistency, 2))
+    tests: |
+      check_equal("first_rate", msg="`first_rate` is the share of rows where `slot_won == 'A'`.")
+      check_object("log")
+      assert "winner" in user["log"].columns, "Add a `winner` column to `log`."
+      assert list(user["log"]["winner"]) == list(sol["log"]["winner"]), "`winner` is off for some rows. With order 'yx', slot A holds y and slot B holds x."
+      check_equal("consistency", msg="`consistency` is the share of pairs (group by `pair_id`) whose two rows have the same `winner`.")
+    success_msg: |
+      Slot A wins 90% of verdicts, and only 1 pair in 5 gets the same winner both ways. Most of these pairs are equally
+      good (v2 often just adds a citation), so the judge falls back on position. A single-order run would have reported
+      whichever version you happened to put first as the winner.
+
+  - id: swap-and-agree
+    type: coding
+    title: Swap, then agree
+    context: |
+      `pairs` has 14 questions where ORBIT v1 (`x`) and v2 (`y`) answered differently, with `question`, `reference`,
+      `x`, `y` and the crew's verdicts `human_x`, `human_y`. `ask(row, first, second)` runs the pairwise judge and returns
+      the winning slot, `"A"` or `"B"`.
+    instructions:
+      - "Write `compare(row)`: ask with `(row.x, row.y)`, then with `(row.y, row.x)`. Return `\"x\"` or `\"y\"` if both verdicts name the same answer, else `\"tie\"`."
+      - Store `compare(row)` for every row of `pairs`, in order, in the list `outcomes`.
+      - "Store v2's win rate in `v2_win_rate`: (number of `\"y\"` + half the number of ties) / number of pairs."
+      - "Among pairs where the crew preferred one answer (`human_x != human_y`), store the share where `outcomes` picked the crew's choice in `clear_agree`."
+    hint: |
+      The first call's winner is `"x" if a == "A" else "y"`; in the swapped call slot A holds y, so its winner is
+      `"y" if b == "A" else "x"`. The crew's choice is `"y" if row.human_y > row.human_x else "x"`.
+    pre_code: |
+      import re
+      import aikit
+      import pandas as pd
+      from kits.llm_evaluation import judge_model, pairwise_pairs, JUDGE_MODEL
+      _judge = aikit.FakeClaude(judge_model(), clock=aikit.VirtualClock())
+      RUBRIC = ("You compare two answers from ORBIT to the same crew question.\n"
+                "The better response contains the key facts of the reference answer. "
+                "Do not prefer a response for being longer.\nReply with 'Winner: A' or 'Winner: B'.")
+
+      def ask(row, first, second):
+          content = (f"{RUBRIC}\n\n<question>{row.question}</question>\n<reference>{row.reference}</reference>\n"
+                     f"<response_a>{first}</response_a>\n<response_b>{second}</response_b>")
+          r = _judge.messages.create(model=JUDGE_MODEL, max_tokens=200, messages=[{"role": "user", "content": content}])
+          return re.search(r"Winner: (A|B)", r.content[0].text).group(1)
+
+      pairs = pairwise_pairs()
+      pairs = pairs[pairs["kind"] == "v1 vs v2"].reset_index(drop=True)
+    sample_code: |
+      def compare(row):
+          a = ask(row, row.x, row.y)
+          b = ask(row, row.y, row.x)
+          first = "x" if a == "A" else "y"
+          second = ____
+          return ____
+
+      outcomes = [compare(row) for row in pairs.itertuples()]
+      v2_win_rate = ____
+
+      clear = [(o, "y" if hy > hx else "x") for o, hx, hy in zip(outcomes, pairs["human_x"], pairs["human_y"]) if hx != hy]
+      clear_agree = ____
+      print(outcomes)
+      print(round(v2_win_rate, 3), clear_agree)
+    solution: |
+      def compare(row):
+          a = ask(row, row.x, row.y)
+          b = ask(row, row.y, row.x)
+          first = "x" if a == "A" else "y"
+          second = "y" if b == "A" else "x"
+          return first if first == second else "tie"
+
+      outcomes = [compare(row) for row in pairs.itertuples()]
+      v2_win_rate = (outcomes.count("y") + 0.5 * outcomes.count("tie")) / len(outcomes)
+
+      clear = [(o, "y" if hy > hx else "x") for o, hx, hy in zip(outcomes, pairs["human_x"], pairs["human_y"]) if hx != hy]
+      clear_agree = sum(o == want for o, want in clear) / len(clear)
+      print(outcomes)
+      print(round(v2_win_rate, 3), clear_agree)
+    tests: |
+      check_object("compare")
+      check_equal("outcomes", msg="`outcomes` doesn't match. `compare` should return the answer named by both calls, or 'tie' when they disagree.")
+      check_equal("v2_win_rate", msg="`v2_win_rate` = (count of 'y' + 0.5 * count of 'tie') / number of pairs.")
+      check_equal("clear_agree", msg="`clear_agree` is the share of pairs with `human_x != human_y` where the outcome is the crew's choice.")
+    success_msg: |
+      9 of 14 pairs become ties (they were position bias, not preference), v2 wins the other 5, and on every pair where
+      the crew had a clear preference the swapped judge agrees. The cost is two calls per pair.
+
+  - id: verbosity-check
+    type: mc
+    title: Does swapping fix verbosity?
+    question: |
+      `plain` and `padded` contain the same facts; `padded` wraps them in friendly filler and is about three times
+      longer. The rubric `NO_LENGTH` doesn't mention length. You judge the pair in **both** orders. What happens?
+    context: |
+      The console has `ask(rubric, first, second)` (returns the winning slot) plus `plain`, `padded`, `NO_LENGTH`, and
+      `WITH_LENGTH`, which adds "Do not prefer a response for being longer." Try both orders with both rubrics.
+    pre_code: |
+      import re
+      import aikit
+      from kits.llm_evaluation import judge_model, pairwise_pairs, JUDGE_MODEL
+      _judge = aikit.FakeClaude(judge_model(), clock=aikit.VirtualClock())
+      _p = pairwise_pairs().query("kind == 'plain vs padded'").iloc[0]
+      plain, padded = _p.x, _p.y
+      NO_LENGTH = ("You compare two answers from ORBIT to the same crew question.\n"
+                   "The better response contains the key facts of the reference answer. Reply with 'Winner: A' or 'Winner: B'.")
+      WITH_LENGTH = NO_LENGTH.replace("Reply", "Do not prefer a response for being longer. Reply")
+
+      def ask(rubric, first, second):
+          content = (f"{rubric}\n\n<question>{_p.question}</question>\n<reference>{_p.reference}</reference>\n"
+                     f"<response_a>{first}</response_a>\n<response_b>{second}</response_b>")
+          r = _judge.messages.create(model=JUDGE_MODEL, max_tokens=200, messages=[{"role": "user", "content": content}])
+          return re.search(r"Winner: (A|B)", r.content[0].text).group(1)
+    options:
+      - text: The padded answer wins in both orders, so the swap reports it as the clear winner.
+        correct: true
+        feedback: |
+          Right. Verbosity bias follows the answer, not the slot, so the verdict is **consistent and wrong**. Swapping only
+          removes position bias. With `WITH_LENGTH` the padded answer stops winning: slot A wins both times, and the swap
+          correctly calls it a tie.
+      - text: Slot A wins both times, so the swap reports a tie.
+        feedback: |
+          That's what happens with `WITH_LENGTH`, where the length bias is switched off and position bias is all that's left.
+          Without a length rule, the longer answer wins in both slots. Run `ask(NO_LENGTH, plain, padded)` and
+          `ask(NO_LENGTH, padded, plain)`.
+      - text: The plain answer wins both times, because it is more concise.
+        feedback: |
+          A judge that hasn't been told to value concision has no reason to prefer it, and this one prefers detail. Check
+          it in the console.
+      - text: The verdicts flip randomly between runs.
+        feedback: |
+          This judge gives the same verdict for the same prompt every time, like a real one at temperature 0. Bias is
+          systematic, which is exactly why it doesn't average out.
+    hint: Position bias follows the slot; verbosity bias follows the answer. Which one does swapping cancel?

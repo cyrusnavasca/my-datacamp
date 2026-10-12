@@ -1,0 +1,196 @@
+title: Pooling, flattening and shape errors
+description: How pooling downsamples, the options for shrinking feature maps, and how to fix the shape errors between convolutions and the classifier.
+exercises:
+  - id: intro
+    type: video
+    title: From feature maps to class scores
+    slides: |
+      # Pooling: shrink the map, keep the signal
+
+      **Max pooling** with a 2 x 2 window and stride 2 keeps the largest value in each window:
+      height and width halve, channels stay the same, and there are **no parameters**.
+
+      ```python
+      x = torch.randn(4, 16, 8, 8)
+      nn.MaxPool2d(2)(x).shape      # (4, 16, 4, 4)
+      ```
+
+      Two effects:
+      - **cheaper:** the next layer sees 4x fewer positions;
+      - **small shifts stop mattering:** if a feature moves inside its window, the max is the same.
+        That is one reason CNNs cope better with shifted inputs than MLPs.
+
+      ---
+
+      ## Underneath: pooling is a reshape and a max
+
+      For one 2-D map with even height and width, split each axis into (blocks, 2) and take the max
+      over the two "2" axes:
+
+      ```python
+      H, W = img.shape
+      pooled = img.reshape(H // 2, 2, W // 2, 2).amax(dim=(1, 3))
+      ```
+
+      In the backward pass, the whole gradient of each window goes to the element that was the max;
+      the other three get zero. Average pooling (`nn.AvgPool2d`) uses the mean instead and spreads
+      the gradient evenly.
+
+      ---
+
+      ## Trade-off: four ways to downsample
+
+      | option | parameters | what it keeps | typical use |
+      | --- | --- | --- | --- |
+      | `MaxPool2d(2)` | 0 | the strongest response per window | classic CNNs; cheap and robust |
+      | `AvgPool2d(2)` | 0 | the average response | smoother; less common mid-network |
+      | `Conv2d(..., stride=2)` | out x in x k² | whatever the learned kernel picks | modern nets; downsampling is learned, costs compute |
+      | `AdaptiveAvgPool2d(1)` (global average pooling) | 0 | one number per channel | the end of the network: the head works for **any** input size |
+
+      ---
+
+      ## Flatten, then classify
+
+      The convolutional part outputs `(N, C, H, W)`. A linear classifier needs `(N, features)`:
+
+      ```python
+      x = features(images)          # (N, 32, 2, 2)
+      x = x.flatten(1)              # (N, 128): keep the batch dimension, merge the rest
+      logits = nn.Linear(128, 10)(x)
+      ```
+
+      `in_features` must equal `C * H * W` **after** the last conv/pool layer, which depends on the
+      input size, every kernel, stride and padding. Getting it wrong is the most common CNN bug.
+
+      ---
+
+      ## Playbook: shape errors in CNNs
+
+      | error | read it as | fix |
+      | --- | --- | --- |
+      | `mat1 and mat2 shapes cannot be multiplied (4x128 and 512x10)` | batch 4; flatten produced 128; `Linear` expects 512 | set `in_features` to 128 |
+      | `expected input[1, 4, 8, 8] to have 1 channels, but got 4 channels` | a 3-D `(4, 8, 8)` batch was read as **one** unbatched image with 4 channels | add the channel dimension: `x.unsqueeze(1)` |
+      | `Given groups=1, weight of size [16, 1, 3, 3], expected input[..., 3, ...]` | RGB fed to a greyscale model, or channels last | convert, or `permute(0, 3, 1, 2)` |
+
+      **Measure** with a dummy forward pass through the feature extractor:
+      `features(torch.zeros(1, 1, 8, 8)).flatten(1).shape`. **Fix** the number, or remove the
+      dependency with `nn.LazyLinear(10)` or global average pooling. **Verify** with a forward pass
+      on a real batch: the output should be `(N, num_classes)`.
+
+  - id: maxpool-by-hand
+    type: coding
+    title: Max pooling with a reshape
+    context: |
+      `fmap` is a 6 x 6 feature map. Pool it with 2 x 2 windows and stride 2 by hand, then check
+      against PyTorch.
+    instructions:
+      - "Store the hand-pooled map in `pooled` (shape `(3, 3)`) using `reshape` and `amax`."
+      - "Store `F.max_pool2d(fmap[None, None], 2)[0, 0]` in `torch_pooled`. Print both."
+    hint: "`fmap.reshape(3, 2, 3, 2).amax(dim=(1, 3))`: axes 1 and 3 run inside each window."
+    pre_code: |
+      import torch
+      import torch.nn.functional as F
+      torch.manual_seed(0)
+      fmap = torch.randint(0, 10, (6, 6)).float()
+    sample_code: |
+      pooled = ____
+      torch_pooled = ____
+      print(fmap)
+      print(pooled)
+      print(torch_pooled)
+    solution: |
+      pooled = fmap.reshape(3, 2, 3, 2).amax(dim=(1, 3))
+      torch_pooled = F.max_pool2d(fmap[None, None], 2)[0, 0]
+      print(fmap)
+      print(pooled)
+      print(torch_pooled)
+    tests: |
+      from kits.deep_learning_pytorch import check_tensor
+      check_tensor(user, sol, "pooled", msg="`pooled` should hold the max of each 2x2 block, shape `(3, 3)`. Reshape to `(3, 2, 3, 2)` and take `amax` over dims 1 and 3.")
+      check_tensor(user, sol, "torch_pooled", msg="`torch_pooled` should be `F.max_pool2d(fmap[None, None], 2)[0, 0]`.")
+    success_msg: Same result, no parameters, a quarter of the positions.
+
+  - id: fix-shape-error
+    type: coding
+    title: "Fix it: the CNN that will not run"
+    context: |
+      A colleague's digit classifier crashes on its first batch. `images` holds 4 digit images of
+      8 x 8 pixels with shape `(4, 8, 8)`. There are **two** problems: one in how the batch is fed
+      in, one in the model. Read each error message, measure, then fix.
+    instructions:
+      - "Measure: store the number of features the feature extractor actually produces for one 8 x 8 image in `flat_size` (dummy forward through `model.features`, then `flatten(1)`)."
+      - Fix the `classifier` layer and the input shape so that `logits = model(batch)` works.
+      - "Verify: `logits` must have shape `(4, 10)`. Print it."
+    hint: |
+      Run the code and read the errors one at a time. `images.unsqueeze(1)` adds the channel
+      dimension. `model.features(torch.zeros(1, 1, 8, 8)).flatten(1).shape[1]` gives the size the
+      classifier must accept.
+    pre_code: |
+      import torch
+      import torch.nn as nn
+      torch.manual_seed(0)
+      images = torch.rand(4, 8, 8)
+    sample_code: |
+      class DigitNet(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.features = nn.Sequential(
+                  nn.Conv2d(1, 16, 3), nn.ReLU(),     # 8x8 -> 6x6
+                  nn.Conv2d(16, 32, 3), nn.ReLU(),    # 6x6 -> 4x4
+                  nn.MaxPool2d(2),                    # 4x4 -> 2x2
+              )
+              self.classifier = nn.Linear(32 * 4 * 4, 10)
+
+          def forward(self, x):
+              return self.classifier(self.features(x).flatten(1))
+
+      model = DigitNet()
+      flat_size = ____
+
+      batch = images
+      logits = model(batch)
+      print(flat_size, logits.shape)
+    solution: |
+      class DigitNet(nn.Module):
+          def __init__(self):
+              super().__init__()
+              self.features = nn.Sequential(
+                  nn.Conv2d(1, 16, 3), nn.ReLU(),     # 8x8 -> 6x6
+                  nn.Conv2d(16, 32, 3), nn.ReLU(),    # 6x6 -> 4x4
+                  nn.MaxPool2d(2),                    # 4x4 -> 2x2
+              )
+              self.classifier = nn.Linear(32 * 2 * 2, 10)
+
+          def forward(self, x):
+              return self.classifier(self.features(x).flatten(1))
+
+      model = DigitNet()
+      flat_size = model.features(torch.zeros(1, 1, 8, 8)).flatten(1).shape[1]
+
+      batch = images.unsqueeze(1)
+      logits = model(batch)
+      print(flat_size, logits.shape)
+    tests: |
+      import torch
+      check_equal("flat_size", 128, msg="`flat_size` should be the number of features after `model.features` and `flatten(1)` for one `(1, 1, 8, 8)` input: 32 channels x 2 x 2.")
+      check_object("logits")
+      assert tuple(user["logits"].shape) == (4, 10), f"`logits` has shape {tuple(user['logits'].shape)}; it should be `(4, 10)`: one row of 10 class scores per image."
+      out = user["DigitNet"]()(torch.zeros(7, 1, 8, 8))
+      assert tuple(out.shape) == (7, 10), "`DigitNet` should accept any batch of `(N, 1, 8, 8)` images and return `(N, 10)`."
+    success_msg: |
+      Two error messages, two numbers to read: "4 channels" meant the batch had no channel
+      dimension, and "4x128 and 512x10" told you the right `in_features` outright.
+
+  - id: downsampling-options
+    type: classify
+    title: Which way to downsample?
+    prompt: Match each description to the downsampling option it describes best.
+    hint: Which options have parameters? Which one makes the output size independent of the input size?
+    zones: [Max pooling, Strided convolution, Global average pooling]
+    items:
+      - { text: "Has no parameters and keeps the strongest response in each 2x2 window", zone: Max pooling }
+      - { text: "A feature moving within its window does not change the output", zone: Max pooling }
+      - { text: "Learns how to downsample, at the cost of extra weights and compute", zone: Strided convolution }
+      - { text: "Convolves and downsamples in one layer instead of conv followed by pool", zone: Strided convolution }
+      - { text: "Reduces each whole feature map to a single number per channel", zone: Global average pooling }
+      - { text: "Lets the same classifier head accept 8x8 and 32x32 inputs", zone: Global average pooling }

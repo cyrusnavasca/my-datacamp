@@ -1,0 +1,202 @@
+title: Pretrained models with pipelines
+description: Run a pretrained sentiment model on crew messages, then rebuild the pipeline by hand from tokenizer, model and softmax.
+exercises:
+  - id: intro
+    type: video
+    title: Someone already trained it
+    slides: |
+      # Pretrained models and the Hub
+
+      Training a transformer from scratch takes billions of tokens. The Hugging Face Hub hosts hundreds of
+      thousands of trained checkpoints you can download and run in three lines:
+
+      ```python
+      from transformers import pipeline
+      clf = pipeline("sentiment-analysis",
+                     model="distilbert/distilbert-base-uncased-finetuned-sst-2-english")
+      clf(["The new scrubber works brilliantly!", "The heater broke again."])
+      # [{'label': 'POSITIVE', 'score': 0.9999}, {'label': 'NEGATIVE', 'score': 0.98}]
+      ```
+
+      - **Always pin `model=`.** The task's default model can change between library versions.
+      - Models are cached locally after the first download. On Helios-7 (and in these exercises)
+        `HF_HUB_OFFLINE=1` forces the cache, so nothing is fetched at run time.
+
+      ---
+
+      ## What the pipeline does underneath
+
+      ```python
+      tok = AutoTokenizer.from_pretrained(name)
+      model = AutoModelForSequenceClassification.from_pretrained(name).eval()
+
+      enc = tok(texts, padding=True, truncation=True, return_tensors="pt")
+      with torch.no_grad():                     # inference: no gradient bookkeeping
+          logits = model(**enc).logits          # (batch, num_labels)
+      probs = torch.softmax(logits, dim=-1)
+      labels = [model.config.id2label[i] for i in probs.argmax(-1).tolist()]
+      ```
+
+      `enc` holds `input_ids` (WordPiece ids with `[CLS]` and `[SEP]` added) and `attention_mask`
+      (1 for real tokens, 0 for padding): the padding mask from the attention chapter.
+
+      ---
+
+      ## Batching, padding and truncation
+
+      - `padding=True` pads to the longest text **in the batch**. One long message makes the whole batch
+        slow, so sort by length when you process thousands of texts.
+      - `truncation=True` cuts at `tok.model_max_length` (512 for DistilBERT). Anything after that is
+        **silently dropped**.
+      - `model.eval()` turns off dropout and `torch.no_grad()` saves memory and time. Forgetting `eval()`
+        gives slightly different answers on every run.
+
+      ---
+
+      ## Trade-offs: how to get a text classifier
+
+      | option | labels needed | CPU latency | quality on your data | main risk |
+      | --- | --- | --- | --- | --- |
+      | TF-IDF + linear model | 100s | ~0.1 ms | good on stable wording | paraphrase, typos, negation |
+      | pretrained pipeline as is | 0 | ~10-30 ms | good **only if** its task and data match yours | wrong labels for your domain |
+      | frozen pretrained features + small head | ~100s | ~10-30 ms | good | needs a labelled sample |
+      | full fine-tune | 1,000s | ~10-30 ms | best | GPU, overfitting, maintenance |
+      | LLM API with a prompt | 0-20 examples | 100s of ms | good, flexible | cost per call, latency, drift |
+
+      Whichever you pick, measure it on a labelled sample of **your** text before trusting it.
+
+  - id: sentiment-pipeline
+    type: coding
+    title: Sentiment on crew messages
+    context: |
+      `clf` is the DistilBERT SST-2 sentiment pipeline, already loaded from the local cache.
+      `messages` holds 6 crew messages. Run the model and look at what it says.
+    instructions:
+      - "Store `clf(messages)` in `results`."
+      - "Store the list of labels in `labels` and the list of scores in `scores`."
+      - "Store the number of `NEGATIVE` messages in `n_negative`, then print each label, score and message."
+    hint: "Each result is a dict: `[r[\"label\"] for r in results]`."
+    pre_code: |
+      from kits.nlp_transformers import sentiment_pipeline
+      clf = sentiment_pipeline()
+      messages = [
+          "The new scrubber works brilliantly, thank you!",
+          "The heater broke again and my quarters are freezing.",
+          "Please book bench 2 in Module B for Thursday.",
+          "Not bad at all, the soup was better than yesterday.",
+          "I am not happy with the new rota.",
+          "The comms window opens at 14:00.",
+      ]
+    sample_code: |
+      results = ____
+      labels = [____ for r in results]
+      scores = [____ for r in results]
+      n_negative = ____
+
+      for label, score, msg in zip(labels, scores, messages):
+          print(f"{label:9} {score:.2f}  {msg}")
+    solution: |
+      results = clf(messages)
+      labels = [r["label"] for r in results]
+      scores = [r["score"] for r in results]
+      n_negative = labels.count("NEGATIVE")
+
+      for label, score, msg in zip(labels, scores, messages):
+          print(f"{label:9} {score:.2f}  {msg}")
+    tests: |
+      check_equal("labels", msg="`labels` should list the 'label' field of each result, in order.")
+      s = check_object("scores")
+      assert len(s) == 6 and all(abs(a - b) < 1e-4 for a, b in zip(s, sol["scores"])), "`scores` should list the 'score' field of each result."
+      check_equal("n_negative", msg="`n_negative` counts the labels equal to 'NEGATIVE'.")
+    success_msg: It handles negation ("not bad", "not happy") that bag-of-words cannot. But look at the two neutral messages, a booking and a timetable fact. They get confident POSITIVE or NEGATIVE labels, because the model has no other option. Keep that in mind.
+    timeout: 120
+
+  - id: pipeline-by-hand
+    type: coding
+    title: Rebuild the pipeline by hand
+    context: |
+      `tok` and `model` are the tokenizer and classifier behind the pipeline (in eval mode), and `clf`
+      is the pipeline itself. `messages` is the same list of 6 messages. `torch` is imported.
+    instructions:
+      - "Tokenise `messages` with `padding=True, truncation=True, return_tensors=\"pt\"` and store the result in `enc`."
+      - "Store the number of padding positions in the batch (zeros in `enc[\"attention_mask\"]`) in `n_pad`."
+      - "Inside `torch.no_grad()`, run `model(**enc)` and store the softmax of its `.logits` over the last dimension in `probs`."
+      - "Store the predicted label names in `labels`, using `model.config.id2label`."
+    hint: "`(enc[\"attention_mask\"] == 0).sum().item()`; `labels = [model.config.id2label[i] for i in probs.argmax(-1).tolist()]`."
+    pre_code: |
+      import torch
+      from transformers import pipeline
+      from kits.nlp_transformers import load_sentiment
+      tok, model = load_sentiment()
+      clf = pipeline("sentiment-analysis", model=model, tokenizer=tok, device="cpu")
+      messages = [
+          "The new scrubber works brilliantly, thank you!",
+          "The heater broke again and my quarters are freezing.",
+          "Please book bench 2 in Module B for Thursday.",
+          "Not bad at all, the soup was better than yesterday.",
+          "I am not happy with the new rota.",
+          "The comms window opens at 14:00.",
+      ]
+    sample_code: |
+      enc = tok(____, padding=True, truncation=True, return_tensors="pt")
+      n_pad = ____
+
+      with torch.no_grad():
+          logits = ____
+      probs = ____
+      labels = ____
+
+      print(enc["input_ids"].shape, n_pad)
+      print(labels)
+      print([r["label"] for r in clf(messages)])
+    solution: |
+      enc = tok(messages, padding=True, truncation=True, return_tensors="pt")
+      n_pad = (enc["attention_mask"] == 0).sum().item()
+
+      with torch.no_grad():
+          logits = model(**enc).logits
+      probs = torch.softmax(logits, dim=-1)
+      labels = [model.config.id2label[i] for i in probs.argmax(-1).tolist()]
+
+      print(enc["input_ids"].shape, n_pad)
+      print(labels)
+      print([r["label"] for r in clf(messages)])
+    tests: |
+      import torch
+      e = check_object("enc")
+      assert tuple(e["input_ids"].shape) == (6, 14), f"`enc['input_ids']` should have shape (6, 14): 6 messages padded to the longest. Got {tuple(e['input_ids'].shape)}."
+      check_equal("n_pad", msg="`n_pad` counts the zeros in `enc['attention_mask']`.")
+      p = check_object("probs")
+      assert tuple(p.shape) == (6, 2), f"`probs` should have shape (6, 2), one row per message; got {tuple(p.shape)}."
+      assert torch.allclose(p.sum(-1), torch.ones(6), atol=1e-5), "Rows of `probs` should sum to 1: softmax over `dim=-1`."
+      assert torch.allclose(p, sol["probs"], atol=1e-4), "`probs` differs from the reference. Run `model(**enc).logits` and apply softmax."
+      check_equal("labels", msg="`labels` should map the argmax of each row through `model.config.id2label`.")
+    success_msg: Same labels as the pipeline. Tokenise, run the model, softmax, map ids to labels. Nothing more is going on.
+    timeout: 120
+
+  - id: long-input
+    type: mc
+    title: Predict, then run - a very long report
+    question: |
+      An incident report of 3,000 tokens opens with three paragraphs of praise for the crew and ends with
+      "...and the pressure seal failed, which is unacceptable." You call
+      `clf(report, truncation=True)`. What does the model base its answer on?
+    context: "The console has `clf` and `tok` loaded. Try `len(tok(report)['input_ids'])` and `tok.model_max_length`."
+    pre_code: |
+      from kits.nlp_transformers import sentiment_pipeline
+      clf = sentiment_pipeline()
+      tok = clf.tokenizer
+      report = "The crew did a wonderful job during the drill and everyone was helpful. " * 150 + "Then the pressure seal failed, which is unacceptable."
+    options:
+      - text: The whole report; transformers read any length
+        feedback: DistilBERT has 512 learned positions, so the tokenizer cuts the input. Check `tok.model_max_length`.
+      - text: The first 512 tokens only. The failure at the end is never seen, so it will likely say POSITIVE
+        correct: true
+        feedback: |
+          Right. Truncation keeps the start and silently drops the rest. For long documents, classify
+          overlapping chunks and combine them, or keep the part that matters (for example the last section).
+      - text: The last 512 tokens, because the end of a text matters most
+        feedback: The default `truncation_side` is "right", so the **end** is cut off. You can change it, but you have to choose to.
+      - text: An average over all 512-token chunks
+        feedback: The pipeline does not chunk for you. That is a strategy you have to implement yourself.
+    hint: "`truncation=True` cuts the token list at `tok.model_max_length`. Which side is cut by default?"

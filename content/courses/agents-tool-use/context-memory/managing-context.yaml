@@ -1,0 +1,292 @@
+title: Tool output eats the context
+description: Where an agent's tokens go, why big tool results break runs, and how to digest, clear or reshape them.
+exercises:
+  - id: context-slides
+    type: video
+    title: Keep the evidence, drop the bulk
+    slides: |
+      # Symptom: "prompt is too long"
+
+      > Kenji: "When was hydroponics humidity above 80% in the last day?"
+      >
+      > `BadRequestError: prompt is too long: 50207 tokens > 20000 maximum`
+
+      `sensor_history` returned 1,440 readings, one a minute, as JSON: about 50,000 tokens. The question needs **two
+      timestamps and a peak**.
+
+      In a typical agent run, tool results are 80-95% of the input tokens. They also stay in `messages` for every later
+      step, so one big result is paid for again on each step after it.
+
+      ---
+
+      ## Three ways big results hurt
+
+      | effect | mechanism | how you notice |
+      | --- | --- | --- |
+      | **hard failure** | the request exceeds the context window | `400 prompt is too long` |
+      | **cost and latency** | every later step resends the result; input tokens dominate the bill | cost per task grows with steps squared |
+      | **quality** | the relevant line is buried among thousands; models attend less reliably to the middle of long contexts | right data in context, wrong answer |
+
+      The fix is the same for all three: send the model **what the decision needs**, not everything the tool can produce.
+
+      ---
+
+      ## Trade-off: options for big tool results
+
+      | option | fidelity | cost | failure mode | wins when |
+      | --- | --- | --- | --- | --- |
+      | send it raw | full | highest | overflow, buried facts | the result is already small |
+      | truncate (first or last N) | arbitrary | low | cuts exactly the part you needed | logs where only the tail matters |
+      | **digest in code** (stats, threshold crossings) | what you chose to keep | very low | drops a field nobody anticipated | structured data, known questions |
+      | summarise with an LLM | good for prose | one more call per result | paraphrases numbers and procedures | unstructured text, varied questions |
+      | **reshape the tool** (filters, aggregates, paging) | the model asks for what it needs | low | more tool parameters to describe | you own the tool |
+      | **clear old results** once used | the model's own notes survive | low | the model needs an old result again | long multi-step runs |
+
+      ---
+
+      ## Digest in code
+
+      ```python
+      def digest(text, threshold):
+          d = json.loads(text)
+          vals = [r["v"] for r in d["readings"]]
+          above = [r["t"] for r in d["readings"] if r["v"] > threshold]
+          return json.dumps({"module": d["module"], "metric": d["metric"], "n": len(vals),
+                             "min": min(vals), "max": max(vals), "mean": round(sum(vals) / len(vals), 3),
+                             "first_above": above[0] if above else None,
+                             "last_above": above[-1] if above else None})
+      ```
+
+      Keep the **evidence** (counts, extremes, the times something crossed a line, units), and say what you dropped (`n`).
+      About 90 tokens instead of 50,000, and the model can still cite the times.
+
+      ---
+
+      ## Clear old results, keep the notes
+
+      ```python
+      def clear_old_results(messages, keep=1):
+          blocks = [b for m in messages if m["role"] == "user" and isinstance(m["content"], list)
+                    for b in m["content"] if b.get("type") == "tool_result"]
+          for b in blocks[:-keep] if keep else blocks:
+              b["content"] = "[cleared: result already used]"
+      ```
+
+      Once the model has read a result and written its takeaway ("Module C CO2 peak 0.26%"), the raw result is dead
+      weight. Clearing it keeps the tool_use/tool_result pairing intact, so the API is happy. Some APIs can do this for
+      you on the server (context editing). Either way, check that the run still gets the right answer.
+
+      ---
+
+      ## Playbook: context problems in agents
+
+      **Check first:** the token count of each message in the failing request. One block is usually most of it.
+
+      1. **One huge result** → digest it, or give the tool filter and aggregate parameters.
+      2. **Many medium results piling up** → clear old results after use, or summarise them into the plan or notes.
+      3. **The model "forgets" the task on long runs** → the task is buried under results; keep a short plan or to-do
+         list near the end of the context (lesson 3).
+      4. **Right data present, wrong answer** → too much noise around it; digest even when it fits.
+
+      Verify with three numbers: peak input tokens per call, total input tokens per task, and the answer on your test task.
+
+  - id: digest-the-dump
+    type: coding
+    title: Digest a 50,000-token dump
+    context: |
+      Kenji asks when hydroponics humidity went above 80% in the last day. `sensor_history` returns one reading a minute
+      (about 50,000 tokens as JSON), and ORBIT's model has a 20,000-token window. `run_agent(client, task, TOOLS,
+      station.run_tool, on_result=fn)` calls `fn(name, input, text)` on every successful tool result and sends back what
+      it returns. `new_client()` gives a fresh model with `.peak_input`, its largest request in tokens.
+    instructions:
+      - "Run the agent without `on_result` inside `try`/`except Exception as e`, and store `str(e)` in `raw_error`."
+      - "Write `digest(text, threshold=80)`: return a JSON string of a dict with `module`, `metric`, `n`, `min`, `max`, `mean` (rounded to 3 places) and `first_above`/`last_above` (the `t` of the first and last readings above `threshold`, or `None`)."
+      - "Write `shrink(name, input, text)`: digest `sensor_history` results, pass others through. Run again with `on_result=shrink` on `client2`, and store the answer in `answer`."
+    hint: |
+      `d = json.loads(text)`; the readings are `d["readings"]`, each `{"t": ..., "v": ...}`. Collect
+      `above = [r["t"] for r in d["readings"] if r["v"] > threshold]`, then `above[0] if above else None`.
+    pre_code: |
+      import json
+      from kits.agents_tool_use import HeliosStation, ContextLimitClaude, VirtualClock, log_analyst, run_agent, count_tokens
+      station = HeliosStation()
+      TOOLS = station.tools
+      task = "When was hydroponics humidity above 80% in the last day, and how high did it get?"
+
+      def new_client():
+          return ContextLimitClaude(log_analyst(80), max_context=20_000, clock=VirtualClock())
+      client = new_client()
+    sample_code: |
+      try:
+          run_agent(client, task, TOOLS, station.run_tool)
+          raw_error = None
+      except Exception as e:
+          raw_error = ____
+      print(raw_error)
+
+      def digest(text, threshold=80):
+          d = json.loads(text)
+          vals = [r["v"] for r in d["readings"]]
+          above = ____
+          return json.dumps({"module": d["module"], "metric": d["metric"], "n": len(vals),
+                             "min": min(vals), "max": max(vals), "mean": round(sum(vals) / len(vals), 3),
+                             "first_above": ____, "last_above": ____})
+
+      def shrink(name, input, text):
+          return ____
+
+      client2 = new_client()
+      answer = run_agent(client2, task, TOOLS, station.run_tool, on_result=shrink)["answer"]
+      print(answer)
+      print("largest request:", client2.peak_input, "tokens")
+    solution: |
+      try:
+          run_agent(client, task, TOOLS, station.run_tool)
+          raw_error = None
+      except Exception as e:
+          raw_error = str(e)
+      print(raw_error)
+
+      def digest(text, threshold=80):
+          d = json.loads(text)
+          vals = [r["v"] for r in d["readings"]]
+          above = [r["t"] for r in d["readings"] if r["v"] > threshold]
+          return json.dumps({"module": d["module"], "metric": d["metric"], "n": len(vals),
+                             "min": min(vals), "max": max(vals), "mean": round(sum(vals) / len(vals), 3),
+                             "first_above": above[0] if above else None, "last_above": above[-1] if above else None})
+
+      def shrink(name, input, text):
+          return digest(text) if name == "sensor_history" else text
+
+      client2 = new_client()
+      answer = run_agent(client2, task, TOOLS, station.run_tool, on_result=shrink)["answer"]
+      print(answer)
+      print("largest request:", client2.peak_input, "tokens")
+    tests: |
+      import json as _j
+      from kits.agents_tool_use import reference_digest, HeliosStation, count_tokens as _ct
+      err = check_object("raw_error")
+      assert isinstance(err, str) and "too long" in err, f"The raw run should fail with 'prompt is too long'; `raw_error` is {err!r}."
+      raw = HeliosStation().run_tool("sensor_history", {"module": "E", "metric": "co2", "hours": 6})
+      mine = _j.loads(user["digest"](raw, 0.4))
+      ref = reference_digest(raw, 0.4)
+      for k in ("module", "metric", "n", "min", "max", "first_above", "last_above"):
+          assert mine.get(k) == ref[k], f"On another sensor, digest()[{k!r}] is {mine.get(k)!r}; expected {ref[k]!r}. Does `digest` use its `threshold` argument?"
+      assert abs(mine.get("mean", 0) - ref["mean"]) < 1e-3, "`mean` should be the average reading, rounded to 3 places."
+      assert _ct(user["digest"](raw, 0.4)) < 200, "The digest should be tiny (under 200 tokens)."
+      ans = check_object("answer")
+      assert isinstance(ans, str) and "03:10" in ans and "04:40" in ans and "86.0" in ans, f"ORBIT should give the window (03:10 to 04:40) and the peak (86.0). It said: {ans!r}. Is `shrink` digesting sensor_history results?"
+      assert user["client2"].peak_input < 3000, f"The largest request was {user['client2'].peak_input} tokens; with a digest it should be under 3,000."
+    success_msg: |
+      From 50,000 tokens and a hard failure to a request of about 1,300 tokens and an exact answer. The digest kept the
+      evidence the question needed (the crossing times and the peak) and nothing else.
+
+  - id: clear-old-results
+    type: coding
+    title: Clear results once they're used
+    context: |
+      ORBIT compares CO2 peaks across four modules, one 4-hour history (about 8,500 tokens) per step, and every step
+      resends all earlier results. After each result, the model writes a one-line note ("Module C CO2 peak ...") in its
+      next turn. `run_agent(client, task, prepare=fn)` calls `fn(messages)` before every model call. `new_client()` gives
+      a fresh model whose `.calls` log has `input_tokens` per call.
+    instructions:
+      - "Run once with no `prepare`; store each call's `input_tokens` in `before_tokens` (a list) and the answer in `before_answer`."
+      - "Write `clear_old_results(messages, keep=1)`: replace the `content` of every `tool_result` block except the last `keep` with `\"[cleared: result already used]\"`."
+      - "Run again with `prepare=clear_old_results` on a new client; store `after_tokens`, `after_answer`, and `saving = 1 - sum(after_tokens) / sum(before_tokens)`."
+    hint: |
+      Collect the blocks with a comprehension over `messages`: user messages whose `content` is a list, blocks whose
+      `type` is `"tool_result"`. Then loop over `blocks[:-keep]` and set `b["content"] = ...`.
+    pre_code: |
+      from kits.agents_tool_use import HeliosStation, FakeClaude, VirtualClock, co2_comparer, tool_result, ToolError, MODEL
+      station = HeliosStation()
+      TOOLS = station.tools
+      task = "Which of modules C, D, E and F had the highest CO2 peak in the last 4 hours?"
+
+      def new_client():
+          return FakeClaude(co2_comparer(), clock=VirtualClock())
+
+      def run_agent(client, task, prepare=None, max_steps=10):
+          messages = [{"role": "user", "content": task}]
+          for step in range(1, max_steps + 1):
+              if prepare:
+                  prepare(messages)
+              r = client.messages.create(model=MODEL, max_tokens=1024, tools=TOOLS, messages=messages)
+              messages.append({"role": "assistant", "content": r.content})
+              if r.stop_reason != "tool_use":
+                  return "".join(b.text for b in r.content if b.type == "text")
+              results = []
+              for b in r.content:
+                  if b.type == "tool_use":
+                      try:
+                          results.append(tool_result(b.id, station.run_tool(b.name, b.input)))
+                      except ToolError as e:
+                          results.append(tool_result(b.id, f"Error: {e}", is_error=True))
+              messages.append({"role": "user", "content": results})
+          return None
+    sample_code: |
+      c1 = new_client()
+      before_answer = run_agent(c1, task)
+      before_tokens = ____
+
+      def clear_old_results(messages, keep=1):
+          blocks = [b for m in messages if m["role"] == "user" and isinstance(m["content"], list)
+                    for b in m["content"] if b.get("type") == "tool_result"]
+          ____
+
+      c2 = new_client()
+      after_answer = run_agent(c2, task, prepare=clear_old_results)
+      after_tokens = ____
+      saving = ____
+      print(before_answer)
+      print(after_answer)
+      print(before_tokens, after_tokens, f"saving {saving:.0%}")
+    solution: |
+      c1 = new_client()
+      before_answer = run_agent(c1, task)
+      before_tokens = [c["input_tokens"] for c in c1.calls]
+
+      def clear_old_results(messages, keep=1):
+          blocks = [b for m in messages if m["role"] == "user" and isinstance(m["content"], list)
+                    for b in m["content"] if b.get("type") == "tool_result"]
+          for b in (blocks[:-keep] if keep else blocks):
+              b["content"] = "[cleared: result already used]"
+
+      c2 = new_client()
+      after_answer = run_agent(c2, task, prepare=clear_old_results)
+      after_tokens = [c["input_tokens"] for c in c2.calls]
+      saving = 1 - sum(after_tokens) / sum(before_tokens)
+      print(before_answer)
+      print(after_answer)
+      print(before_tokens, after_tokens, f"saving {saving:.0%}")
+    tests: |
+      check_equal("before_tokens", msg="`before_tokens` should list `input_tokens` for each call of the first run (from `c1.calls`).")
+      bt = user["before_tokens"]
+      assert all(b > a for a, b in zip(bt, bt[1:])), "Without clearing, every call should be bigger than the one before."
+      assert user["after_answer"] == user["before_answer"], f"Clearing changed the answer. Before: {user['before_answer']!r}; after: {user['after_answer']!r}. Keep the latest result so the model can note it."
+      assert "Module E" in user["after_answer"], "The answer should still name Module E as the highest peak."
+      check_object("saving")
+      real = 1 - sum(user["after_tokens"]) / sum(bt)
+      assert abs(user["saving"] - real) < 1e-9, "`saving` is `1 - sum(after_tokens) / sum(before_tokens)`."
+      assert real >= 0.4, f"Clearing saved only {real:.0%} of input tokens; it should save at least 40%. Are old results actually replaced?"
+    success_msg: |
+      Same answer at about half the tokens. It works because the model's notes, not the raw results, carry the facts
+      forward. Try `keep=0`: the model loses the result it hasn't noted yet, and the answer breaks. Clear what has been
+      **used**, not what is merely old.
+
+  - id: pick-a-strategy
+    type: mc
+    title: Choose a context strategy
+    question: |
+      `search_handbook` returns the three best-matching documents in full, about 6,000 tokens per call, but answers usually
+      sit in one or two sentences. Questions vary widely (no fixed fields to extract), and for procedures the crew needs
+      the **exact wording**. What do you change?
+    options:
+      - text: Return the best-matching passages (a few sentences each, with doc ids), and add a `read_document(id)` tool for when the model needs the whole thing.
+        correct: true
+        feedback: "Right. Reshaping the tool keeps exact wording, cuts most calls to a few hundred tokens, and lets the model pull more context when a passage isn't enough. It costs one more tool to describe."
+      - text: Digest each result in code into a fixed dict of fields.
+        feedback: "Digests work for structured data with known questions. Here the questions vary and the text is prose, so there are no fixed fields to keep."
+      - text: Summarise each result with an extra LLM call before it goes back.
+        feedback: "It shrinks the result, but adds a call per search and paraphrases procedures, which is exactly what the crew can't accept."
+      - text: Keep the first 500 tokens of each result.
+        feedback: "Cheap, but the answer is often further down a document. Truncation cuts at an arbitrary point, not at the relevant one."
+    hint: Which option keeps exact wording without sending whole documents every time?

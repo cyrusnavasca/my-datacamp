@@ -1,0 +1,186 @@
+title: Prompt, RAG or fine-tune?
+description: What each option changes, what it costs, and a decision ladder for choosing between them.
+exercises:
+  - id: intro
+    type: video
+    title: Three ways to change a model's behaviour
+    slides: |
+      # Three levers, three places
+
+      ORBIT's ticket triager gets 65% of crew tickets right. You can change its behaviour in three places:
+
+      | lever | what changes | when it takes effect |
+      | --- | --- | --- |
+      | **Prompt** | the instructions and examples in the context | the next call |
+      | **RAG** | which documents get pasted into the context, chosen per request | the next call, and the index can be updated any time |
+      | **Fine-tune** | the model's **weights**, via gradient descent on your examples | after a training run, evaluation and a redeploy |
+
+      A useful mental model: the context is **working memory**, the weights are **habits**. Prompting and RAG
+      edit working memory. Fine-tuning changes habits, slowly and expensively, and it is hard to undo.
+
+      ---
+
+      ## Knowledge or behaviour?
+
+      Ask what is actually missing:
+
+      - **Knowledge** (facts that change, need sources, or are too many to memorise: the handbook, this
+        week's rota, part numbers). Use **RAG**. A fine-tune does not store facts reliably: it learns the
+        *style* of confident answers, then makes up the facts it never saw. It also can't cite anything,
+        and it goes stale the day the handbook changes.
+      - **Behaviour** (format, tone, length, a labelling convention such as "display faults are IT", a
+        narrow skill). **Prompt** first. **Fine-tune** when the prompt can't hold enough examples, or when
+        a long prompt costs too much or is too slow at your volume.
+
+      Many production systems combine the two: **RAG for facts + a fine-tune for format**, for example
+      a medical assistant that retrieves the current formulary and writes in a strict note template.
+
+      ---
+
+      ## Trade-offs side by side
+
+      | | Prompt | RAG | Fine-tune |
+      | --- | --- | --- | --- |
+      | Setup effort | minutes | days (chunking, index, eval) | days to weeks (data, training, eval) |
+      | Data needed | 0 to 50 examples | a document corpus | hundreds to thousands of clean examples |
+      | Per-call cost | grows with prompt length | + retrieved tokens + search | short prompts; fine-tuned models can cost more per token |
+      | Latency | grows with prompt length | + retrieval step | lowest (short prompt, smaller model possible) |
+      | Fresh knowledge | edit the prompt | re-index | retrain |
+      | Cites sources | only what is in the prompt | yes | no |
+      | Iteration speed | seconds | minutes | hours |
+      | Typical failure | ignored instructions, huge prompts | wrong chunks retrieved | forgetting, overfitting, invented facts |
+
+      ---
+
+      ## The decision ladder
+
+      When the system underperforms, climb only as far as you need:
+
+      1. **Build an eval set first.** No number, no decision.
+      2. **Improve the prompt**: clearer instructions, then a few *targeted* examples of the failures.
+      3. **Missing knowledge?** Add retrieval.
+      4. **Still failing with good examples, or the prompt is too long or slow at your volume?** Now
+         consider fine-tuning, usually a smaller model.
+      5. Before fine-tuning *for cost*, try the cheap cost levers: **prompt caching** of the fixed prefix,
+         a smaller model with the same prompt, shorter outputs.
+
+      ---
+
+      ## The cost maths
+
+      ```python
+      import anthropic
+      client = anthropic.Anthropic()
+      msg = client.messages.create(
+          model="claude-opus-5-5", max_tokens=20,
+          system=SYSTEM_WITH_100_EXAMPLES,          # about 3,900 tokens, sent on every call
+          messages=[{"role": "user", "content": f"<ticket>{text}</ticket>"}],
+      )
+      print(msg.usage.input_tokens, msg.usage.output_tokens)
+      ```
+
+      Cost per call = input tokens × input price + output tokens × output price. A fine-tune is a
+      one-off cost $C$ that buys a cheaper call, so
+
+      $$\text{break-even calls} = \frac{C}{\text{cost}_\text{prompt} - \text{cost}_\text{fine-tuned}}$$
+
+      Prices in this course come from `aikit.PRICES` and are made up. Always check the provider's
+      live pricing page before deciding.
+
+  - id: which-lever
+    type: classify
+    title: Which lever for the job?
+    prompt: Sort each Helios request by the option you would try **first** that can actually solve it.
+    hint: Facts that change or need citing call for retrieval. Format and conventions are behaviour. Fine-tune only when prompting can't do it or costs too much at volume.
+    zones: [Prompt, RAG, Fine-tune, RAG + fine-tune]
+    items:
+      - { text: "ORBIT must answer from the station handbook, which is revised every week", zone: RAG }
+      - { text: "Replies should use British spelling and stay under 40 words", zone: Prompt }
+      - { text: "A new crew member wants ORBIT to call her by her nickname", zone: Prompt }
+      - { text: "Answer questions about this week's crew rota and cite the rota document", zone: RAG }
+      - { text: "Make ORBIT know the 400-page engineering manual by heart", zone: RAG }
+      - { text: "Label 2 million sensor log lines a day into 30 fault codes; a 60-example prompt works but costs too much", zone: Fine-tune }
+      - { text: "Run the triager on a rover with no network, on a 1B-parameter model", zone: Fine-tune }
+      - { text: "Write incident reports in the station's rigid template, which prompting with 30 examples still gets wrong", zone: Fine-tune }
+      - { text: "Answer from the current drug formulary, written in a strict clinical note format that prompting can't hold", zone: RAG + fine-tune }
+      - { text: "Summarise 3,000 incident reports on request, in a house style that 40 prompt examples can't reproduce", zone: RAG + fine-tune }
+
+  - id: break-even
+    type: coding
+    title: When does a fine-tune pay for itself?
+    context: |
+      Helios-7 and four sister stations will send **30,000** tickets a month. Option A keeps the
+      100-example prompt `fewshot_prompt` on `claude-opus-5-5`. Option B fine-tunes `claude-haiku-4-5`
+      with the short prompt `short_prompt`; the fine-tuned model costs `FT_MULT` times the base price
+      and the project costs `ONE_OFF` dollars. A ticket adds `TICKET_TOKENS` input tokens and the
+      reply is `OUT_TOKENS` tokens. `aikit` is imported.
+    instructions:
+      - "Store the cost of one call for option A in `cost_a`, using `aikit.cost({\"input_tokens\": ..., \"output_tokens\": ...}, model)` and `aikit.count_tokens(fewshot_prompt) + TICKET_TOKENS` input tokens."
+      - "Store the cost of one call for option B in `cost_b`: the same with `short_prompt` and the Haiku model, multiplied by `FT_MULT`."
+      - "Store `months_a_vs_b`: the break-even number of calls, `ONE_OFF / (cost_a - cost_b)`, divided by `MONTHLY`."
+      - "Prompt caching bills the fixed prefix at `cache_read_input_tokens` rates. Store `cost_a_cached` (the prompt tokens as `cache_read_input_tokens`, only the ticket as `input_tokens`) and `months_cached_vs_b`, the break-even months against the cached option."
+    hint: "`aikit.cost({\"input_tokens\": TICKET_TOKENS, \"cache_read_input_tokens\": aikit.count_tokens(fewshot_prompt), \"output_tokens\": OUT_TOKENS}, \"claude-opus-5-5\")` prices the cached call."
+    pre_code: |
+      import aikit
+      from kits.llm_apis_prompting import TRIAGE_SYSTEM, examples_block, split_tickets
+      _pool, _ = split_tickets()
+      fewshot_prompt = TRIAGE_SYSTEM + "\n" + examples_block(list(zip(_pool.text, _pool.category)))
+      short_prompt = TRIAGE_SYSTEM
+      TICKET_TOKENS, OUT_TOKENS = 20, 8
+      FT_MULT = 2.0          # fine-tuned models often cost more per token than their base model
+      ONE_OFF = 1500.0       # data cleaning, training runs, evaluation and engineer time, in USD
+      MONTHLY = 30_000
+    sample_code: |
+      in_a = aikit.count_tokens(fewshot_prompt) + TICKET_TOKENS
+      in_b = aikit.count_tokens(short_prompt) + TICKET_TOKENS
+
+      cost_a = aikit.cost({"input_tokens": in_a, "output_tokens": OUT_TOKENS}, "claude-opus-5-5")
+      cost_b = ____
+      months_a_vs_b = ____
+
+      cost_a_cached = aikit.cost({"input_tokens": ____, "cache_read_input_tokens": ____,
+                                  "output_tokens": OUT_TOKENS}, "claude-opus-5-5")
+      months_cached_vs_b = ____
+
+      print(f"A ${cost_a:.5f}/call, cached A ${cost_a_cached:.5f}/call, B ${cost_b:.5f}/call")
+      print(f"break-even: {months_a_vs_b:.1f} months vs A, {months_cached_vs_b:.1f} months vs cached A")
+    solution: |
+      in_a = aikit.count_tokens(fewshot_prompt) + TICKET_TOKENS
+      in_b = aikit.count_tokens(short_prompt) + TICKET_TOKENS
+
+      cost_a = aikit.cost({"input_tokens": in_a, "output_tokens": OUT_TOKENS}, "claude-opus-5-5")
+      cost_b = aikit.cost({"input_tokens": in_b, "output_tokens": OUT_TOKENS}, "claude-haiku-4-5") * FT_MULT
+      months_a_vs_b = ONE_OFF / (cost_a - cost_b) / MONTHLY
+
+      cost_a_cached = aikit.cost({"input_tokens": TICKET_TOKENS, "cache_read_input_tokens": aikit.count_tokens(fewshot_prompt),
+                                  "output_tokens": OUT_TOKENS}, "claude-opus-5-5")
+      months_cached_vs_b = ONE_OFF / (cost_a_cached - cost_b) / MONTHLY
+
+      print(f"A ${cost_a:.5f}/call, cached A ${cost_a_cached:.5f}/call, B ${cost_b:.5f}/call")
+      print(f"break-even: {months_a_vs_b:.1f} months vs A, {months_cached_vs_b:.1f} months vs cached A")
+    tests: |
+      check_equal("cost_a", tol=1e-9, msg="`cost_a` is the Opus price of `count_tokens(fewshot_prompt) + TICKET_TOKENS` input tokens and `OUT_TOKENS` output tokens.")
+      check_equal("cost_b", tol=1e-9, msg="`cost_b` is the Haiku price of the short prompt plus the ticket, times `FT_MULT`.")
+      check_equal("months_a_vs_b", tol=1e-6, msg="`months_a_vs_b` = `ONE_OFF / (cost_a - cost_b) / MONTHLY`.")
+      check_equal("cost_a_cached", tol=1e-9, msg="For `cost_a_cached`, the fixed prompt goes in `cache_read_input_tokens` and only `TICKET_TOKENS` in `input_tokens`.")
+      check_equal("months_cached_vs_b", tol=1e-6, msg="`months_cached_vs_b` = `ONE_OFF / (cost_a_cached - cost_b) / MONTHLY`.")
+    success_msg: The fine-tune pays back in about 2.6 months against the uncached prompt, but caching alone cuts option A's cost by almost 9x and pushes break-even out to about two years. Try the cheap lever first.
+
+  - id: vendor-catalogue
+    type: mc
+    title: A catalogue that changes every week
+    question: |
+      A hydroponics supplier wants ORBIT to answer crew questions about its nutrient catalogue:
+      2,000 products whose prices and stock change weekly. Answers must quote the product code.
+      ORBIT gets about 40 such questions a day. What do you build first?
+    options:
+      - text: "Fine-tune ORBIT on the catalogue so it knows every product."
+        feedback: "Fine-tuning is poor at storing 2,000 changing facts. The model would learn to answer confidently, invent codes it never saw, and go stale within a week. You would have to retrain every week."
+      - text: "Retrieval over the catalogue, re-indexed when it changes, with the product code cited from the retrieved entry."
+        correct: true
+        feedback: "Right. This is a knowledge problem: facts that change and must be quoted exactly. RAG keeps answers fresh (re-index weekly), lets ORBIT cite the code from the document, and costs nothing to update."
+      - text: "Paste the whole catalogue into the system prompt."
+        feedback: "2,000 products is a very long prompt on every call: high cost and latency, and models get worse at finding one item in a huge context. Retrieval sends only the few entries that matter."
+      - text: "Distil a small model from Claude so it is cheap enough to answer all questions."
+        feedback: "40 questions a day is tiny volume, so cost isn't the constraint. And a distilled model has the same problem as a fine-tune: facts baked into weights go stale."
+    hint: Is the gap knowledge or behaviour? How often does it change?

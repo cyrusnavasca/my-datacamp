@@ -1,0 +1,264 @@
+title: Diagnosing the queries that miss
+description: A playbook for when relevant docs aren't found. Read and bucket the misses, match each bucket to a fix and its cost, fix the biggest bucket with query rewriting, and verify on held-out queries.
+exercises:
+  - id: diagnosing-misses-slides
+    type: video
+    title: From a number to the queries behind it
+    slides: |
+      # Symptom: "ORBIT got worse when the new crew arrived"
+
+      Nothing in ORBIT changed, and recall on the old test set is still excellent. But the new crew's questions keep
+      missing. The **query mix drifted**: new people, new words.
+
+      1. **Measure** on queries from the new crew, labelled the same way (a dev set and a held-out test set).
+      2. **Diagnose** by reading the misses, not by staring at the average.
+      3. **Fix** the biggest bucket with the cheapest fix that addresses its cause.
+      4. **Verify** on the held-out test set, and check the old test set didn't regress.
+
+      ---
+
+      ## Read the misses and bucket them
+
+      For each missed query, print the query, its gold docs, what came back, and the gold doc's rank:
+
+      | bucket | how it looks | typical fix |
+      | --- | --- | --- |
+      | **jargon or slang** | words that appear nowhere in the corpus ("veg bay") | query rewriting with a glossary |
+      | **exact codes** | `P-2`, `F-1`; zero or near-zero query vector | hybrid keyword + semantic |
+      | **paraphrase** | everyday words for corpus terms | better or general embedding model |
+      | **near miss** | gold doc at rank 4-10 | larger k, or retrieve more and rerank |
+      | **multi-hop** | one of two needed docs found | query decomposition (rag-systems) |
+      | **label or corpus problem** | gold label wrong, or the answer isn't in the corpus | fix the label; add the doc |
+
+      Count the buckets and fix the **largest** first: that's where the recall is.
+
+      ---
+
+      ## Fix menu with costs
+
+      | fix | latency | money | upkeep | risk |
+      | --- | --- | --- | --- | --- |
+      | glossary rewriting | ~0 ms | none | someone maintains the glossary | misses new slang until it's added |
+      | LLM query rewriting | +1 LLM call (100s of ms) | per query | prompt upkeep | can drift or add wrong terms |
+      | hybrid search | +a few ms | small | second index | fusion weight to tune |
+      | better embedding model | maybe more | re-embed the corpus | migration | still won't know local slang |
+      | fine-tune the embedder | none at query time | training run | labelled pairs | overfits small data |
+      | larger k + rerank | reranker pass | per query | another model | doesn't help total misses |
+
+      ---
+
+      ## Query rewriting with a glossary
+
+      ```python
+      GLOSSARY = {"veg bay": "hydroponics Module C", "dark pass": "eclipse", ...}
+
+      def rewrite(query):
+          extra = [v for k, v in GLOSSARY.items()
+                   if re.search(rf"\b{re.escape(k)}\b", query, re.IGNORECASE)]
+          return " ".join([query] + extra)          # append, don't replace
+      ```
+
+      - **Append** the expansion. Keep the original words, because they may still match.
+      - Use **word boundaries**, so "walk" doesn't fire inside "spacewalk".
+      - The same function works in front of keyword, semantic or hybrid search.
+
+      ---
+
+      ## Verify on queries you didn't look at
+
+      You read the **dev** misses to choose the fix, so dev numbers flatter it. Prove it on the **test** split:
+
+      - the bucket you targeted improves on test;
+      - overall test recall improves;
+      - the **old** test set (the 41 handbook questions) doesn't regress, because rewriting can break queries that already worked.
+
+      Then add the new queries to the permanent test set, so the next drift is caught by a number, not by the crew.
+
+  - id: bucket-the-misses
+    type: classify
+    title: Bucket the misses
+    prompt: Each line is a query ORBIT missed, with what happened. Sort them by cause.
+    hint: Words that never appear in the handbook point to jargon. Codes that vanish point to exact matching. Two docs needed points to multi-hop. A wrong label or a missing doc points to the label or corpus.
+    zones: [Jargon or slang, Exact code, Needs two docs, Label or corpus problem]
+    items:
+      - { text: "'When does the veg bay get watered?' returns the water recycling page", zone: Jargon or slang }
+      - { text: "'How long is the dark pass?' returns the robotic arm page", zone: Jargon or slang }
+      - { text: "'P-2 is silent' returns the first pages in the index, all with score 0", zone: Exact code }
+      - { text: "'Does D-3 need a defrost?' finds general text about ice but not the dehumidifier coil", zone: Exact code }
+      - { text: "'Who can book the glovebox, and in which module is it?' finds the booking policy but not the module map", zone: Needs two docs }
+      - { text: "'Who owns the hydroponics schedule, and what is their role?' finds the schedule but not the crew roster", zone: Needs two docs }
+      - { text: "'How much does Tern cost to launch?' is labelled with the cargo page, which never mentions cost", zone: Label or corpus problem }
+      - { text: "Questions about the new water filter miss because its manual was never added to the handbook", zone: Label or corpus problem }
+
+  - id: fix-for-the-bucket
+    type: mc
+    title: Choose the fix
+    question: |
+      On the new crew's dev queries, ORBIT's hybrid search misses 7 of 20. Four are station slang ("veg bay", "the hab",
+      "the chute", "farm"), two are paraphrases, and one is a near miss at rank 5. The p95 budget leaves no room for another
+      LLM call per query. The crew already keeps a slang page on the station wiki. What do you do first?
+    options:
+      - text: Switch to a larger general-purpose embedding model.
+        feedback: "A general model knows everyday English, not Helios slang: no training corpus ever called hydroponics 'the veg bay'. On the held-out slang queries, the general model alone scores no better (0.75 hit@3). And you'd pay to re-embed the corpus."
+      - text: Rewrite every query with an LLM before searching.
+        feedback: "An LLM could expand slang it has seen explained, but it doesn't know Helios slang either unless you put the glossary in its prompt, and the extra call breaks the latency budget."
+      - text: Expand queries with the crew's slang glossary before searching.
+        correct: true
+        feedback: "Right. The biggest bucket is slang, the crew already maintains its meaning, and a dictionary lookup costs no latency or money. Append expansions (don't replace), verify on the held-out test split, and check that old queries don't regress. The remaining paraphrase and near-miss buckets are next."
+      - text: Increase k from 3 to 10.
+        feedback: "That rescues the near miss at rank 5 and nothing else. The slang queries don't find the right page anywhere in the ranking. Fix the bucket that holds most of the misses."
+    hint: Which bucket is biggest, and which fix matches its cause within the latency budget?
+
+  - id: new-crew-rotation
+    type: sequential
+    title: "Mission: the new crew rotation"
+    context: |
+      A new crew rotation arrived, and they talk differently. ORBIT runs the hybrid search from chapter 2: `search(query)`
+      returns ranked doc ids. The new crew's labelled queries are split into `dev` (20, for diagnosis) and `test` (20,
+      held out). `old_set` holds the 41 handbook questions. `evaluate(search, testset, k)` is your harness, `CREW_GLOSSARY`
+      maps crew slang to handbook words, and `re`, `np` and `pd` are imported.
+    pre_code: |
+      import re
+      import numpy as np
+      import pandas as pd
+      from kits.embeddings_vector_search import HybridSearch, crew_queries, build_testset, evaluate, CREW_GLOSSARY
+      _hs = HybridSearch(alpha=0.5)
+      def search(query):
+          return _hs.search(query, k=10)
+      def _as_testset(qs):
+          return [{"id": q["id"], "query": q["query"], "doc_ids": q["doc_ids"], "type": q["kind"]} for q in qs]
+      dev = _as_testset(crew_queries(split="dev"))
+      test = _as_testset(crew_queries(split="test"))
+      old_set = build_testset(include_crew=False)
+    steps:
+      - instructions:
+          - "**Measure.** Store `evaluate(search, dev, 3)` in `df_dev`, and the mean `hit` per type in `dev_by_type` (a pandas Series indexed by type)."
+          - "Print `dev_by_type` and the overall dev hit@3."
+        hint: "`df_dev.groupby(\"type\")[\"hit\"].mean()`."
+        sample_code: |
+          df_dev = ____
+          dev_by_type = ____
+          print(dev_by_type.round(2))
+          print("overall", df_dev["hit"].mean())
+        solution: |
+          df_dev = evaluate(search, dev, 3)
+          dev_by_type = df_dev.groupby("type")["hit"].mean()
+          print(dev_by_type.round(2))
+          print("overall", df_dev["hit"].mean())
+        tests: |
+          d = check_object("dev_by_type")
+          s = sol["dev_by_type"]
+          for t in s.index:
+              assert abs(float(d[t]) - float(s[t])) < 1e-9, f"dev_by_type[{t!r}] should be {s[t]:.3f}: the mean hit@3 of the dev queries of that type."
+      - instructions:
+          - "**Diagnose.** Store the ids of the dev queries with `hit == 0` in `miss_ids` (in `df_dev` order), and a dict counting misses per type in `miss_counts`."
+          - "Store the type with the most misses in `biggest`."
+          - "Some misses are near misses (the gold doc is ranked, just below 3) and others are total misses (`rank` is NaN). Store the ids of the near misses in `near_miss_ids`."
+          - "Store how many of the `biggest`-type misses contain a `CREW_GLOSSARY` term (case-insensitive, whole words) in `glossary_covers`."
+        hint: |
+          `m = df_dev[df_dev["hit"] == 0]`; `m["type"].value_counts().to_dict()`; `m.loc[m["rank"].notna(), "id"]`.
+          To look up a query's text: `qtext = {t["id"]: t["query"] for t in dev}`. Term test:
+          `re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE)`.
+        sample_code: |
+          m = df_dev[df_dev["hit"] == 0]
+          miss_ids = ____
+          miss_counts = ____
+          biggest = ____
+          near_miss_ids = ____
+
+          qtext = {t["id"]: t["query"] for t in dev}
+          def has_term(text):
+              return any(re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE) for term in CREW_GLOSSARY)
+          glossary_covers = ____
+          for i in miss_ids:
+              print(i, qtext[i])
+          print(miss_counts, biggest, near_miss_ids, glossary_covers)
+        solution: |
+          m = df_dev[df_dev["hit"] == 0]
+          miss_ids = list(m["id"])
+          miss_counts = m["type"].value_counts().to_dict()
+          biggest = max(miss_counts, key=miss_counts.get)
+          near_miss_ids = list(m.loc[m["rank"].notna(), "id"])
+
+          qtext = {t["id"]: t["query"] for t in dev}
+          def has_term(text):
+              return any(re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE) for term in CREW_GLOSSARY)
+          glossary_covers = sum(has_term(qtext[i]) for i in m.loc[m["type"] == biggest, "id"])
+          for i in miss_ids:
+              print(i, qtext[i])
+          print(miss_counts, biggest, near_miss_ids, glossary_covers)
+        tests: |
+          check_equal("miss_ids", msg="`miss_ids` should list the ids of dev queries with hit == 0, in `df_dev` order.")
+          mc = check_object("miss_counts")
+          assert {k: int(v) for k, v in dict(mc).items()} == sol["miss_counts"], f"`miss_counts` should be {sol['miss_counts']}."
+          check_equal("biggest", msg="`biggest` should be the type with the most misses.")
+          check_equal("near_miss_ids", msg="`near_miss_ids` should be the missed ids whose `rank` is not NaN.")
+          check_equal("glossary_covers", msg="`glossary_covers` should count the biggest-type misses whose query contains a glossary term.")
+      - instructions:
+          - "**Fix.** Write `rewrite(query)`: for every `CREW_GLOSSARY` term found in the query (case-insensitive, whole words), **append** its expansion. Return the original query followed by the expansions, joined by spaces."
+          - "Write `fixed_search(query)` that searches with the rewritten query."
+        hint: |
+          `extra = [v for k, v in CREW_GLOSSARY.items() if re.search(rf"\b{re.escape(k)}\b", query, re.IGNORECASE)]`,
+          then `" ".join([query] + extra)`.
+        sample_code: |
+          def rewrite(query):
+              extra = ____
+              return ____
+
+          def fixed_search(query):
+              return ____
+
+          print(rewrite("When does the veg bay get watered?"))
+          print(fixed_search("When does the veg bay get watered?")[:3])
+        solution: |
+          def rewrite(query):
+              extra = [v for k, v in CREW_GLOSSARY.items() if re.search(rf"\b{re.escape(k)}\b", query, re.IGNORECASE)]
+              return " ".join([query] + extra)
+
+          def fixed_search(query):
+              return search(rewrite(query))
+
+          print(rewrite("When does the veg bay get watered?"))
+          print(fixed_search("When does the veg bay get watered?")[:3])
+        tests: |
+          f = check_object("rewrite")
+          q = "When does the Veg Bay get watered?"
+          r = f(q)
+          assert r.startswith(q), "`rewrite` should keep the original query at the start and append expansions after it."
+          assert "hydroponics" in r, "`rewrite` should append the expansion for 'veg bay', matching case-insensitively."
+          assert "spacewalk" not in f("What happens during a spacewalk?").replace("What happens during a spacewalk?", ""), "'walk' must not match inside 'spacewalk': use word boundaries (`\\b`)."
+          assert f("How warm is the galley?") == "How warm is the galley?", "A query with no glossary terms should come back unchanged."
+          check_object("fixed_search")
+      - instructions:
+          - "**Verify** on the held-out queries. Store `evaluate(search, test, 3)` in `df_test_before` and `evaluate(fixed_search, test, 3)` in `df_test_after`."
+          - "Store `evaluate(search, old_set, 3)[\"hit\"].mean()` in `old_before` and the same for `fixed_search` in `old_after`."
+          - "To pass, test jargon hit@3 must reach at least 0.9, overall test hit@3 at least 0.9, and `old_after` must not be below `old_before`."
+        hint: "Per-type means: `df_test_after.groupby(\"type\")[\"hit\"].mean()`."
+        sample_code: |
+          df_test_before = ____
+          df_test_after = ____
+          old_before = ____
+          old_after = ____
+          print("test before", df_test_before.groupby("type")["hit"].mean().round(2).to_dict(), df_test_before["hit"].mean())
+          print("test after ", df_test_after.groupby("type")["hit"].mean().round(2).to_dict(), df_test_after["hit"].mean())
+          print("old set", old_before, "->", old_after)
+        solution: |
+          df_test_before = evaluate(search, test, 3)
+          df_test_after = evaluate(fixed_search, test, 3)
+          old_before = evaluate(search, old_set, 3)["hit"].mean()
+          old_after = evaluate(fixed_search, old_set, 3)["hit"].mean()
+          print("test before", df_test_before.groupby("type")["hit"].mean().round(2).to_dict(), df_test_before["hit"].mean())
+          print("test after ", df_test_after.groupby("type")["hit"].mean().round(2).to_dict(), df_test_after["hit"].mean())
+          print("old set", old_before, "->", old_after)
+        tests: |
+          from kits.embeddings_vector_search import evaluate as ev
+          after = ev(user["fixed_search"], sol["test"], 3)
+          jt = after.loc[after["type"] == "jargon", "hit"].mean()
+          assert jt >= 0.9, f"Jargon hit@3 on the test split is {jt:.2f}; it should be at least 0.9. Check that `rewrite` appends the glossary expansions."
+          assert after["hit"].mean() >= 0.9, f"Overall test hit@3 is {after['hit'].mean():.2f}; it should be at least 0.9."
+          ob, oa = check_object("old_before"), check_object("old_after")
+          assert abs(oa - ev(user["fixed_search"], sol["old_set"], 3)["hit"].mean()) < 1e-9, "`old_after` should be the mean hit@3 of `fixed_search` on `old_set`."
+          assert oa >= ob - 1e-9, "The old handbook questions got worse after rewriting. Make sure `rewrite` only appends expansions for whole-word glossary matches."
+          dfa = check_object("df_test_after")
+          assert abs(dfa["hit"].mean() - after["hit"].mean()) < 1e-9, "`df_test_after` should be `evaluate(fixed_search, test, 3)`."
+    success_msg: "On queries you never looked at, slang hit@3 went from 0.75 to 1.0 and overall from 0.85 to 0.95, with no regression on the old questions. It cost no latency and no money. The rest of the dev misses (two paraphrases and a near miss) are the next buckets, and the new queries now belong in the permanent test set."

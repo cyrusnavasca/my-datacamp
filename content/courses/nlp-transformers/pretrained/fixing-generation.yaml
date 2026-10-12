@@ -1,0 +1,302 @@
+title: "Troubleshooting: repetitive generation"
+description: Measure repetition with an n-gram metric, implement a repetition penalty, and tune decoding until the text stops looping without turning into word salad.
+exercises:
+  - id: intro
+    type: video
+    title: When the model gets stuck in a loop
+    slides: |
+      # Symptom: the same phrase, again and again
+
+      ORBIT's crew-log autocomplete (DistilGPT2, greedy decoding) produces:
+
+      > "The crew of the space station, the Space Shuttle, and the International Space Station are all
+      > aboard the International Space Station.\n\n\n\n\n\n\n\n\n\n..."
+
+      Loops are the most common failure of small models and of greedy or beam search. Once a phrase is
+      generated, it is in the context, which makes it **more** likely to be generated again. The loop
+      feeds itself.
+
+      ---
+
+      ## Measure: repeated n-gram rate, plus a fluency guard
+
+      $$\text{rep}_n = 1 - \frac{\#\text{ distinct } n\text{-grams}}{\#\ n\text{-grams}}$$
+
+      over the generated token ids. 0 means no 3-gram repeats; looping text scores 0.4 or more.
+
+      One metric is not enough: word salad never repeats either. Pair it with a **fluency** score, the mean
+      negative log-likelihood per token under the model (lower is more fluent):
+
+      | output | rep$_3$ | NLL/token |
+      | --- | --- | --- |
+      | greedy, looping | ~0.4 | ~1 |
+      | healthy text | ~0 | ~2-3 |
+      | word salad ($T$ = 1.5+) | 0 | 8+ |
+
+      Measure over several prompts and seeds; one sample proves nothing.
+
+      ---
+
+      ## Diagnose: check these first
+
+      1. **Decoding mode.** Greedy, beam search or very low temperature? Those are the usual cause.
+      2. **Length.** Loops grow with `max_new_tokens`. Does a stop sequence or EOS end the text earlier?
+      3. **Prompt.** A prompt that ends mid-list or with a repeated pattern invites more of it.
+      4. **Model size.** Tiny models loop far more than large ones. If nothing else works, that is the real fix.
+
+      ---
+
+      ## Fix: options in order, and what they cost
+
+      | fix | how | cost and risk |
+      | --- | --- | --- |
+      | sampling | `do_sample=True, temperature=0.7, top_p=0.9` | less consistent output; on its own often **not enough** for tiny models |
+      | repetition penalty | `repetition_penalty=1.1-1.3`: logits of already-seen tokens are divided by the penalty if positive, multiplied if negative | also penalises words that **should** repeat ("the", names, part codes); too high gives odd word choices |
+      | n-gram ban | `no_repeat_ngram_size=3`: never repeat any 3-gram | hard ban; breaks legitimate repeats like "B-6 ... B-6", lists and code |
+      | bigger or better model | | latency and cost |
+
+      Change one knob at a time, and re-measure **both** metrics on the same prompts and seeds.
+
+      ---
+
+      ## Verify on prompts you did not tune on
+
+      Tuning settings on three prompts is fitting to three prompts. Keep a held-out set of prompts and seeds:
+
+      ```python
+      rates = [repeated_ngram_rate(continue_text(p, seed=s, **settings)) for p in held_out for s in seeds]
+      ```
+
+      Pass only if repetition is low **and** fluency stays in the healthy range on the held-out set. Record
+      the chosen settings next to these numbers so the next person knows why they were picked.
+
+  - id: repeat-rate
+    type: coding
+    title: Measure repetition
+    context: |
+      `looping` and `healthy` are lists of token ids from two generations of 40 tokens each. Write the metric
+      that tells them apart.
+    instructions:
+      - "Write `repeated_ngram_rate(ids, n=3)`: build every `n`-gram as a tuple, and return `1 - distinct / total`. Return `0.0` if there are no n-grams."
+      - "Store the rate of `looping` in `rate_looping` and of `healthy` in `rate_healthy`."
+    hint: "`grams = [tuple(ids[i:i + n]) for i in range(len(ids) - n + 1)]`, then `1 - len(set(grams)) / len(grams)`."
+    pre_code: |
+      looping = [11, 262, 4687, 11, 290, 262, 4037, 4687, 389, 477, 8222, 262, 4037, 4687, 13] + [198] * 25
+      healthy = [543, 318, 3058, 287, 13066, 1088, 3668, 290, 468, 587, 37349, 329, 517, 621, 257, 5707,
+                 13, 198, 1, 1135, 821, 845, 6568, 546, 428, 3663, 284, 307, 1498, 1011, 636, 287, 340,
+                 290, 284, 2193, 422, 340, 553, 339]
+    sample_code: |
+      def repeated_ngram_rate(ids, n=3):
+          grams = [tuple(ids[i:i + n]) for i in range(____)]
+          if not grams:
+              return 0.0
+          return ____
+
+      rate_looping = ____
+      rate_healthy = ____
+      print(f"looping {rate_looping:.2f}  healthy {rate_healthy:.2f}")
+    solution: |
+      def repeated_ngram_rate(ids, n=3):
+          grams = [tuple(ids[i:i + n]) for i in range(len(ids) - n + 1)]
+          if not grams:
+              return 0.0
+          return 1 - len(set(grams)) / len(grams)
+
+      rate_looping = repeated_ngram_rate(looping)
+      rate_healthy = repeated_ngram_rate(healthy)
+      print(f"looping {rate_looping:.2f}  healthy {rate_healthy:.2f}")
+    tests: |
+      f = check_object("repeated_ngram_rate")
+      assert abs(f([1, 2, 3, 1, 2, 3]) - 0.25) < 1e-9, "For [1, 2, 3, 1, 2, 3] there are 4 trigrams and 3 distinct ones, so the rate is 0.25."
+      assert abs(f([1, 2, 1, 2, 1], n=2) - 0.5) < 1e-9, "The function should honour `n`: [1, 2, 1, 2, 1] has 4 bigrams, 2 distinct, rate 0.5."
+      assert f([1, 2]) == 0.0, "With fewer than n tokens there are no n-grams; return 0.0."
+      check_equal("rate_looping")
+      check_equal("rate_healthy")
+    success_msg: The looping output repeats more than half of its trigrams; the healthy one none. Now you have a number to drive the fix.
+
+  - id: repetition-penalty
+    type: coding
+    title: Implement the repetition penalty
+    context: |
+      `logits` is a next-token score vector over a 10-token vocabulary, and `seen` lists the ids already
+      generated (with a duplicate). `torch` and transformers' `RepetitionPenaltyLogitsProcessor` are imported.
+    instructions:
+      - "Write `apply_penalty(logits, seen, penalty)`: return a **copy** where, for each distinct id in `seen`, a positive logit is divided by `penalty` and a negative one is multiplied by it."
+      - "Store `apply_penalty(logits, seen, 1.3)` in `penalised`."
+      - "Store the library's result, `RepetitionPenaltyLogitsProcessor(1.3)(torch.tensor([seen]), logits.unsqueeze(0).clone())[0]`, in `reference`."
+    hint: "Loop over `set(seen)`: `out[i] = out[i] / penalty if out[i] > 0 else out[i] * penalty`, starting from `out = logits.clone()`."
+    pre_code: |
+      import torch
+      from kits.nlp_transformers import quiet
+      quiet()
+      from transformers import RepetitionPenaltyLogitsProcessor
+      logits = torch.tensor([2.0, -1.0, 3.5, 0.5, -2.0, 1.2, 0.0, -0.3, 4.1, 1.0])
+      seen = [2, 4, 8, 2, 7]
+    sample_code: |
+      def apply_penalty(logits, seen, penalty):
+          out = logits.clone()
+          for i in set(seen):
+              if out[i] > 0:
+                  out[i] = ____
+              else:
+                  out[i] = ____
+          return out
+
+      penalised = apply_penalty(logits, seen, 1.3)
+      reference = ____
+      print(penalised)
+      print(torch.allclose(penalised, reference))
+    solution: |
+      def apply_penalty(logits, seen, penalty):
+          out = logits.clone()
+          for i in set(seen):
+              if out[i] > 0:
+                  out[i] = out[i] / penalty
+              else:
+                  out[i] = out[i] * penalty
+          return out
+
+      penalised = apply_penalty(logits, seen, 1.3)
+      reference = RepetitionPenaltyLogitsProcessor(1.3)(torch.tensor([seen]), logits.unsqueeze(0).clone())[0]
+      print(penalised)
+      print(torch.allclose(penalised, reference))
+    tests: |
+      import torch
+      f = check_object("apply_penalty")
+      lg = torch.tensor([1.0, -1.0, 2.0])
+      before = lg.clone()
+      got = f(lg, [0, 1, 0], 2.0)
+      assert torch.equal(lg, before), "`apply_penalty` changed its input. Work on `logits.clone()`."
+      assert torch.allclose(got, torch.tensor([0.5, -2.0, 2.0])), "Each seen id is penalised once: [1.0, -1.0, 2.0] with seen [0, 1, 0] and penalty 2 should give [0.5, -2.0, 2.0]. Negative logits are multiplied, so they get more negative."
+      p = check_object("penalised")
+      assert torch.allclose(p, sol["penalised"]), "`penalised` should be `apply_penalty(logits, seen, 1.3)`."
+      r = check_object("reference")
+      assert torch.allclose(r, sol["reference"]), "`reference` should be the processor's output for the same logits and ids."
+    success_msg: Your version matches the library. Note the asymmetry; dividing a negative logit would raise it, so negatives are multiplied instead. Both make seen tokens less likely.
+
+  - id: penalty-side-effects
+    type: mc
+    title: Pick the right anti-repetition fix
+    question: |
+      ORBIT drafts maintenance notes such as "Valve B-6 is leaking. Isolate valve B-6, then replace the
+      B-6 seal." Drafts sometimes loop. Which fix is the safest first try?
+    options:
+      - text: "`no_repeat_ngram_size=2`"
+        feedback: A hard ban on repeated bigrams makes "valve B-6" impossible the second time, so the note cannot name the part it is about. N-gram bans suit free prose, not technical text.
+      - text: "`repetition_penalty=3.0`"
+        feedback: Far too strong. Every seen token, including "B-6", "the" and "valve", becomes very unlikely, and the text turns odd. Typical values are 1.1-1.3.
+      - text: "Sampling with a moderate temperature plus a mild `repetition_penalty` around 1.1-1.2, verified on held-out notes"
+        correct: true
+        feedback: Right. A mild penalty discourages loops while still allowing a needed repeat when the model is confident, and sampling breaks the feedback cycle. Verify that part codes still come through.
+      - text: "Lower the temperature to 0.1 for more accurate notes"
+        feedback: That moves towards greedy decoding, which is the usual **cause** of loops.
+    hint: Which options would stop the note from mentioning B-6 a second time?
+
+  - id: fix-loop
+    type: sequential
+    title: "Mission: stop the autocomplete from looping"
+    xp: 200
+    timeout: 180
+    context: |
+      **Mission.** Crew complain that ORBIT's log autocomplete repeats itself. Measure the loop, rule out
+      the cheap fixes that do not work, find settings that do, and prove they hold on prompts you did not tune on.
+
+      Loaded: `prompts` (3 tuning prompts), `held_out` (3 other prompts), and three helpers.
+      `continue_text(prompt, seed=0, **settings)` returns exactly 40 new token ids from DistilGPT2, passing
+      `settings` to `model.generate`. `repeated_ngram_rate(ids)` is the metric you wrote, and
+      `fluency(prompt, ids)` returns the mean NLL per token (lower is more fluent; word salad scores 8+).
+      `tok` decodes ids, and `np` is imported.
+    pre_code: |
+      import numpy as np
+      from kits.nlp_transformers import continue_text, repeated_ngram_rate, fluency, load_gpt2
+      tok, _model = load_gpt2()
+      prompts = ["The crew of the space station", "Today in the hydroponics lab we", "The commander announced that"]
+      held_out = ["Engineers on the station checked the", "My favourite meal in space is", "The airlock alarm went off because"]
+      def score(settings, prompt_list, seed=0):
+          outs = [continue_text(p, seed=seed, **settings) for p in prompt_list]
+          rep = float(np.mean([repeated_ngram_rate(o) for o in outs]))
+          nll = float(np.mean([fluency(p, o) for p, o in zip(prompt_list, outs)]))
+          return rep, nll
+    steps:
+      - instructions:
+          - "**Measure.** Generate greedily (`continue_text(p)` with no settings) for each prompt in `prompts`. Store the three repetition rates in `greedy_rates` and their mean in `baseline`."
+          - "Print the decoded first output with `tok.decode(...)` to see the symptom."
+        hint: "`outs = [continue_text(p) for p in prompts]`, then `[repeated_ngram_rate(o) for o in outs]`."
+        sample_code: |
+          outs = [____ for p in prompts]
+          greedy_rates = ____
+          baseline = ____
+          print(repr(tok.decode(outs[0])))
+          print(f"mean repeated-trigram rate: {baseline:.2f}")
+        solution: |
+          outs = [continue_text(p) for p in prompts]
+          greedy_rates = [repeated_ngram_rate(o) for o in outs]
+          baseline = float(np.mean(greedy_rates))
+          print(repr(tok.decode(outs[0])))
+          print(f"mean repeated-trigram rate: {baseline:.2f}")
+        tests: |
+          check_equal("greedy_rates", msg="`greedy_rates` should hold `repeated_ngram_rate` of the greedy output for each of the 3 prompts.")
+          check_equal("baseline", msg="`baseline` is the mean of `greedy_rates`.")
+      - instructions:
+          - "**Diagnose.** Use `score(settings, prompts)`, which returns `(mean repetition, mean NLL)`. Store the score of sampling alone, `{\"do_sample\": True, \"temperature\": 0.8, \"top_p\": 0.9, \"top_k\": 0}`, in `sampling_only`."
+          - "Store the score of a very hot setting, `{\"do_sample\": True, \"temperature\": 1.6, \"top_k\": 0}`, in `too_hot`."
+        hint: "`sampling_only = score({...}, prompts)`. Look at both numbers in each tuple."
+        sample_code: |
+          sampling_only = score(____, prompts)
+          too_hot = score(____, prompts)
+          print(f"greedy rep {baseline:.2f}")
+          print(f"sampling only: rep {sampling_only[0]:.2f}, NLL {sampling_only[1]:.1f}")
+          print(f"too hot:       rep {too_hot[0]:.2f}, NLL {too_hot[1]:.1f}")
+        solution: |
+          sampling_only = score({"do_sample": True, "temperature": 0.8, "top_p": 0.9, "top_k": 0}, prompts)
+          too_hot = score({"do_sample": True, "temperature": 1.6, "top_k": 0}, prompts)
+          print(f"greedy rep {baseline:.2f}")
+          print(f"sampling only: rep {sampling_only[0]:.2f}, NLL {sampling_only[1]:.1f}")
+          print(f"too hot:       rep {too_hot[0]:.2f}, NLL {too_hot[1]:.1f}")
+        tests: |
+          s = check_object("sampling_only")
+          assert abs(s[0] - sol["sampling_only"][0]) < 1e-9 and abs(s[1] - sol["sampling_only"][1]) < 1e-6, "`sampling_only` should be score({'do_sample': True, 'temperature': 0.8, 'top_p': 0.9, 'top_k': 0}, prompts)."
+          h = check_object("too_hot")
+          assert abs(h[0] - sol["too_hot"][0]) < 1e-9 and abs(h[1] - sol["too_hot"][1]) < 1e-6, "`too_hot` should be score({'do_sample': True, 'temperature': 1.6, 'top_k': 0}, prompts)."
+      - instructions:
+          - "**Fix.** Sampling alone still repeats, and heat alone ruins fluency. Choose `settings` (a dict for `generate`) so that on `prompts` the mean repetition is **at most 0.05** and the mean NLL is **at most 4.0**."
+          - "Store `score(settings, prompts)` in `tuned` and print it."
+        hint: "Combine moderate sampling with a mild penalty, for example `{\"do_sample\": True, \"temperature\": 0.7, \"top_p\": 0.9, \"top_k\": 0, \"repetition_penalty\": 1.2}`. `no_repeat_ngram_size=3` also works here, with the trade-offs from the slides."
+        sample_code: |
+          settings = {"do_sample": True, "temperature": 0.7, "top_p": 0.9, "top_k": 0, ____}
+          tuned = score(settings, prompts)
+          print(f"rep {tuned[0]:.2f}, NLL {tuned[1]:.1f}")
+        solution: |
+          settings = {"do_sample": True, "temperature": 0.7, "top_p": 0.9, "top_k": 0, "repetition_penalty": 1.2}
+          tuned = score(settings, prompts)
+          print(f"rep {tuned[0]:.2f}, NLL {tuned[1]:.1f}")
+        tests: |
+          st = check_object("settings")
+          assert isinstance(st, dict), "`settings` should be a dict of keyword arguments for `generate`."
+          rep, nll = user["score"](st, user["prompts"])
+          assert rep <= 0.05, f"With your settings the mean repetition on `prompts` is {rep:.2f}; it must be at most 0.05. Add a mild repetition_penalty (1.1-1.3) or an n-gram ban."
+          assert nll <= 4.0, f"Mean NLL is {nll:.1f}, so the text is losing fluency (limit 4.0). Lower the temperature or the penalty."
+          t = check_object("tuned")
+          assert abs(t[0] - rep) < 1e-9 and abs(t[1] - nll) < 1e-6, "`tuned` should be `score(settings, prompts)`."
+      - instructions:
+          - "**Verify.** Score `settings` on `held_out` with `seed=1` (prompts and seed you did not tune on) and store it in `verified`."
+          - "Store `True` in `passed` if repetition is at most 0.1 and NLL at most 4.5 there, and print the before and after numbers."
+        hint: "`verified = score(settings, held_out, seed=1)`, then `passed = verified[0] <= 0.1 and verified[1] <= 4.5`."
+        sample_code: |
+          verified = ____
+          passed = ____
+          print(f"tuning set: greedy rep {baseline:.2f} -> {tuned[0]:.2f}")
+          print(f"held out:   rep {verified[0]:.2f}, NLL {verified[1]:.1f}, passed={passed}")
+        solution: |
+          verified = score(settings, held_out, seed=1)
+          passed = verified[0] <= 0.1 and verified[1] <= 4.5
+          print(f"tuning set: greedy rep {baseline:.2f} -> {tuned[0]:.2f}")
+          print(f"held out:   rep {verified[0]:.2f}, NLL {verified[1]:.1f}, passed={passed}")
+        tests: |
+          v = check_object("verified")
+          rep, nll = user["score"](user["settings"], user["held_out"], seed=1)
+          assert abs(v[0] - rep) < 1e-9 and abs(v[1] - nll) < 1e-6, "`verified` should be `score(settings, held_out, seed=1)`."
+          assert rep <= 0.1, f"On held-out prompts repetition is {rep:.2f} (limit 0.1). Your settings were fitted to the tuning prompts; make the fix a little stronger."
+          assert nll <= 4.5, f"On held-out prompts NLL is {nll:.1f} (limit 4.5). Your settings make the text less fluent; back off temperature or penalty."
+          check_equal("passed", True, msg="`passed` should be True when the held-out repetition is at most 0.1 and NLL at most 4.5.")
+    success_msg: Mission complete. Repetition is down from about 0.4 to near zero, fluency stays healthy, and the held-out prompts confirm it. Write the settings and these numbers into the config's changelog.

@@ -1,0 +1,164 @@
+# Sample lesson: shows every exercise type. The lesson builder can use it as a reference.
+title: First steps in Python
+description: Use Python as a calculator, store results in variables and meet the basic types.
+exercises:
+  - id: intro
+    type: video
+    title: Python as a calculator
+    slides: |
+      # Python as a calculator
+
+      Python reads your script **top to bottom** and runs each line.
+
+      ```python
+      print(7 + 3)    # 10
+      print(2 ** 10)  # 1024
+      ```
+
+      ---
+
+      ## The operators you will use most
+
+      | operator | meaning | example | result |
+      | --- | --- | --- | --- |
+      | `+ - * /` | the usual four | `9 / 2` | `4.5` |
+      | `//` | floor division | `9 // 2` | `4` |
+      | `%` | remainder | `9 % 2` | `1` |
+      | `**` | power | `3 ** 2` | `9` |
+
+      ---
+
+      ## Variables
+
+      A variable is a **name for a value**. Assign with `=`:
+
+      ```python
+      height = 1.79
+      weight = 68.7
+      bmi = weight / height ** 2
+      ```
+
+      Now `bmi` holds $\frac{68.7}{1.79^2} \approx 21.4$, and you can reuse it.
+
+  - id: savings
+    type: coding
+    title: Compound interest
+    context: |
+      You put **100** into a savings account that pays **10%** interest a year.
+      After one year you have `100 * 1.1`. After two years, `100 * 1.1 * 1.1`, or `100 * 1.1 ** 2`.
+    instructions:
+      - Create a variable `savings` equal to `100`.
+      - Create `growth` equal to `1.1`.
+      - Calculate what you have after **7 years** and store it in `result`.
+      - Print `result`.
+    hint: Raise `growth` to the power of 7 with `growth ** 7`, then multiply by `savings`.
+    pre_code: ""
+    sample_code: |
+      # Starting amount and yearly growth
+      savings = ____
+      growth = ____
+
+      # Amount after 7 years
+      result = ____
+
+      # Show it
+      print(____)
+    solution: |
+      # Starting amount and yearly growth
+      savings = 100
+      growth = 1.1
+
+      # Amount after 7 years
+      result = savings * growth ** 7
+
+      # Show it
+      print(result)
+    tests: |
+      check_equal("savings")
+      check_equal("growth")
+      check_equal("result", msg="`result` should be `savings * growth ** 7`.")
+      check_output_contains("194.87", msg="Print `result` so you can see the answer.")
+    success_msg: Nice. Money nearly doubles in 7 years at 10% a year.
+
+  - id: types-quiz
+    type: mc
+    title: What type is it?
+    question: |
+      After running `x = 10 / 2`, what is `type(x)`?
+    context: Use the console on the right to check before you answer.
+    pre_code: |
+      x = 10 / 2
+    options:
+      - text: "`int`"
+        feedback: "Close, but `/` always returns a float in Python 3, even when the result is whole. Try `type(x)` in the console."
+      - text: "`float`"
+        correct: true
+        feedback: "Right. `/` is true division and always gives a `float`. Use `//` if you want an `int`."
+      - text: "`str`"
+        feedback: "No quotes were involved, so it is a number, not a string."
+    hint: Run `print(type(x))` in the console.
+
+  - id: classify-types
+    type: classify
+    title: Sort the values by type
+    prompt: Put each value in the group of its Python type.
+    hint: Quotes make a string. A decimal point makes a float. `True` and `False` are booleans.
+    zones: [int, float, str, bool]
+    items:
+      - { text: "42", zone: int }
+      - { text: "-7", zone: int }
+      - { text: "3.14", zone: float }
+      - { text: "2.0", zone: float }
+      - { text: "\"hello\"", zone: str }
+      - { text: "\"42\"", zone: str }
+      - { text: "True", zone: bool }
+      - { text: "False", zone: bool }
+
+  - id: order-bmi
+    type: parsons
+    title: Arrange the BMI script
+    prompt: |
+      Put the lines in order so the script computes a body mass index and prints a message
+      only when it is above 25. Indent the line that belongs inside the `if`.
+    hint: Variables must exist before you use them, and the `print` belongs inside the `if` block.
+    lines:
+      - "height = 1.79"
+      - "weight = 82.0"
+      - "bmi = weight / height ** 2"
+      - "if bmi > 25:"
+      - "    print('above 25')"
+
+  - id: trip-budget
+    type: sequential
+    title: Plan a trip budget
+    context: |
+      You are planning a 5-day trip. Build the budget one step at a time; each step can use
+      the variables from the steps before it.
+    pre_code: |
+      days = 5
+    steps:
+      - instructions:
+          - "Hotels cost `120` a night for `days - 1` nights. Store the total in `hotel`."
+        hint: "`120 * (days - 1)`"
+        sample_code: |
+          hotel = ____
+        solution: |
+          hotel = 120 * (days - 1)
+        tests: |
+          check_equal("hotel")
+      - instructions:
+          - "Food is `45` a day. Store `food` for all `days`."
+          - "Add `hotel` and `food` into `total` and print it."
+        hint: "`food = 45 * days`, then `total = hotel + food`."
+        sample_code: |
+          food = ____
+          total = ____
+          print(total)
+        solution: |
+          food = 45 * days
+          total = hotel + food
+          print(total)
+        tests: |
+          check_equal("food")
+          check_equal("total")
+          check_output_contains("705")

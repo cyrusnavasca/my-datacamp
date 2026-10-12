@@ -1,0 +1,30 @@
+title: Feature Engineering and Model Evaluation
+description: 'Turn raw data into good features and evaluate models honestly: leakage, imbalance, validation
+  strategies and metrics that match the goal.'
+level: intermediate
+est_hours: 4
+prerequisites:
+- supervised-learning
+objectives:
+- Engineer numeric, categorical, date and text features
+- Spot and prevent data leakage
+- Handle class imbalance
+- Choose metrics and validation schemes that fit the problem
+requires: []
+chapters:
+- id: features
+  title: Creating features
+  description: Encoding, binning, interactions and date features.
+  lessons: []
+- id: leakage
+  title: Leakage and validation
+  description: Time-based splits, group k-fold and leakage traps.
+  lessons: []
+- id: imbalance
+  title: Imbalanced data
+  description: Resampling, class weights, precision/recall trade-offs.
+  lessons: []
+- id: metrics
+  title: Choosing metrics
+  description: Calibration, thresholds and business-aligned metrics.
+  lessons: []

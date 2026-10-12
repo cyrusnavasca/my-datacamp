@@ -1,0 +1,277 @@
+title: Retries with backoff
+description: Which errors to retry, exponential backoff with jitter built by hand, surviving a chaos monkey, and how retries multiply into storms.
+exercises:
+  - id: retries-backoff-slides
+    type: video
+    title: Try again, but politely
+    slides: |
+      # Not every error deserves a retry
+
+      | status | meaning | retry? |
+      | --- | --- | --- |
+      | **429** `rate_limit_error` | you sent too much, too fast | yes, after `retry-after` |
+      | **529** `overloaded_error` | the provider is overloaded | yes, with longer backoff, or fall back |
+      | **500** `api_error` | a server-side fault | yes, a few times |
+      | timeout, connection reset | no answer came back | yes, if repeating it is safe |
+      | **400** `invalid_request_error` | your request is wrong (missing field, bad roles) | **no**: it will fail the same way; fix the code |
+      | **401 / 403** | bad key, no permission | **no** |
+      | **413** | the request is too large | **no**: shrink it |
+
+      Retrying a 400 just burns time and quota, and hides the real bug.
+
+      ---
+
+      ## Exponential backoff with jitter
+
+      Wait longer after each failure, up to a cap: $\text{ceiling} = \min(\text{cap},\ \text{base} \times 2^{\text{attempt}})$.
+
+      **Jitter** picks a random wait below that ceiling ("full jitter": `uniform(0, ceiling)`). Without it, the 200
+      clients that all hit a 429 at 14:02:00.0 all retry at 14:02:00.5, then all at 14:02:01.5, and the bursts never
+      end. Jitter spreads them out.
+
+      ```
+      attempt     0     1     2     3     4     5
+      ceiling   0.5s   1s    2s    4s    8s    8s     (base 0.5 s, cap 8 s)
+      ```
+
+      If the error carries `retry-after`, wait **at least** that long. The server is telling you when it will have room.
+
+      ---
+
+      ## The retry loop
+
+      ```python
+      RETRYABLE = (anthropic.RateLimitError, anthropic.OverloadedError,      # 429, 529
+                   anthropic.InternalServerError, anthropic.APIConnectionError)  # 5xx, timeouts, resets
+
+      def call_with_retry(max_attempts=6, **kwargs):
+          for attempt in range(max_attempts):
+              try:
+                  return client.messages.create(**kwargs)
+              except RETRYABLE as e:
+                  if attempt == max_attempts - 1:
+                      raise                                   # out of attempts: let the caller degrade
+                  delay = backoff_delay(attempt)
+                  retry_after = getattr(e, "retry_after", None)   # aikit; with the SDK read e.response.headers
+                  if retry_after:
+                      delay = max(delay, retry_after)
+                  time.sleep(delay)
+      ```
+
+      The real SDK **already retries** 429s, 5xx and connection errors with backoff (`max_retries`, default 2):
+      `anthropic.Anthropic(max_retries=5)`, or `client.with_options(max_retries=0)` to turn it off and use your own loop.
+
+      ---
+
+      ## Retry storms
+
+      Retries multiply across layers. If the web handler, the orchestrator and the SDK each retry 3 times, one crew
+      question can cause $(1+3)^3 = 64$ API calls during an outage, aimed at a service that is already overloaded.
+
+      - Retry at **one** layer; set the others to zero.
+      - Keep a **retry budget**: for example, retries may add at most 10% to traffic; above that, fail fast or fall back.
+      - Retry only **idempotent** work. Re-running `send_message` after a timeout may send the message twice: use an
+        idempotency key, or check whether the first attempt went through.
+
+      ---
+
+      ## Trade-off: how hard to retry
+
+      | setting | higher means | lower means |
+      | --- | --- | --- |
+      | `max_attempts` | more requests eventually succeed | users get a fast, clear failure (and you can fall back) |
+      | `base` | less load on a struggling service | faster recovery from one-off blips |
+      | `cap` | patient for long outages | bounded worst-case latency |
+      | jitter | spreads synchronised clients | (no jitter: simpler, but herds) |
+
+      A chat user will not wait 60 s. An overnight batch job will. Size the retry policy to who is waiting.
+
+  - id: retryable
+    type: classify
+    title: Retry or fix the request?
+    prompt: ORBIT's error log from last week. Sort each error by what the client should do.
+    hint: Would sending exactly the same request again, a little later, plausibly succeed?
+    zones: [Retry with backoff, "Don't retry: fix the request"]
+    items:
+      - { text: "429 rate_limit_error: too many requests", zone: Retry with backoff }
+      - { text: "529 overloaded_error: the API is temporarily overloaded", zone: Retry with backoff }
+      - { text: "500 api_error: internal server error", zone: Retry with backoff }
+      - { text: The request timed out with no response, zone: Retry with backoff }
+      - { text: Connection reset while sending, zone: Retry with backoff }
+      - { text: "400 max_tokens: field required", zone: "Don't retry: fix the request" }
+      - { text: "400 messages.0: the first message must use the 'user' role", zone: "Don't retry: fix the request" }
+      - { text: "400 tool_use ids need a matching tool_result block", zone: "Don't retry: fix the request" }
+      - { text: "401 invalid x-api-key", zone: "Don't retry: fix the request" }
+      - { text: "413 request too large", zone: "Don't retry: fix the request" }
+
+  - id: backoff-delay
+    type: coding
+    title: Exponential backoff with jitter
+    context: |
+      You need the wait time before retry number `attempt` (0 for the first retry). Use "full jitter": a uniform random
+      wait between 0 and the exponential ceiling.
+    instructions:
+      - "Write `ceiling(attempt, base=0.5, cap=8.0)`: `base * 2 ** attempt`, but never more than `cap`."
+      - "Write `backoff_delay(attempt, base=0.5, cap=8.0, rng=random)`: a uniform random number between 0 and `ceiling(attempt, base, cap)`, drawn with `rng.uniform`."
+      - "Store `ceilings`: the ceilings for attempts 0 to 6."
+    hint: |
+      `min(cap, base * 2 ** attempt)` and `rng.uniform(0, ceiling(attempt, base, cap))`.
+    pre_code: |
+      import random
+    sample_code: |
+      def ceiling(attempt, base=0.5, cap=8.0):
+          return ____
+
+      def backoff_delay(attempt, base=0.5, cap=8.0, rng=random):
+          return ____
+
+      ceilings = [ceiling(a) for a in range(7)]
+      print(ceilings)
+      print([round(backoff_delay(a), 2) for a in range(7)])
+    solution: |
+      def ceiling(attempt, base=0.5, cap=8.0):
+          return min(cap, base * 2 ** attempt)
+
+      def backoff_delay(attempt, base=0.5, cap=8.0, rng=random):
+          return rng.uniform(0, ceiling(attempt, base, cap))
+
+      ceilings = [ceiling(a) for a in range(7)]
+      print(ceilings)
+      print([round(backoff_delay(a), 2) for a in range(7)])
+    tests: |
+      import random
+      check_equal("ceilings", msg="`ceilings` should be [0.5, 1, 2, 4, 8, 8, 8]: base * 2**attempt, capped at 8.")
+      bd = user["backoff_delay"]
+      rng = random.Random(1)
+      for a in range(7):
+          top = min(8.0, 0.5 * 2 ** a)
+          xs = [bd(a, rng=rng) for _ in range(2000)]
+          assert min(xs) >= 0 and max(xs) <= top + 1e-9, f"For attempt {a}, waits must stay between 0 and {top}; got {min(xs):.3f} to {max(xs):.3f}."
+          mean = sum(xs) / len(xs)
+          assert abs(mean - top / 2) < 0.1 * top, f"For attempt {a}, the mean wait should be about {top / 2} (uniform between 0 and {top}); got {mean:.3f}. Draw with `rng.uniform(0, ceiling)`."
+      assert bd(3, base=1.0, cap=5.0, rng=random.Random(2)) <= 5.0, "`backoff_delay` must pass `base` and `cap` on to `ceiling`."
+    success_msg: |
+      The ceiling doubles until it hits the cap, and jitter spreads each wait across the whole range below it, so a
+      crowd of clients that failed together will retry at different moments.
+
+  - id: chaos-retry
+    type: coding
+    title: "Chaos monkey: survive 30% failures"
+    context: |
+      The chaos monkey is on: `client` fails 30% of calls with 429, 529 or 500 errors. Each 429 carries
+      `retry_after = 1.0` seconds. `clk` is the virtual clock: sleep with `clk.sleep(seconds)`, never `time.sleep`.
+      `backoff_delay` and `RETRYABLE` (the retryable error classes) are ready.
+    instructions:
+      - "Complete `call_with_retry(max_attempts=6, **kwargs)`: on a `RETRYABLE` error, re-raise if it was the last attempt; otherwise wait `backoff_delay(attempt)`, or `e.retry_after` if that is longer, using `clk.sleep`."
+      - "Do not catch other errors: a `BadRequestError` must reach the caller at once."
+      - "Send the 50 requests in the loop (already written). All 50 must succeed."
+    hint: |
+      `except RETRYABLE as e:` then `if attempt == max_attempts - 1: raise`. Compute `delay = backoff_delay(attempt)`
+      and `if e.retry_after: delay = max(delay, e.retry_after)`, then `clk.sleep(delay)`.
+    pre_code: |
+      import random
+      from kits.llmops_production import (make_client, VirtualClock, SMALL, SYSTEM, CONCISE, EVAL,
+                                          RateLimitError, OverloadedError, InternalServerError, APITimeoutError, BadRequestError)
+      clk = VirtualClock()
+      client = make_client(clock=clk, fail_rate=0.3, fail_with=("rate_limit", "overloaded", "server"), seed=7)
+      RETRYABLE = (RateLimitError, OverloadedError, InternalServerError, APITimeoutError)
+
+      def backoff_delay(attempt, base=0.5, cap=8.0, rng=random):
+          return rng.uniform(0, min(cap, base * 2 ** attempt))
+    sample_code: |
+      def call_with_retry(max_attempts=6, **kwargs):
+          for attempt in range(max_attempts):
+              try:
+                  return client.messages.create(**kwargs)
+              except RETRYABLE as e:
+                  if ____:
+                      raise
+                  delay = ____
+                  if e.retry_after:
+                      delay = ____
+                  ____
+
+      results = []
+      for i in range(50):
+          q = EVAL[i % len(EVAL)]["question"]
+          results.append(call_with_retry(model=SMALL, max_tokens=300, system=SYSTEM + "\n" + CONCISE,
+                                         messages=[{"role": "user", "content": q}]))
+
+      errors = [c["error"] for c in client.calls if c["error"]]
+      print(f"{len(results)} answered with {len(client.calls)} calls; {len(errors)} failures survived")
+      print(f"waited {sum(clk.sleeps):.1f} s in total over {len(clk.sleeps)} retries")
+    solution: |
+      def call_with_retry(max_attempts=6, **kwargs):
+          for attempt in range(max_attempts):
+              try:
+                  return client.messages.create(**kwargs)
+              except RETRYABLE as e:
+                  if attempt == max_attempts - 1:
+                      raise
+                  delay = backoff_delay(attempt)
+                  if e.retry_after:
+                      delay = max(delay, e.retry_after)
+                  clk.sleep(delay)
+
+      results = []
+      for i in range(50):
+          q = EVAL[i % len(EVAL)]["question"]
+          results.append(call_with_retry(model=SMALL, max_tokens=300, system=SYSTEM + "\n" + CONCISE,
+                                         messages=[{"role": "user", "content": q}]))
+
+      errors = [c["error"] for c in client.calls if c["error"]]
+      print(f"{len(results)} answered with {len(client.calls)} calls; {len(errors)} failures survived")
+      print(f"waited {sum(clk.sleeps):.1f} s in total over {len(clk.sleeps)} retries")
+    tests: |
+      check_object("results")
+      res = user["results"]
+      assert len(res) == 50 and all(getattr(r, "content", None) for r in res), "All 50 requests should return a reply. Retry on RETRYABLE errors until one succeeds."
+      calls, sleeps = user["client"].calls, user["clk"].sleeps
+      errs = [c for c in calls if c["error"]]
+      assert len(sleeps) == len(errs), f"There were {len(errs)} failed calls but {len(sleeps)} sleeps. Sleep once after each failure (and never after a success)."
+      streak, k = 0, 0
+      for c in calls:
+          if c["error"]:
+              top = min(8.0, 0.5 * 2 ** streak)
+              s = sleeps[k]
+              if c["error"] == "rate_limit":
+                  assert s >= 1.0 - 1e-9, f"Retry {k + 1} followed a 429 with retry_after=1.0 but waited only {s:.2f} s. Wait at least `e.retry_after`."
+                  assert s <= max(top, 1.0) + 1e-9, f"Retry {k + 1} waited {s:.2f} s; for retry attempt {streak} it should be at most max({top}, retry_after)."
+              else:
+                  assert s <= top + 1e-9, f"Retry {k + 1} waited {s:.2f} s, but for retry attempt {streak} of that request the ceiling is {top} s. Use `backoff_delay(attempt)`."
+              streak, k = streak + 1, k + 1
+          else:
+              streak = 0
+      assert len(set(round(s, 6) for s in sleeps)) > 5, "All your waits are the same: add jitter with `backoff_delay`."
+      import aikit
+      before = len(sleeps)
+      try:
+          user["call_with_retry"](model="claude-haiku-4-5", max_tokens=0, messages=[{"role": "user", "content": "hi"}])
+          raised = False
+      except aikit.BadRequestError:
+          raised = True
+      assert raised, "A BadRequestError (max_tokens=0) should reach the caller: only catch RETRYABLE errors."
+      assert len(user["clk"].sleeps) == before, "Your loop slept after a BadRequestError. A 400 will fail the same way every time: do not retry it."
+    success_msg: |
+      All 50 crew questions answered while about a third of the calls failed. Each retry waited longer, with jitter,
+      and 429s waited at least as long as the server asked. The price: extra calls and several seconds of added
+      latency on the unlucky requests, which is what your p95 will show.
+
+  - id: retry-amplification
+    type: mc
+    title: How many calls did that outage cost?
+    question: |
+      ORBIT's web handler retries a failed answer 3 times. Inside it, the orchestrator retries each LLM call 3 times,
+      and the SDK underneath has `max_retries=3`. The API returns 529 for ten minutes. In the worst case, how many API
+      calls can **one** crew question cause, and what should you change?
+    options:
+      - text: 9 calls (3 + 3 + 3). Fine as it is.
+        feedback: The layers multiply, they do not add. Each orchestrator attempt runs the SDK's whole retry loop, and each handler attempt runs the orchestrator's.
+      - text: 27 calls (3 × 3 × 3). Lower the SDK to 2 retries.
+        feedback: Close, but each layer makes 1 first try plus 3 retries, so 4 attempts. And trimming one layer slightly does not fix the structure.
+      - text: 64 calls (4 × 4 × 4). Retry at one layer only, and add a retry budget so an outage leads to failing fast or falling back.
+        correct: true
+        feedback: "Right. 4 attempts per layer, multiplied across 3 layers, is 64 calls per question, all aimed at a service that is already overloaded, which keeps it overloaded. Pick one layer to retry (often the SDK), set the others to 0, cap retries as a share of traffic, and fall back (next lesson) when the budget is spent."
+      - text: 4 calls. Retries never stack because the SDK handles them.
+        feedback: The SDK handles its own retries, but your code above it does not know that and retries the whole thing again.
+    hint: Each layer makes one first attempt plus its retries, and it does that for every attempt of the layer above.

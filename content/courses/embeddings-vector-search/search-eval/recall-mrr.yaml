@@ -1,0 +1,232 @@
+title: Recall@k, MRR and nDCG
+description: The metrics that say whether search works. Compute them by hand, choose the one that matches how results are used, and spot a metric that has stopped telling you anything.
+exercises:
+  - id: recall-mrr-slides
+    type: video
+    title: Measuring a ranking
+    slides: |
+      # What "good search" means
+
+      For each labelled query you know the **relevant** docs; the system returns a **ranking**. Score each query, then
+      average over queries.
+
+      | metric | per query | answers the question |
+      | --- | --- | --- |
+      | hit@k | 1 if **any** relevant doc is in the top k | "did we find something useful?" |
+      | recall@k | relevant docs in the top k ÷ all relevant docs | "did we find **everything** needed?" |
+      | precision@k | relevant docs in the top k ÷ k | "how much of what we pass on is noise?" |
+      | reciprocal rank | 1 / rank of the first relevant doc (0 if none) | "how high is the first good result?" |
+
+      **MRR** is the mean reciprocal rank over queries. With one relevant doc, hit@k and recall@k are the same thing.
+
+      ---
+
+      ## A worked example
+
+      Ranking `[a, b, c, d, e]`, relevant `{c, e}`:
+
+      | metric | value |
+      | --- | --- |
+      | hit@3 | 1 (c is at rank 3) |
+      | recall@3 | 1/2 (c found, e at rank 5 isn't) |
+      | precision@3 | 1/3 |
+      | reciprocal rank | 1/3 |
+
+      **nDCG@k** handles graded relevance (e.g. 2 = answers it, 1 = related): each result earns
+      $\frac{\text{gain}}{\log_2(\text{rank} + 1)}$; sum over the top k (DCG), then divide by the best possible
+      DCG for that query (ideal ordering), so it lands in 0..1.
+
+      $$\text{nDCG@}k = \frac{\sum_{i=1}^{k} g_i / \log_2(i+1)}{\text{same sum for the ideal ranking}}$$
+
+      ---
+
+      ## Pick the metric that matches how results are used
+
+      | how results are used | metric |
+      | --- | --- |
+      | the top k chunks go into an LLM prompt; one doc answers the question | hit@k with **that** k |
+      | multi-hop questions need several docs | recall@k |
+      | a human reads the list top-down | MRR or nDCG |
+      | relevance has degrees (exact answer vs background) | nDCG@k |
+      | every extra chunk costs tokens or distracts the model | also precision@k |
+
+      Set k to what the system **actually** uses. If ORBIT passes 5 chunks, recall@50 is a vanity number.
+
+      ---
+
+      ## Pitfalls
+
+      - **Saturation:** when every system scores 1.0 at your k, the metric can't tell them apart. Use a smaller k, MRR,
+        or harder queries.
+      - **Duplicates:** deduplicate chunks to documents before scoring doc-level metrics, or one doc counts three times.
+      - **Unanswerable queries** have no relevant docs: recall is undefined. Leave them out of retrieval metrics and
+        measure refusals separately.
+      - **Averages hide types:** always break the numbers down by query type (you did this in chapter 2).
+
+  - id: metrics-by-hand
+    type: coding
+    title: Retrieval metrics by hand
+    context: |
+      `ranked` holds the doc rankings ORBIT returned for three crew questions, and `relevant` the set of correct doc ids
+      for each. `gains` gives graded relevance for the second question (2 = answers it, 1 = related). `np` is imported.
+    instructions:
+      - "Write `hit_at_k(ranked, relevant, k)`, `recall_at_k(ranked, relevant, k)` and `reciprocal_rank(ranked, relevant)` (ranks start at 1, return 0.0 if nothing relevant is found)."
+      - "Write `ndcg_at_k(ranked, gains, k)` where `gains` is a dict `{doc_id: gain}` (missing docs have gain 0). Use $\\log_2(\\text{rank}+1)$ discounts and divide by the DCG of the ideal ordering."
+      - "Store the mean hit@3, mean recall@3 and MRR over the three questions in `mean_hit3`, `mean_recall3` and `mrr`, and `ndcg_at_k(ranked[1], gains, 3)` in `ndcg_q2`."
+    hint: |
+      `recall_at_k`: `len(set(ranked[:k]) & set(relevant)) / len(relevant)`.
+      `reciprocal_rank`: loop with `enumerate(ranked, start=1)`, return `1 / i` at the first relevant doc.
+      nDCG: `dcg = sum(gains.get(d, 0) / np.log2(i + 1) for i, d in enumerate(ranked[:k], start=1))`, and the ideal is
+      the same sum over `sorted(gains.values(), reverse=True)[:k]`.
+    pre_code: |
+      import numpy as np
+      ranked = [
+          ["co2-scrubbers", "power-systems", "incident-2026-scrubber-fault", "thermal-control", "glossary"],
+          ["crew-roster", "lab-booking-policy", "modules-map", "sample-handling", "med-bay-access"],
+          ["daily-schedule", "galley-and-meals", "crew-quarters", "comms-windows", "station-overview"],
+      ]
+      relevant = [
+          {"incident-2026-scrubber-fault"},
+          {"lab-booking-policy", "med-bay-access"},
+          {"exercise-requirements"},
+      ]
+      gains = {"lab-booking-policy": 2, "med-bay-access": 1}
+    sample_code: |
+      def hit_at_k(ranked, relevant, k):
+          return ____
+
+      def recall_at_k(ranked, relevant, k):
+          return ____
+
+      def reciprocal_rank(ranked, relevant):
+          for i, doc in enumerate(ranked, start=1):
+              if ____:
+                  return ____
+          return 0.0
+
+      def ndcg_at_k(ranked, gains, k):
+          dcg = ____
+          ideal = sorted(gains.values(), reverse=True)[:k]
+          idcg = ____
+          return dcg / idcg if idcg else 0.0
+
+      mean_hit3 = np.mean([hit_at_k(r, g, 3) for r, g in zip(ranked, relevant)])
+      mean_recall3 = ____
+      mrr = ____
+      ndcg_q2 = ____
+      print(mean_hit3, mean_recall3, mrr, round(ndcg_q2, 3))
+    solution: |
+      def hit_at_k(ranked, relevant, k):
+          return float(any(d in relevant for d in ranked[:k]))
+
+      def recall_at_k(ranked, relevant, k):
+          return len(set(ranked[:k]) & set(relevant)) / len(relevant)
+
+      def reciprocal_rank(ranked, relevant):
+          for i, doc in enumerate(ranked, start=1):
+              if doc in relevant:
+                  return 1 / i
+          return 0.0
+
+      def ndcg_at_k(ranked, gains, k):
+          dcg = sum(gains.get(d, 0) / np.log2(i + 1) for i, d in enumerate(ranked[:k], start=1))
+          ideal = sorted(gains.values(), reverse=True)[:k]
+          idcg = sum(g / np.log2(i + 1) for i, g in enumerate(ideal, start=1))
+          return dcg / idcg if idcg else 0.0
+
+      mean_hit3 = np.mean([hit_at_k(r, g, 3) for r, g in zip(ranked, relevant)])
+      mean_recall3 = np.mean([recall_at_k(r, g, 3) for r, g in zip(ranked, relevant)])
+      mrr = np.mean([reciprocal_rank(r, g) for r, g in zip(ranked, relevant)])
+      ndcg_q2 = ndcg_at_k(ranked[1], gains, 3)
+      print(mean_hit3, mean_recall3, mrr, round(ndcg_q2, 3))
+    tests: |
+      from kits.embeddings_vector_search import hit_at_k as H, recall_at_k as R, reciprocal_rank as RR, ndcg_at_k as N
+      cases = [(list("abcde"), {"c", "e"}), (list("abcde"), {"z"}), (list("abcde"), {"a"}), (list("xyz"), {"y", "q", "z"})]
+      fh, fr, frr, fn = check_object("hit_at_k"), check_object("recall_at_k"), check_object("reciprocal_rank"), check_object("ndcg_at_k")
+      for rk, rel in cases:
+          for k in [1, 3]:
+              assert abs(float(fh(rk, rel, k)) - H(rk, rel, k)) < 1e-9, f"hit_at_k({rk}, {rel}, {k}) should be {H(rk, rel, k)}."
+              assert abs(float(fr(rk, rel, k)) - R(rk, rel, k)) < 1e-9, f"recall_at_k({rk}, {rel}, {k}) should be {R(rk, rel, k):.3f}: found relevant in the top k divided by all relevant."
+          assert abs(float(frr(rk, rel)) - RR(rk, rel)) < 1e-9, f"reciprocal_rank({rk}, {rel}) should be {RR(rk, rel):.3f}."
+      g = {"b": 1, "e": 2, "q": 3}
+      for k in [2, 3, 5]:
+          assert abs(float(fn(list("abcde"), g, k)) - N(list("abcde"), g, k)) < 1e-9, f"ndcg_at_k(['a'..'e'], {g}, {k}) should be {N(list('abcde'), g, k):.4f}. The ideal DCG uses the k largest gains, even for docs not retrieved."
+      check_equal("mean_hit3")
+      check_equal("mean_recall3")
+      check_equal("mrr")
+      check_equal("ndcg_q2")
+    success_msg: "The second question shows why one number isn't enough: hit@3 is 1, but recall@3 is only 0.5, because the medical-bay page the answer also needs is at rank 5. For a two-document answer, recall is the metric that counts."
+
+  - id: which-metric
+    type: mc
+    title: Which metric predicts success?
+    question: |
+      ORBIT puts the **top 5** retrieved docs into the prompt. About a third of crew questions are multi-hop: the answer
+      needs **two** specific docs (e.g. who may book the glovebox **and** which module it's in). Which retrieval metric best
+      predicts whether ORBIT can answer?
+    options:
+      - text: hit@5
+        feedback: "hit@5 counts a multi-hop question as a success when only one of its two docs is retrieved, and the model then can't answer it. It's the right metric for single-doc questions."
+      - text: MRR
+        feedback: "MRR rewards ranking the **first** relevant doc highly, but the model sees all 5 slots, so rank 1 vs rank 4 barely matters. And MRR ignores the second doc entirely."
+      - text: recall@5
+        correct: true
+        feedback: "Right. Recall@5 is the share of the needed docs that make it into the 5 slots the model sees. A multi-hop question with one of two docs scores 0.5, which matches its real chance of being answered. Break it down by question type as well."
+      - text: precision@1
+        feedback: "Precision@1 only looks at the first slot. The model gets 5, and multi-hop questions need 2 of them to be right."
+    hint: How many docs does the model see, and how many must be among them?
+
+  - id: saturated-metric
+    type: coding
+    title: Spot a saturated metric
+    context: |
+      You're comparing two retrievers on the 41 handbook questions. `rank_a` and `rank_b` hold each retriever's top 10
+      doc ids per question, `gold` the relevant doc sets, and `hit_at_k` and `reciprocal_rank` are imported.
+    instructions:
+      - "For each system, compute mean hit@k for k in `[1, 3, 5, 10]` and the MRR. Store them in dicts `a` and `b` with keys `\"hit@1\"`, `\"hit@3\"`, `\"hit@5\"`, `\"hit@10\"` and `\"mrr\"`."
+      - "Store the list of metric names (in that key order) where the two systems differ by at least 0.02 in `informative`."
+      - "Store the names where **both** systems score exactly 1.0 in `saturated`."
+    hint: |
+      `np.mean([hit_at_k(r, g, k) for r, g in zip(rank_a, gold)])`. Build `informative` with
+      `[m for m in a if abs(a[m] - b[m]) >= 0.02]`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import HybridSearch, labelled_questions, hit_at_k, reciprocal_rank
+      _qs = labelled_questions()
+      gold = [set(q["doc_ids"]) for q in _qs]
+      _A, _B = HybridSearch(alpha=1.0, embed=aikit.embed), HybridSearch(alpha=0.5)
+      rank_a = [_A.search(q["question"], 10) for q in _qs]
+      rank_b = [_B.search(q["question"], 10) for q in _qs]
+    sample_code: |
+      def metrics(ranks):
+          out = {f"hit@{k}": ____ for k in [1, 3, 5, 10]}
+          out["mrr"] = ____
+          return out
+
+      a, b = metrics(rank_a), metrics(rank_b)
+      informative = ____
+      saturated = ____
+      for m in a:
+          print(f"{m:7s} A {a[m]:.3f}  B {b[m]:.3f}")
+      print("informative:", informative, " saturated:", saturated)
+    solution: |
+      def metrics(ranks):
+          out = {f"hit@{k}": float(np.mean([hit_at_k(r, g, k) for r, g in zip(ranks, gold)])) for k in [1, 3, 5, 10]}
+          out["mrr"] = float(np.mean([reciprocal_rank(r, g) for r, g in zip(ranks, gold)]))
+          return out
+
+      a, b = metrics(rank_a), metrics(rank_b)
+      informative = [m for m in a if abs(a[m] - b[m]) >= 0.02]
+      saturated = [m for m in a if a[m] == 1.0 and b[m] == 1.0]
+      for m in a:
+          print(f"{m:7s} A {a[m]:.3f}  B {b[m]:.3f}")
+      print("informative:", informative, " saturated:", saturated)
+    tests: |
+      for name in ["a", "b"]:
+          d = check_object(name)
+          for m, v in sol[name].items():
+              assert m in d and abs(d[m] - v) < 1e-9, f"`{name}[{m!r}]` should be {v:.3f}."
+      check_equal("informative", msg="`informative` should list the metrics where |A - B| >= 0.02, in key order.")
+      check_equal("saturated", msg="`saturated` should list the metrics where both systems score exactly 1.0.")
+    success_msg: hit@5 and hit@10 are 1.0 for both systems, so they can't tell a weaker retriever from a stronger one. hit@1, hit@3 and MRR can. On easy questions written from the handbook's own wording, only strict metrics separate systems. The next lesson adds harder, realistic queries.

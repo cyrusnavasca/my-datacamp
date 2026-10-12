@@ -1,0 +1,270 @@
+title: Online signals and drift
+description: Read quality from production (thumbs, rephrases, escalations) without fooling yourself, detect when the questions change, and turn drift into new eval cases.
+exercises:
+  - id: online-signals-slides
+    type: video
+    title: What production tells you about quality
+    slides: |
+      # Signals from real use
+
+      The eval set says how ORBIT does on questions you thought of. Production says how it does on the questions
+      the crew actually asks.
+
+      | signal | example | coverage | noise |
+      | --- | --- | --- | --- |
+      | explicit | thumbs up/down, a rating | low: most people never click | biased toward strong feelings |
+      | implicit | **rephrased** within a minute, copied the answer, gave up, asked a human | every request | each is ambiguous on its own |
+      | outcome | the booking was made; the ticket was closed | where a task has an end state | the best signal, when you have one |
+      | sampled judge | an LLM judge scores 2% of traffic | as high as you pay for | judge bias (calibrate it) |
+
+      Track **rates by segment** (topic, prompt version, model), not just overall averages.
+
+      ---
+
+      ## Reading signals honestly
+
+      - **Selection bias:** the people who click thumbs are not everyone. A 40% feedback rate in one topic and 25% in
+        another changes the thumbs-down rate even if quality is the same.
+      - **Bad news is not a bad answer:** "AL-2 is closed for maintenance" gets thumbs-down for being true.
+      - **Instrumentation changes:** move the button, change its wording or default, and the rate moves with no
+        change in quality.
+      - **Small numbers:** 1 thumbs-down out of 6 is "17%". Show counts next to rates.
+
+      Use signals as a **smoke alarm**: they tell you where to look. Then read the actual traces (error analysis).
+
+      ---
+
+      ## Drift: when the questions change
+
+      ORBIT's eval set was built from the first crew's questions. Then a new crew rotation started an experiment
+      campaign. Compare the **topic mix** before and after with the **population stability index**:
+
+      $$\text{PSI} = \sum_i (a_i - b_i)\,\ln\frac{a_i}{b_i}$$
+
+      where $b_i$ and $a_i$ are the shares of topic $i$ before and after (clip zeros to a small number such as $10^{-4}$).
+      A common rule of thumb: **below 0.1** stable, **0.1 to 0.25** moderate, **above 0.25** a major shift. Each term
+      shows which topic moved. For free text without topics, compare embedding clusters, or the distance between
+      embedding centroids.
+
+      ---
+
+      ## Close the loop
+
+      ```
+      drift or bad signals ──► sample those traces ──► read and label them ──► add them to the eval set
+               ▲                                                                       │
+               └──── release with the regression gate ◄── fix (docs, prompt, routing) ◄┘
+      ```
+
+      An eval set that never changes slowly stops describing production. Each drift episode should leave behind
+      new eval cases, so the same failure is caught **before** the next release instead of by the crew.
+
+  - id: signal-rates
+    type: coding
+    title: Implicit feedback by topic
+    context: |
+      `log` has one row per ORBIT request over 14 days: `trace_id`, `day`, `topic`, `question`, `thumbs` (`"up"`,
+      `"down"` or missing) and `rephrased` (the crew member asked again within a minute).
+    instructions:
+      - "Build `by_topic`, indexed by `topic`, with columns `n` (requests), `feedback_rate` (share with any thumbs), `thumbs_down` (share of all requests with `\"down\"`) and `rephrase_rate`."
+      - "Store `overall_feedback`: the share of all requests that got any thumbs."
+      - "Store `worst_topic`: among topics with at least 30 requests, the one with the highest `rephrase_rate`."
+    hint: |
+      `("thumbs", lambda s: s.notna().mean())` for the feedback rate. Filter with `by_topic[by_topic["n"] >= 30]`,
+      then `["rephrase_rate"].idxmax()`.
+    pre_code: |
+      import pandas as pd
+      from kits.llmops_production import requests_log
+      log = requests_log()
+    sample_code: |
+      by_topic = log.groupby("topic").agg(
+          n=("trace_id", "size"),
+          feedback_rate=____,
+          thumbs_down=("thumbs", lambda s: (s == "down").mean()),
+          rephrase_rate=____,
+      )
+      overall_feedback = ____
+      worst_topic = ____
+      print(by_topic.round(3))
+      print(f"only {overall_feedback:.0%} of requests get any thumbs; worst topic: {worst_topic}")
+    solution: |
+      by_topic = log.groupby("topic").agg(
+          n=("trace_id", "size"),
+          feedback_rate=("thumbs", lambda s: s.notna().mean()),
+          thumbs_down=("thumbs", lambda s: (s == "down").mean()),
+          rephrase_rate=("rephrased", "mean"),
+      )
+      overall_feedback = log["thumbs"].notna().mean()
+      worst_topic = by_topic[by_topic["n"] >= 30]["rephrase_rate"].idxmax()
+      print(by_topic.round(3))
+      print(f"only {overall_feedback:.0%} of requests get any thumbs; worst topic: {worst_topic}")
+    tests: |
+      import numpy as np
+      check_object("by_topic")
+      b, e = user["by_topic"], sol["by_topic"]
+      for col in ("n", "feedback_rate", "thumbs_down", "rephrase_rate"):
+          assert col in b.columns, f"`by_topic` needs a `{col}` column."
+          assert np.allclose(b.loc[e.index, col].astype(float), e[col].astype(float)), f"`by_topic['{col}']` is off."
+      check_equal("overall_feedback", tol=1e-9)
+      check_equal("worst_topic", msg="Among topics with n >= 30, pick the highest `rephrase_rate`.")
+    success_msg: |
+      Fewer than half the requests get any thumbs, so rephrases are the denser signal. Laboratory stands out on both:
+      about a third of its questions get thumbs-down and about a third are asked again. That is where to read traces.
+
+  - id: signal-bias
+    type: mc
+    title: Did quality really drop?
+    question: |
+      On Monday the "Was this helpful?" buttons moved from below ORBIT's reply to a pop-up that appears **after every
+      answer**. Since then:
+
+      | | before | after |
+      | --- | --- | --- |
+      | requests with any thumbs | 22% | 61% |
+      | thumbs-down (share of all requests) | 3.1% | 7.9% |
+      | thumbs-down (share of rated requests) | 14% | 13% |
+      | rephrased within a minute | 8.2% | 8.0% |
+      | eval accuracy of the live version | 97% | 97% |
+
+      What do you conclude?
+    options:
+      - text: Quality dropped sharply; roll back Monday's release.
+        feedback: The only thing that changed on Monday was the feedback UI. Among people who rated, the thumbs-down share is flat (14% → 13%), and the rephrase rate and eval accuracy did not move.
+      - text: The pop-up made more people rate answers. The thumbs-down rate per request rose because more people vote, not because answers got worse.
+        correct: true
+        feedback: "Right. The instrument changed, so the raw rate is not comparable across Monday. The signals that did not change (rephrase rate, eval accuracy, the down-share among rated answers) say quality held. Annotate dashboards with UI changes, and normalise by how many people were asked."
+      - text: The crew's questions drifted, so the eval set is out of date.
+        feedback: Drift would show up in the topic mix and usually in rephrases or eval coverage. Nothing here points to it; the timing matches the UI change exactly.
+      - text: Nothing can be concluded from feedback; ignore it.
+        feedback: Too far. Feedback is noisy, but here it is easy to see what happened by comparing it with steadier signals. Keep it, normalise it and read it with the others.
+    hint: Which number depends on how many people are asked to rate, and which ones do not?
+
+  - id: drift-mission
+    type: sequential
+    title: "Mission: the new crew rotation"
+    context: |
+      A new crew rotation arrived on **day 8**. Nothing was deployed, yet laboratory crew say ORBIT "knows nothing".
+      `log` holds 14 days of requests with topics, questions and feedback. `EVAL_QUESTIONS` is the set of questions
+      already in the eval set. Detect the drift, connect it to the signals, and say which eval cases to add.
+    pre_code: |
+      import numpy as np
+      import pandas as pd
+      from kits.llmops_production import requests_log, EVAL
+      log = requests_log()
+      log["period"] = np.where(log["day"] >= 8, "after", "before")
+      EVAL_QUESTIONS = {item["question"] for item in EVAL}
+    steps:
+      - instructions:
+          - "Build `shares`: a DataFrame indexed by topic with columns `before` and `after`, holding each topic's share of that period's requests."
+        hint: |
+          `pd.crosstab(log["topic"], log["period"], normalize="columns")[["before", "after"]]`.
+        sample_code: |
+          shares = ____
+          print(shares.round(3))
+        solution: |
+          shares = pd.crosstab(log["topic"], log["period"], normalize="columns")[["before", "after"]]
+          print(shares.round(3))
+        tests: |
+          import numpy as np
+          check_object("shares")
+          s, e = user["shares"], sol["shares"]
+          assert {"before", "after"} <= set(s.columns), "`shares` needs columns `before` and `after`."
+          assert np.allclose(s.loc[e.index, ["before", "after"]].astype(float), e.astype(float)), "Each column should hold topic shares that sum to 1 within the period."
+      - instructions:
+          - "Compute the PSI terms per topic in `psi_terms` (clip both shares to at least `1e-4` first) and their sum in `psi`."
+          - "Store `top_mover` (the topic with the largest term) and `severity`: `\"stable\"` below 0.1, `\"moderate\"` up to 0.25, else `\"major\"`."
+        hint: |
+          `a = shares["after"].clip(lower=1e-4)`, `b = shares["before"].clip(lower=1e-4)`,
+          `psi_terms = (a - b) * np.log(a / b)`.
+        sample_code: |
+          a = shares["after"].clip(lower=1e-4)
+          b = shares["before"].clip(lower=1e-4)
+          psi_terms = ____
+          psi = ____
+          top_mover = ____
+          severity = ____
+          print(psi_terms.round(4))
+          print(f"PSI {psi:.2f} ({severity}); biggest mover: {top_mover}")
+        solution: |
+          a = shares["after"].clip(lower=1e-4)
+          b = shares["before"].clip(lower=1e-4)
+          psi_terms = (a - b) * np.log(a / b)
+          psi = psi_terms.sum()
+          top_mover = psi_terms.idxmax()
+          severity = "stable" if psi < 0.1 else ("moderate" if psi <= 0.25 else "major")
+          print(psi_terms.round(4))
+          print(f"PSI {psi:.2f} ({severity}); biggest mover: {top_mover}")
+        tests: |
+          check_equal("psi", tol=1e-6, msg="`psi` is the sum over topics of (after - before) * ln(after / before), with shares clipped at 1e-4.")
+          check_equal("top_mover")
+          check_equal("severity", msg="Above 0.25 the shift is 'major'.")
+      - instructions:
+          - "For laboratory requests, compare the periods: build `lab` indexed by `period` with columns `n`, `thumbs_down` and `rephrase_rate`."
+          - "Within **after**-period laboratory requests, split by whether the question is in `EVAL_QUESTIONS`: store `known_down` and `new_down`, the thumbs-down rates of known and not-known questions."
+        hint: |
+          `lab_after = log[(log["topic"] == "laboratory") & (log["period"] == "after")]` and
+          `lab_after["question"].isin(EVAL_QUESTIONS)` for the split.
+        sample_code: |
+          lab = log[log["topic"] == "laboratory"].groupby("period").agg(
+              n=("trace_id", "size"),
+              thumbs_down=____,
+              rephrase_rate=____,
+          )
+          lab_after = log[(log["topic"] == "laboratory") & (log["period"] == "after")]
+          known = lab_after["question"].isin(EVAL_QUESTIONS)
+          known_down = ____
+          new_down = ____
+          print(lab.round(3))
+          print(f"thumbs-down on questions the eval set knows: {known_down:.0%}; on new ones: {new_down:.0%}")
+        solution: |
+          lab = log[log["topic"] == "laboratory"].groupby("period").agg(
+              n=("trace_id", "size"),
+              thumbs_down=("thumbs", lambda s: (s == "down").mean()),
+              rephrase_rate=("rephrased", "mean"),
+          )
+          lab_after = log[(log["topic"] == "laboratory") & (log["period"] == "after")]
+          known = lab_after["question"].isin(EVAL_QUESTIONS)
+          known_down = (lab_after.loc[known, "thumbs"] == "down").mean()
+          new_down = (lab_after.loc[~known, "thumbs"] == "down").mean()
+          print(lab.round(3))
+          print(f"thumbs-down on questions the eval set knows: {known_down:.0%}; on new ones: {new_down:.0%}")
+        tests: |
+          import numpy as np
+          check_object("lab")
+          l, e = user["lab"], sol["lab"]
+          for col in ("n", "thumbs_down", "rephrase_rate"):
+              assert col in l.columns, f"`lab` needs a `{col}` column."
+              assert np.allclose(l.loc[e.index, col].astype(float), e[col].astype(float)), f"`lab['{col}']` is off."
+          check_equal("known_down", tol=1e-9)
+          check_equal("new_down", tol=1e-9, msg="`new_down` is the thumbs-down rate among after-period lab requests whose question is NOT in EVAL_QUESTIONS.")
+      - instructions:
+          - "Store `new_cases`: the sorted list of distinct after-period laboratory questions that are not in `EVAL_QUESTIONS` and got a thumbs-down **or** a rephrase."
+          - "Store `coverage_gap`: the share of after-period requests (all topics) whose question is not in `EVAL_QUESTIONS`."
+        hint: |
+          `bad = lab_after[(lab_after["thumbs"] == "down") | lab_after["rephrased"]]`, then keep questions
+          `~isin(EVAL_QUESTIONS)`, `sorted(set(...))`.
+        sample_code: |
+          bad = lab_after[____]
+          new_cases = sorted(set(____))
+          after = log[log["period"] == "after"]
+          coverage_gap = ____
+          for q in new_cases:
+              print("-", q)
+          print(f"{coverage_gap:.0%} of this week's traffic is not covered by the eval set")
+        solution: |
+          bad = lab_after[(lab_after["thumbs"] == "down") | lab_after["rephrased"]]
+          new_cases = sorted(set(bad.loc[~bad["question"].isin(EVAL_QUESTIONS), "question"]))
+          after = log[log["period"] == "after"]
+          coverage_gap = (~after["question"].isin(EVAL_QUESTIONS)).mean()
+          for q in new_cases:
+              print("-", q)
+          print(f"{coverage_gap:.0%} of this week's traffic is not covered by the eval set")
+        tests: |
+          check_equal("new_cases", msg=f"`new_cases` should be the {len(sol['new_cases'])} distinct new lab questions with a thumbs-down or a rephrase, sorted.")
+          check_equal("coverage_gap", tol=1e-9)
+    success_msg: |
+      Drift, measured: PSI about 0.55, almost all of it laboratory (11% → 38% of traffic). Questions the eval set
+      already knew stayed fine; the new CRYSTAL-2 campaign questions drew the thumbs-down, because the handbook has
+      nothing about the campaign. A third of this week's traffic is outside the eval set. Next steps: add the six
+      CRYSTAL-2 questions (with gold answers from the lab lead) to the eval set, add the campaign document to the
+      handbook, and ship the fix through the gate, the shadow and the canary you built in this chapter.

@@ -1,0 +1,201 @@
+ticket_id,crew,text,category,priority
+T1000,Tomas Lindqvist,The valve in Module B is making a clicking noise.,maintenance,normal
+T1001,Kenji Watanabe,Hatch seal in Module E is stuck and will not move.,maintenance,low
+T1002,Lucía Ferreira,The pump in Module E is making a clicking noise.,maintenance,low
+T1003,Noor Haddad,"Got an odd message asking for my password, is it real?",it,high
+T1004,Tomas Lindqvist,"Password reset please, I am locked out.",it,high
+T1005,Amara Okafor,Need two more coffee for the lab.,supplies,low
+T1006,Tomas Lindqvist,Where are the spare coffee stored?,supplies,low
+T1007,Priya Raman,Please book bench 1 in Module B for 3 hours on Monday.,scheduling,normal
+T1008,Kenji Watanabe,The fan display in Module F froze again.,it,normal
+T1009,Priya Raman,"Leak near the hatch seal in Module E, small puddle on the floor.",maintenance,high
+T1010,Amara Okafor,The pump display in Module F froze again.,it,low
+T1011,Tomas Lindqvist,"Feeling headache after exercise, is that normal?",medical,low
+T1012,Noor Haddad,Where are the spare filters stored?,supplies,normal
+T1013,Tomas Lindqvist,"Feeling blocked nose after exercise, is that normal?",medical,normal
+T1014,Lucía Ferreira,Please book bench 5 in Module B for 4 hours on Tuesday.,scheduling,normal
+T1015,Kenji Watanabe,Need a refill of nasal spray from the medical bay.,medical,normal
+T1016,Noor Haddad,"Got an odd message asking for my password, is it real?",it,high
+T1017,Kenji Watanabe,Please book bench 2 in Module B for 2 hours on Wednesday.,scheduling,normal
+T1018,Kenji Watanabe,Freezer door on panel B-6 keeps flickering.,maintenance,normal
+T1019,Tomas Lindqvist,Please add coffee to the next Tern manifest.,supplies,low
+T1020,Noor Haddad,Printer in Module C says offline.,it,normal
+T1021,Priya Raman,Need two more filters for the lab.,supplies,low
+T1022,Amara Okafor,Can I get something for a dizzy?,medical,high
+T1023,Kenji Watanabe,The light panel in Module F is making a clicking noise.,maintenance,normal
+T1024,Kenji Watanabe,"Leak near the air vent in Module E, small puddle on the floor.",maintenance,high
+T1025,Noor Haddad,The fan display in Module F froze again.,it,low
+T1026,Priya Raman,The freezer door display in Module A froze again.,it,normal
+T1027,Noor Haddad,"Requesting a check-up, my headache is not going away.",medical,normal
+T1028,Lucía Ferreira,Swap my galley duty on Tuesday with Tomas?,scheduling,low
+T1029,Tomas Lindqvist,Swap my galley duty on Friday with Tomas?,scheduling,low
+T1030,Lucía Ferreira,Can I move my exercise slot on Friday to the afternoon?,scheduling,low
+T1031,Amara Okafor,The heater display in Module A froze again.,it,normal
+T1032,Tomas Lindqvist,Can I move my exercise slot on Monday to the afternoon?,scheduling,normal
+T1033,Tomas Lindqvist,The heater in Module E is making a grinding noise.,maintenance,low
+T1034,Priya Raman,Need two more gloves for the lab.,supplies,normal
+T1035,Tomas Lindqvist,"Password reset please, I am locked out.",it,high
+T1036,Noor Haddad,"Got an odd message asking for my password, is it real?",it,high
+T1037,Kenji Watanabe,Cancel my lab booking for Wednesday.,scheduling,normal
+T1038,Amara Okafor,We are running low on gloves in Module B.,supplies,normal
+T1039,Tomas Lindqvist,Pump in Module E is stuck and will not move.,maintenance,low
+T1040,Priya Raman,The pump in Module A is making a grinding noise.,maintenance,low
+T1041,Priya Raman,"Got an odd message asking for my password, is it real?",it,high
+T1042,Tomas Lindqvist,Please add zip ties to the next Tern manifest.,supplies,normal
+T1043,Tomas Lindqvist,Printer in Module D says offline.,it,normal
+T1044,Amara Okafor,Please add wipes to the next Tern manifest.,supplies,normal
+T1045,Kenji Watanabe,Where are the spare filters stored?,supplies,normal
+T1046,Priya Raman,The fan in Module F is making a rattling noise.,maintenance,low
+T1047,Lucía Ferreira,Need a refill of antihistamines from the medical bay.,medical,normal
+T1048,Priya Raman,"Requesting a check-up, my sore back is not going away.",medical,normal
+T1049,Lucía Ferreira,"I have had a dizzy since yesterday, can I see Priya?",medical,high
+T1050,Tomas Lindqvist,The fan in Module B is making a grinding noise.,maintenance,normal
+T1051,Kenji Watanabe,Out of gloves in the galley.,supplies,low
+T1052,Kenji Watanabe,"Requesting a check-up, my headache is not going away.",medical,normal
+T1053,Noor Haddad,Where are the spare filters stored?,supplies,normal
+T1054,Tomas Lindqvist,"Password reset please, I am locked out.",it,high
+T1055,Amara Okafor,"Feeling sore back after exercise, is that normal?",medical,normal
+T1056,Noor Haddad,My laptop cannot connect to HELIOS-NET.,it,normal
+T1057,Tomas Lindqvist,The heater in Module E is making a high-pitched noise.,maintenance,low
+T1058,Tomas Lindqvist,My laptop cannot connect to HELIOS-NET.,it,low
+T1059,Noor Haddad,My laptop cannot connect to HELIOS-NET.,it,low
+T1060,Lucía Ferreira,We are running low on gloves in Module E.,supplies,normal
+T1061,Noor Haddad,Hatch seal in Module D is stuck and will not move.,maintenance,normal
+T1062,Priya Raman,Printer in Module C says offline.,it,low
+T1063,Kenji Watanabe,Can I move my exercise slot on Wednesday to the afternoon?,scheduling,low
+T1064,Amara Okafor,Cancel my lab booking for Wednesday.,scheduling,low
+T1065,Amara Okafor,Need two more zip ties for the lab.,supplies,low
+T1066,Lucía Ferreira,"Got an odd message asking for my password, is it real?",it,high
+T1067,Amara Okafor,Can I move my exercise slot on Wednesday to the afternoon?,scheduling,low
+T1068,Kenji Watanabe,I need the glovebox on Tuesday morning.,scheduling,normal
+T1069,Amara Okafor,Swap my galley duty on Friday with Tomas?,scheduling,normal
+T1070,Priya Raman,The hatch seal display in Module B froze again.,it,low
+T1071,Priya Raman,Light panel in Module C is stuck and will not move.,maintenance,normal
+T1072,Noor Haddad,"Feeling sore back after exercise, is that normal?",medical,normal
+T1073,Priya Raman,Swap my galley duty on Thursday with Tomas?,scheduling,low
+T1074,Amara Okafor,"Leak near the valve in Module A, small puddle on the floor.",maintenance,high
+T1075,Tomas Lindqvist,Can I move my exercise slot on Wednesday to the afternoon?,scheduling,normal
+T1076,Kenji Watanabe,Need two more sample bags for the lab.,supplies,normal
+T1077,Amara Okafor,The hatch seal in Module E is making a clicking noise.,maintenance,normal
+T1078,Kenji Watanabe,Printer in Module B says offline.,it,low
+T1079,Priya Raman,Can someone look at the freezer door in Module A? It stopped working this morning.,maintenance,low
+T1080,Lucía Ferreira,"I have had a blocked nose since yesterday, can I see Priya?",medical,normal
+T1081,Tomas Lindqvist,"Got an odd message asking for my password, is it real?",it,high
+T1082,Amara Okafor,Need a refill of nasal spray from the medical bay.,medical,low
+T1083,Priya Raman,Cancel my lab booking for Tuesday.,scheduling,low
+T1084,Tomas Lindqvist,"Leak near the fan in Module D, small puddle on the floor.",maintenance,high
+T1085,Priya Raman,"Requesting a check-up, my blocked nose is not going away.",medical,low
+T1086,Tomas Lindqvist,"I have had a rash since yesterday, can I see Priya?",medical,normal
+T1087,Priya Raman,I need the glovebox on Monday morning.,scheduling,normal
+T1088,Noor Haddad,"Password reset please, I am locked out.",it,high
+T1089,Priya Raman,The fan display in Module A froze again.,it,low
+T1090,Lucía Ferreira,The fan display in Module A froze again.,it,normal
+T1091,Lucía Ferreira,I need the glovebox on Thursday morning.,scheduling,normal
+T1092,Amara Okafor,"Leak near the pump in Module C, small puddle on the floor.",maintenance,high
+T1093,Lucía Ferreira,We are running low on batteries in Module E.,supplies,normal
+T1094,Amara Okafor,"Feeling dizzy after exercise, is that normal?",medical,high
+T1095,Noor Haddad,Swap my galley duty on Wednesday with Tomas?,scheduling,low
+T1096,Noor Haddad,Swap my galley duty on Wednesday with Tomas?,scheduling,normal
+T1097,Lucía Ferreira,Cancel my lab booking for Wednesday.,scheduling,low
+T1098,Kenji Watanabe,"Requesting a check-up, my rash is not going away.",medical,normal
+T1099,Priya Raman,Can I get something for a stiff neck?,medical,normal
+T1100,Priya Raman,My laptop cannot connect to HELIOS-NET.,it,normal
+T1101,Lucía Ferreira,"Requesting a check-up, my stiff neck is not going away.",medical,normal
+T1102,Kenji Watanabe,Cancel my lab booking for Thursday.,scheduling,normal
+T1103,Noor Haddad,Can I get something for a dizzy?,medical,high
+T1104,Lucía Ferreira,"I have had a blocked nose since yesterday, can I see Priya?",medical,normal
+T1105,Noor Haddad,The hatch seal display in Module B froze again.,it,normal
+T1106,Amara Okafor,Need a refill of antihistamines from the medical bay.,medical,low
+T1107,Amara Okafor,"Requesting a check-up, my stiff neck is not going away.",medical,normal
+T1108,Noor Haddad,Need two more gloves for the lab.,supplies,normal
+T1109,Tomas Lindqvist,Out of filters in the galley.,supplies,low
+T1110,Noor Haddad,The air vent in Module B is making a clicking noise.,maintenance,normal
+T1111,Amara Okafor,We are running low on gloves in Module E.,supplies,normal
+T1112,Lucía Ferreira,"Requesting a check-up, my rash is not going away.",medical,normal
+T1113,Noor Haddad,The heater display in Module E froze again.,it,normal
+T1114,Tomas Lindqvist,Need two more filters for the lab.,supplies,normal
+T1115,Tomas Lindqvist,Out of coffee in the galley.,supplies,normal
+T1116,Noor Haddad,Swap my galley duty on Thursday with Tomas?,scheduling,low
+T1117,Noor Haddad,Cancel my lab booking for Monday.,scheduling,normal
+T1118,Priya Raman,"Feeling blocked nose after exercise, is that normal?",medical,normal
+T1119,Noor Haddad,Light panel on panel B-4 keeps flickering.,maintenance,low
+T1120,Kenji Watanabe,"I have had a dizzy since yesterday, can I see Priya?",medical,high
+T1121,Kenji Watanabe,Swap my galley duty on Thursday with Tomas?,scheduling,low
+T1122,Lucía Ferreira,"Requesting a check-up, my dizzy is not going away.",medical,high
+T1123,Amara Okafor,Air vent in Module D is stuck and will not move.,maintenance,normal
+T1124,Lucía Ferreira,Cancel my lab booking for Thursday.,scheduling,normal
+T1125,Kenji Watanabe,Printer in Module B says offline.,it,low
+T1126,Amara Okafor,Cancel my lab booking for Thursday.,scheduling,normal
+T1127,Kenji Watanabe,Cancel my lab booking for Tuesday.,scheduling,low
+T1128,Kenji Watanabe,Printer in Module A says offline.,it,normal
+T1129,Amara Okafor,My laptop cannot connect to HELIOS-NET.,it,normal
+T1130,Kenji Watanabe,Please add batteries to the next Tern manifest.,supplies,low
+T1131,Tomas Lindqvist,Can someone look at the air vent in Module C? It stopped working this morning.,maintenance,normal
+T1132,Priya Raman,I need the glovebox on Thursday morning.,scheduling,normal
+T1133,Amara Okafor,Please book bench 4 in Module B for 2 hours on Friday.,scheduling,normal
+T1134,Amara Okafor,"I have had a rash since yesterday, can I see Priya?",medical,low
+T1135,Lucía Ferreira,Need a refill of painkillers from the medical bay.,medical,low
+T1136,Noor Haddad,Need a refill of nasal spray from the medical bay.,medical,low
+T1137,Kenji Watanabe,"Got an odd message asking for my password, is it real?",it,high
+T1138,Lucía Ferreira,I need the glovebox on Tuesday morning.,scheduling,normal
+T1139,Amara Okafor,Valve on panel A-5 keeps flickering.,maintenance,normal
+T1140,Kenji Watanabe,"Password reset please, I am locked out.",it,high
+T1141,Noor Haddad,"I have had a stiff neck since yesterday, can I see Priya?",medical,normal
+T1142,Priya Raman,"I have had a rash since yesterday, can I see Priya?",medical,normal
+T1143,Lucía Ferreira,My laptop cannot connect to HELIOS-NET.,it,low
+T1144,Noor Haddad,Swap my galley duty on Thursday with Tomas?,scheduling,normal
+T1145,Kenji Watanabe,Freezer door in Module A is stuck and will not move.,maintenance,normal
+T1146,Kenji Watanabe,"Leak near the freezer door in Module F, small puddle on the floor.",maintenance,high
+T1147,Noor Haddad,"Requesting a check-up, my sore back is not going away.",medical,normal
+T1148,Kenji Watanabe,Swap my galley duty on Friday with Tomas?,scheduling,normal
+T1149,Priya Raman,Need two more coffee for the lab.,supplies,low
+T1150,Kenji Watanabe,Can someone look at the heater in Module B? It stopped working this morning.,maintenance,normal
+T1151,Priya Raman,"Password reset please, I am locked out.",it,high
+T1152,Kenji Watanabe,"Leak near the freezer door in Module B, small puddle on the floor.",maintenance,high
+T1153,Priya Raman,"Feeling blocked nose after exercise, is that normal?",medical,normal
+T1154,Tomas Lindqvist,The fan display in Module E froze again.,it,low
+T1155,Lucía Ferreira,"Requesting a check-up, my dizzy is not going away.",medical,high
+T1156,Noor Haddad,"Requesting a check-up, my rash is not going away.",medical,normal
+T1157,Tomas Lindqvist,We are running low on coffee in Module A.,supplies,normal
+T1158,Lucía Ferreira,"Feeling rash after exercise, is that normal?",medical,normal
+T1159,Priya Raman,Need two more zip ties for the lab.,supplies,normal
+T1160,Kenji Watanabe,The freezer door display in Module F froze again.,it,normal
+T1161,Amara Okafor,I need the glovebox on Tuesday morning.,scheduling,normal
+T1162,Noor Haddad,"Feeling headache after exercise, is that normal?",medical,normal
+T1163,Noor Haddad,Need a refill of antihistamines from the medical bay.,medical,normal
+T1164,Lucía Ferreira,Swap my galley duty on Friday with Tomas?,scheduling,normal
+T1165,Tomas Lindqvist,Valve on panel B-3 keeps flickering.,maintenance,normal
+T1166,Amara Okafor,Light panel in Module C is stuck and will not move.,maintenance,low
+T1167,Kenji Watanabe,The light panel display in Module F froze again.,it,low
+T1168,Kenji Watanabe,Valve in Module D is stuck and will not move.,maintenance,normal
+T1169,Priya Raman,Can I move my exercise slot on Monday to the afternoon?,scheduling,normal
+T1170,Lucía Ferreira,The air vent in Module A is making a rattling noise.,maintenance,normal
+T1171,Amara Okafor,Light panel on panel E-3 keeps flickering.,maintenance,low
+T1172,Lucía Ferreira,Air vent in Module E is stuck and will not move.,maintenance,normal
+T1173,Kenji Watanabe,Can I get something for a dizzy?,medical,high
+T1174,Lucía Ferreira,Where are the spare batteries stored?,supplies,normal
+T1175,Amara Okafor,Swap my galley duty on Friday with Tomas?,scheduling,normal
+T1176,Amara Okafor,Pump on panel C-6 keeps flickering.,maintenance,low
+T1177,Tomas Lindqvist,Need a refill of painkillers from the medical bay.,medical,low
+T1178,Lucía Ferreira,Out of sample bags in the galley.,supplies,normal
+T1179,Noor Haddad,Please book bench 2 in Module B for 3 hours on Wednesday.,scheduling,normal
+T1180,Noor Haddad,Valve on panel F-5 keeps flickering.,maintenance,low
+T1181,Noor Haddad,We are running low on gloves in Module E.,supplies,low
+T1182,Amara Okafor,Can I move my exercise slot on Monday to the afternoon?,scheduling,low
+T1183,Priya Raman,Swap my galley duty on Friday with Tomas?,scheduling,normal
+T1184,Kenji Watanabe,"Leak near the valve in Module F, small puddle on the floor.",maintenance,high
+T1185,Kenji Watanabe,Swap my galley duty on Friday with Tomas?,scheduling,normal
+T1186,Noor Haddad,Fan in Module D is stuck and will not move.,maintenance,normal
+T1187,Tomas Lindqvist,The fan display in Module A froze again.,it,normal
+T1188,Noor Haddad,Printer in Module A says offline.,it,normal
+T1189,Tomas Lindqvist,My laptop cannot connect to HELIOS-NET.,it,normal
+T1190,Priya Raman,"Password reset please, I am locked out.",it,high
+T1191,Noor Haddad,Can I get something for a dizzy?,medical,high
+T1192,Kenji Watanabe,We are running low on coffee in Module D.,supplies,normal
+T1193,Noor Haddad,Please book bench 2 in Module B for 3 hours on Thursday.,scheduling,normal
+T1194,Amara Okafor,Cancel my lab booking for Friday.,scheduling,normal
+T1195,Amara Okafor,Can someone look at the valve in Module C? It stopped working this morning.,maintenance,normal
+T1196,Noor Haddad,My laptop cannot connect to HELIOS-NET.,it,normal
+T1197,Tomas Lindqvist,Out of wipes in the galley.,supplies,normal
+T1198,Noor Haddad,Swap my galley duty on Thursday with Tomas?,scheduling,normal
+T1199,Priya Raman,Valve on panel E-2 keeps flickering.,maintenance,normal

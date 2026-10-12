@@ -1,0 +1,253 @@
+title: When nearest neighbours look random
+description: A troubleshooting playbook for broken similarity search. Measure with a labelled set and two label-free checks, find the cause, fix it at the right cost, and prove it worked.
+exercises:
+  - id: similarity-bugs-slides
+    type: video
+    title: Debugging a similarity index
+    slides: |
+      # Symptom: "the related docs make no sense"
+
+      The crew says ORBIT's *related documents* panel suggests nonsense. Before you swap models or tune anything,
+      follow the loop:
+
+      **Symptom → Measure → Diagnose → Fix → Verify**
+
+      Most "the model is bad" reports turn out to be **pipeline bugs**: the vectors are fine, but they're stored,
+      scaled or compared the wrong way. Pipeline bugs are cheap to fix and give huge gains. Rule them out first.
+
+      ---
+
+      ## Measure: one metric, three cheap checks
+
+      **The metric**: a small labelled set (questions with their correct docs). Score **hit@1**, the share of
+      questions whose top result is correct. Here, 41 handbook questions.
+
+      **The checks** need no labels:
+
+      | check | code | healthy value |
+      | --- | --- | --- |
+      | self-retrieval | embed each doc's own text, search; is row `i` the top hit for doc `i`? | about 100% |
+      | norms | `n = np.linalg.norm(V, axis=1)`; look at `n.min()` and `n.max()` | all 1.0 for a cosine model |
+      | hubs | how many **distinct** docs appear as top-1 across many queries? | many; not 3 docs winning everything |
+
+      ---
+
+      ## Diagnose: what each check points to
+
+      | what you see | usual cause | how to confirm |
+      | --- | --- | --- |
+      | self-retrieval near 0%, top scores still high | rows and ids out of step (sorted differently, a deleted row shifted everything) | `offset = top - np.arange(n)`: one repeated offset means a shift |
+      | self-retrieval fails only with the query-side embedder | query and index from **different models** or versions | embed one doc both ways; compare the vectors |
+      | norms spread out (e.g. 2 to 6) | vectors summed or never normalised, compared by dot product | long docs win as hubs |
+      | some norms exactly 0 | empty or unreadable text, or every token unknown to the model | print those rows' text |
+      | long docs never found by their second half | input past the model's length limit was cut | check token counts against the limit |
+
+      ---
+
+      ## Fix: options and what they cost
+
+      | fix | cost | when |
+      | --- | --- | --- |
+      | re-align ids to rows | cheap, but you must know the true mapping | you can reconstruct the order exactly |
+      | normalise in place | one pass over $N \times d$ numbers, no API calls | the only problem is length |
+      | **re-embed everything** with one model | $N$ texts of API calls and time: pennies for 34 docs, a real bill for 10M chunks | the mapping is unknown, or models were mixed |
+      | store ids **next to** vectors, plus the model name | none | always, to stop it happening again |
+
+      Cheapest correct fix first. Re-embedding is always correct, but for big corpora check the bill.
+
+      ---
+
+      ## Verify, then keep the checks
+
+      - Re-run the **same** metric on the **same** labelled questions: hit@1 must go up, and self-retrieval should be about 100%.
+      - Turn the checks into tests that run whenever the index is rebuilt: self-retrieval on a sample, all norms within
+        `1 ± 1e-3`, no zero rows. They take seconds and catch this whole class of bug before the crew does.
+
+  - id: symptom-to-cause
+    type: classify
+    title: Which bug is it?
+    prompt: Sort each observation by its most likely cause.
+    hint: Self-retrieval failing everywhere suggests misalignment. Long docs winning suggests length. A model change on one side suggests mixed models. Zeros or missing parts of the text suggest the text never reached the model intact.
+    zones: [Rows and ids out of step, Vectors not normalised, Query and docs from different models, Text lost before embedding]
+    items:
+      - { text: "Since one document was deleted, every result is the document listed right after the correct one", zone: Rows and ids out of step }
+      - { text: "Printing the stored text of each result shows relevant text, but the doc ids shown to the crew are wrong", zone: Rows and ids out of step }
+      - { text: "After switching the index metric from cosine to dot product, three long manuals appear in almost every result list", zone: Vectors not normalised }
+      - { text: "np.linalg.norm(V, axis=1) ranges from 0.8 to 9.5", zone: Vectors not normalised }
+      - { text: "The query service moved to a new embedding model and the index was not rebuilt; top scores fell from about 0.8 to 0.1", zone: Query and docs from different models }
+      - { text: "Self-retrieval passes with the indexing script's embedder but fails with the query service's embedder", zone: Query and docs from different models }
+      - { text: "Answers in the second half of long incident reports are never found", zone: Text lost before embedding }
+      - { text: "Forty rows of the index have a norm of exactly 0", zone: Text lost before embedding }
+
+  - id: self-retrieval-check
+    type: coding
+    title: Write the self-retrieval check
+    context: |
+      `texts` holds the 34 handbook docs and `V_good` their embeddings, row `i` for `texts[i]`. `V_after_delete`
+      is the same index after a botched deletion shifted the rows. Write the check that catches this without any labels.
+    instructions:
+      - "Write `self_retrieval_rate(texts, V)`: embed `texts` with `aikit.embed`, find each one's best row in `V` (`argmax`), and return the share where the best row equals the text's own index."
+      - "Store the rate for `V_good` in `rate_good` and for `V_after_delete` in `rate_bad`."
+      - "For `V_after_delete`, store `top - np.arange(len(texts))` (each text's best row minus its index) in `offsets`, and the most common offset in `shift`."
+    hint: |
+      `E = aikit.embed(texts)`, `top = np.argmax(E @ V.T, axis=1)`, `np.mean(top == np.arange(len(texts)))`.
+      For the most common offset: `vals, counts = np.unique(offsets, return_counts=True)`, then `vals[np.argmax(counts)]`.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import handbook_docs
+      texts = [d["title"] + ". " + d["text"] for d in handbook_docs()]
+      V_good = aikit.embed(texts)
+      V_after_delete = np.roll(V_good, 1, axis=0)
+    sample_code: |
+      def self_retrieval_rate(texts, V):
+          E = ____
+          top = ____
+          return ____
+
+      rate_good = self_retrieval_rate(texts, V_good)
+      rate_bad = self_retrieval_rate(texts, V_after_delete)
+
+      top = np.argmax(aikit.embed(texts) @ V_after_delete.T, axis=1)
+      offsets = ____
+      vals, counts = np.unique(offsets, return_counts=True)
+      shift = ____
+      print(rate_good, rate_bad, shift)
+    solution: |
+      def self_retrieval_rate(texts, V):
+          E = aikit.embed(texts)
+          top = np.argmax(E @ V.T, axis=1)
+          return float(np.mean(top == np.arange(len(texts))))
+
+      rate_good = self_retrieval_rate(texts, V_good)
+      rate_bad = self_retrieval_rate(texts, V_after_delete)
+
+      top = np.argmax(aikit.embed(texts) @ V_after_delete.T, axis=1)
+      offsets = top - np.arange(len(texts))
+      vals, counts = np.unique(offsets, return_counts=True)
+      shift = vals[np.argmax(counts)]
+      print(rate_good, rate_bad, shift)
+    tests: |
+      import numpy as np
+      import aikit
+      texts, V_good = sol["texts"], sol["V_good"]
+      f = check_object("self_retrieval_rate")
+      _perm = np.random.default_rng(1).permutation(len(texts))
+      _r = float(f(texts, V_good[_perm]))
+      _want = float(np.mean(np.argmax(aikit.embed(texts) @ V_good[_perm].T, axis=1) == np.arange(len(texts))))
+      assert abs(_r - _want) < 1e-9, "`self_retrieval_rate` gave the wrong value on a shuffled index. Compare each text's best row with its own position, `np.arange(len(texts))`."
+      check_equal("rate_good", 1.0, msg="`rate_good` should be 1.0: every doc finds itself in the healthy index.")
+      check_equal("rate_bad", 0.0, msg="`rate_bad` should be 0.0: after the shift, no doc finds its own row.")
+      check_equal("offsets", msg="`offsets` should be `top - np.arange(len(texts))` for `V_after_delete`.")
+      check_equal("shift", msg="`shift` should be the most common value in `offsets`.")
+    success_msg: Every doc's vector now sits one row later than its id, so `shift` is 1 (one row wraps around). Self-retrieval gives a clear answer without a single labelled question, so run it every time an index is rebuilt.
+
+  - id: fix-related-docs
+    type: sequential
+    title: "Mission: fix the related-docs panel"
+    context: |
+      ORBIT's related-docs panel uses an index left by a previous engineer: `ids` (34 doc ids, alphabetical), `texts`
+      (their text) and `V` (one row per doc). The model card says the vectors should be unit length. You have 41 labelled
+      crew questions: `Q` holds their embeddings (from `aikit.embed`) and `gold[i]` the correct doc ids for question `i`.
+      Measure, diagnose, fix, verify.
+    pre_code: |
+      import numpy as np
+      import aikit
+      from kits.embeddings_vector_search import legacy_index, labelled_questions
+      ids, texts, V = legacy_index()
+      _qs = labelled_questions()
+      Q = aikit.embed([q["question"] for q in _qs])
+      gold = [set(q["doc_ids"]) for q in _qs]
+    steps:
+      - instructions:
+          - "**Measure.** Write `hit_at_1(V)`: each question's best row is `np.argmax(Q @ V.T, axis=1)`, and a hit means `ids[row]` is in `gold`. Return the share of hits."
+          - "Store `hit_at_1(V)` in `before` and the number of distinct best rows across the 41 questions in `distinct_top1`."
+        hint: |
+          `top = np.argmax(Q @ V.T, axis=1)`, then `np.mean([ids[t] in g for t, g in zip(top, gold)])`.
+          Distinct rows: `len(set(top))`.
+        sample_code: |
+          def hit_at_1(V):
+              top = ____
+              return ____
+
+          before = hit_at_1(V)
+          distinct_top1 = ____
+          print(before, distinct_top1)
+        solution: |
+          def hit_at_1(V):
+              top = np.argmax(Q @ V.T, axis=1)
+              return float(np.mean([ids[t] in g for t, g in zip(top, gold)]))
+
+          before = hit_at_1(V)
+          distinct_top1 = len(set(np.argmax(Q @ V.T, axis=1)))
+          print(before, distinct_top1)
+        tests: |
+          import numpy as np
+          import aikit
+          texts = sol["texts"]
+          f = check_object("hit_at_1")
+          assert abs(f(aikit.embed(texts)) - sol["hit_at_1"](aikit.embed(texts))) < 1e-9, "`hit_at_1` gives the wrong score on a healthy index. A hit means `ids[top]` is in that question's `gold` set."
+          check_equal("before", msg="`before` should be `hit_at_1(V)`.")
+          check_equal("distinct_top1", msg="`distinct_top1` should be `len(set(top))` for the legacy `V`.")
+      - instructions:
+          - "**Diagnose.** Store the self-retrieval rate of `V` in `self_rate`: embed `texts` with `aikit.embed`, and check whether each one's best row in `V` is its own index."
+          - "Store the smallest and largest row norm of `V` in `norm_min` and `norm_max`."
+          - "Print all three. Low self-retrieval with high-looking scores means misaligned rows; norms far from 1 mean the vectors were never normalised."
+        hint: |
+          `top = np.argmax(aikit.embed(texts) @ V.T, axis=1)`; `np.mean(top == np.arange(len(texts)))`.
+          `n = np.linalg.norm(V, axis=1)`, then `n.min()` and `n.max()`.
+        sample_code: |
+          top = ____
+          self_rate = ____
+          n = ____
+          norm_min, norm_max = ____, ____
+          print(self_rate, norm_min, norm_max)
+        solution: |
+          top = np.argmax(aikit.embed(texts) @ V.T, axis=1)
+          self_rate = float(np.mean(top == np.arange(len(texts))))
+          n = np.linalg.norm(V, axis=1)
+          norm_min, norm_max = float(n.min()), float(n.max())
+          print(self_rate, norm_min, norm_max)
+        tests: |
+          check_equal("self_rate", msg="`self_rate` should be the share of texts whose best row in `V` is their own index.")
+          check_equal("norm_min", tol=1e-6, msg="`norm_min` should be the smallest of `np.linalg.norm(V, axis=1)`.")
+          check_equal("norm_max", tol=1e-6, msg="`norm_max` should be the largest of `np.linalg.norm(V, axis=1)`.")
+      - instructions:
+          - "**Fix.** Both checks failed: the rows don't line up with `ids`, and they aren't unit length. Build `V_fixed`, where row `i` is a unit-length vector for `texts[i]`."
+          - "Any correct fix passes. Re-embedding `texts` costs 34 API calls here, which is cheap. Re-aligning in place also works if you can work out the true row order."
+        hint: "The simplest correct fix is `V_fixed = aikit.embed(texts)`, which embeds in `ids` order and returns unit-length rows."
+        sample_code: |
+          V_fixed = ____
+          print(V_fixed.shape)
+        solution: |
+          V_fixed = aikit.embed(texts)
+          print(V_fixed.shape)
+        tests: |
+          import numpy as np
+          import aikit
+          texts = sol["texts"]
+          Vf = np.asarray(check_object("V_fixed"))
+          assert Vf.shape == (34, 64), f"`V_fixed` should have one 64-dim row per doc, shape (34, 64); got {Vf.shape}."
+          assert np.allclose(np.linalg.norm(Vf, axis=1), 1.0, atol=1e-6), "Every row of `V_fixed` should have length 1."
+          _top = np.argmax(aikit.embed(texts) @ Vf.T, axis=1)
+          assert np.mean(_top == np.arange(34)) >= 0.95, "Rows of `V_fixed` still don't line up with `ids`: self-retrieval is below 95%. Row i must be the vector for texts[i]."
+      - instructions:
+          - "**Verify.** Store `hit_at_1(V_fixed)` in `after` and print `before` and `after`."
+          - "Store the self-retrieval rate of `V_fixed` in `self_after`. Together they're your proof the panel is fixed."
+        hint: Reuse `hit_at_1` from step 1 and the self-retrieval code from step 2, with `V_fixed`.
+        sample_code: |
+          after = ____
+          self_after = ____
+          print(f"hit@1 {before:.2f} -> {after:.2f}, self-retrieval {self_after:.2f}")
+        solution: |
+          after = hit_at_1(V_fixed)
+          self_after = float(np.mean(np.argmax(aikit.embed(texts) @ V_fixed.T, axis=1) == np.arange(len(texts))))
+          print(f"hit@1 {before:.2f} -> {after:.2f}, self-retrieval {self_after:.2f}")
+        tests: |
+          import numpy as np
+          a = check_object("after")
+          assert abs(a - user["hit_at_1"](user["V_fixed"])) < 1e-9, "`after` should be `hit_at_1(V_fixed)`."
+          assert a >= 0.85, f"hit@1 after the fix is {a:.2f}; it should be at least 0.85. Check `V_fixed`."
+          s = check_object("self_after")
+          assert s >= 0.95, "`self_after` should be the self-retrieval rate of `V_fixed`, about 1.0."
+    success_msg: hit@1 went from 0.00 to above 0.85 without touching the model. The bugs were in the pipeline. Keep self-retrieval and the norm check as tests on every rebuild.
